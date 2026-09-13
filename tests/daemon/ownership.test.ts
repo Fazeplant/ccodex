@@ -52,6 +52,28 @@ describe("gateway socket ownership", () => {
     }
   });
 
+  it.skipIf(process.platform !== "linux")("keeps identifying an owner whose other descriptors close mid-scan", async () => {
+    const root = mkdtempSync(join(tmpdir(), "gateway-owner-churn-"));
+    temporary.push(root);
+    const socketPath = join(root, "gateway.sock");
+    // The owner churns descriptors so readlink races ENOENT on its /proc/<pid>/fd
+    // entries; a single miss must not drop the owner from the scan.
+    const child = spawn(process.execPath, ["-e", `
+      const net = require("node:net"); const fs = require("node:fs");
+      net.createServer().listen(${JSON.stringify(socketPath)}, () => {
+        setInterval(() => { for (let i = 0; i < 64; i += 1) fs.closeSync(fs.openSync("/dev/null", "r")); }, 0);
+      });
+    `], { stdio: "ignore" });
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(socketPath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(existsSync(socketPath)).toBe(true);
+      for (let scan = 0; scan < 150; scan += 1) expect(socketOwnerPids(socketPath)).toEqual([child.pid]);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
   it("treats an owner exit during identification as a vacant endpoint", () => {
     const runtime: SocketOwnershipRuntime = {
       ownerPids: (() => {

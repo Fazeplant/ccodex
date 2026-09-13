@@ -54,7 +54,14 @@ function linuxSocketOwners(socketPath: string): number[] {
     if (!/^\d+$/u.test(entry)) continue;
     try {
       for (const descriptor of readdirSync(`/proc/${entry}/fd`)) {
-        const target = readlinkSync(`/proc/${entry}/fd/${descriptor}`);
+        let target: string;
+        try {
+          target = readlinkSync(`/proc/${entry}/fd/${descriptor}`);
+        } catch {
+          // A descriptor closed between readdir and readlink must not abort
+          // the scan of this process: skipping the owner escalates to SIGKILL.
+          continue;
+        }
         const match = /^socket:\[(\d+)\]$/u.exec(target);
         if (match?.[1] && inodes.has(match[1])) {
           owners.add(Number(entry));
