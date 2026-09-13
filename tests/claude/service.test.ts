@@ -3073,7 +3073,7 @@ You are in a side conversation, not the main thread.`,
     await first.close();
   });
 
-  it("unloads an idle user side runtime without deleting the conversation", async () => {
+  it("keeps a user side resumable after more than 24 hours and runtime unload", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-side-idle-resume-"));
     directories.push(directory);
     const fake = new FakeClaudeQuery();
@@ -3099,8 +3099,11 @@ You are in a side conversation, not the main thread.`,
     };
 
     await run("before idle");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 25 * 60 * 60_000);
     await (service as unknown as { unloadIdleRuntimes(): Promise<void> }).unloadIdleRuntimes();
+    clock.mockRestore();
     expect(service.readThread(started.thread.id, true).thread.turns).toHaveLength(1);
+    expect(service.readThread(started.thread.id, false).thread.status.type).toBe("idle");
 
     await run("after idle");
     expect(service.readThread(started.thread.id, true).thread.turns).toHaveLength(2);

@@ -188,7 +188,7 @@ async function flushUntil(predicate: () => boolean): Promise<void> {
   expect(predicate()).toBe(true);
 }
 
-async function fixture(): Promise<{
+async function fixture(ephemeral = false): Promise<{
   service: ClaudeService;
   provider: ControlledClaudeQuery;
   threadId: string;
@@ -202,7 +202,7 @@ async function fixture(): Promise<{
   const service = new ClaudeService(
     config(directory), hub, new Logger("error"), new SqliteHybridStore(join(directory, "state.sqlite")), provider.factory,
   );
-  const started = await service.startThread({ model: "claude:haiku", cwd: directory });
+  const started = await service.startThread({ model: "claude:haiku", cwd: directory, ephemeral, threadSource: "user" });
   const events: RecordedEvent[] = [];
   hub.subscribe(started.thread.id, "test", (method, params) => events.push({ method, params }));
   const prepared = await service.prepareTurn({
@@ -237,6 +237,62 @@ afterEach(() => {
 });
 
 describe("Claude autonomous continuation lifecycle", () => {
+  it("reports a projection failure and stops the provider instead of expiring the side chat", async () => {
+    const { service, provider, threadId, events } = await fixture(true);
+    provider.push(messageStart(), ...streamedText(0, "Done."), assistantText("Done."), result(), command("completed"));
+    await flushUntil(() => terminalEvents(events).length === 1);
+    provider.push(toolResult("orphan-result"));
+    await flushUntil(() => provider.returnCalls === 1);
+    expect(service.readThread(threadId, true).thread.status.type).toBe("systemError");
+    expect(events.some((event) => event.method === "thread/status/changed"
+      && (event.params as { status: { type: string } }).status.type === "notLoaded")).toBe(false);
+    expect(terminalEvents(events)).toHaveLength(1);
+    await service.close();
+  });
+
+  it.each([false, true])("keeps a notification arriving before the first token for the next request (ephemeral=%s)", async (ephemeral) => {
+    // 2026-09-07 capture: requesting → task_notification → message_start →
+    // human result → command completed → autonomous Bash → tool result.
+    // The first request was already in flight when the background task finished.
+    const { service, provider, threadId, turnId, events } = await fixture(ephemeral);
+    provider.push(
+      messageStart(),
+      taskStarted("overlay"),
+      status("requesting"),
+      tasksChanged([]),
+      taskNotification("overlay"),
+      messageStart(),
+      ...streamedText(0, "Waiting for the overlay."),
+      assistantText("Waiting for the overlay."),
+      { ...result(), origin: { kind: "human" } } as unknown as SDKMessage,
+      command("completed"),
+    );
+    await flush();
+    expect(terminalEvents(events)).toHaveLength(0);
+    expect(service.readThread(threadId, true).thread.turns[0]).toMatchObject({ id: turnId, status: "inProgress" });
+
+    provider.push(
+      status("requesting"),
+      messageStart(),
+      ...streamedBlock(0, { type: "tool_use", id: "read-overlay", name: "Bash", input: { command: "cat overlay.log" } }),
+      toolResult("read-overlay"),
+      messageStart(),
+      ...streamedText(0, "Overlay complete."),
+      assistantText("Overlay complete."),
+      result("task-notification"),
+    );
+    await flushUntil(() => terminalEvents(events).length === 1);
+    expect(service.readThread(threadId, true).thread.turns).toEqual([
+      expect.objectContaining({ id: turnId, status: "completed", items: expect.arrayContaining([
+        expect.objectContaining({ type: "agentMessage", text: "Overlay complete.", phase: "final_answer" }),
+      ]) }),
+    ]);
+    expect(events.some((event) => event.method === "thread/status/changed"
+      && (event.params as { status: { type: string } }).status.type === "notLoaded")).toBe(false);
+    expect(provider.returnCalls).toBe(0);
+    await service.close();
+  });
+
   it("keeps the captured 6047ms requesting TTFT in one original turn", async () => {
     vi.useFakeTimers();
     const { service, provider, threadId, turnId, events } = await fixture();

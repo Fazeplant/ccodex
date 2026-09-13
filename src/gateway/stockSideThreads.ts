@@ -12,7 +12,6 @@ import type { SubscriptionHub } from "./subscriptions.js";
 import { isUserSideFork } from "./sideFork.js";
 
 export const STOCK_SIDE_THREAD_SOURCE = "ccodexSide";
-export const STOCK_SIDE_DISCONNECT_GRACE_MS = 60 * 60_000;
 
 type PendingKind = "create" | "delete" | "promote";
 
@@ -35,7 +34,8 @@ function isThread(value: unknown): value is Thread {
 }
 
 function isMarked(thread: Thread): boolean {
-  return thread.threadSource === STOCK_SIDE_THREAD_SOURCE;
+  return thread.threadSource === STOCK_SIDE_THREAD_SOURCE
+    || thread.threadSource?.startsWith(`${STOCK_SIDE_THREAD_SOURCE}:`) === true;
 }
 
 async function hasPersistedMarker(thread: Thread): Promise<boolean> {
@@ -49,8 +49,9 @@ async function hasPersistedMarker(thread: Thread): Promise<boolean> {
         type?: unknown;
         payload?: { thread_source?: unknown };
       };
-      return record.type === "session_meta"
-        && record.payload?.thread_source === STOCK_SIDE_THREAD_SOURCE;
+      if (record.type !== "session_meta" || typeof record.payload?.thread_source !== "string") return false;
+      thread.threadSource = record.payload.thread_source;
+      return isMarked(thread);
     }
     return false;
   } catch {
@@ -71,20 +72,17 @@ export class StockSideThreads {
   private readonly pending = new Map<string, Pending>();
   private readonly connectionsByThread = new Map<string, Set<string>>();
   private readonly threadsByConnection = new Map<string, Set<string>>();
-  private readonly cleanupTimers = new Map<string, NodeJS.Timeout>();
   private readonly publicParents = new Map<string, string>();
   private readonly publicSources = new Map<string, string>();
   private readonly publicIds = new Map<string, string>();
   private readonly optimisticBySource = new Map<string, string[]>();
   private readonly serverRequests = new Map<string, RequestId>();
   private readonly serverRequestAliases = new Map<string, string>();
-  private closed = false;
 
   public constructor(
     private readonly enabled: boolean,
     private readonly cleanupStock: StockRpc,
     private readonly logger: Logger,
-    private readonly graceMs = STOCK_SIDE_DISCONNECT_GRACE_MS,
   ) {}
 
   public async recover(): Promise<void> {
@@ -98,8 +96,8 @@ export class StockSideThreads {
       for (const thread of result.data) {
         if (!await hasPersistedMarker(thread)) continue;
         this.hidden.add(thread.id);
-        const ageMs = Math.max(0, Date.now() - thread.updatedAt * 1_000);
-        this.scheduleCleanup(thread.id, Math.max(0, this.graceMs - ageMs));
+        const publicId = thread.threadSource?.slice(STOCK_SIDE_THREAD_SOURCE.length + 1);
+        if (publicId) this.publicIds.set(thread.id, publicId);
       }
       cursor = result.nextCursor;
     } while (cursor);
@@ -167,6 +165,12 @@ export class StockSideThreads {
     publicSideThreadId: string,
   ): Promise<{ response: ThreadForkResponse; backendThreadId: string }> {
     this.publicSources.set(params.threadId, publicSourceThreadId);
+    const recovered = [...this.publicIds].find(([, publicId]) => publicId === publicSideThreadId)?.[0];
+    if (recovered) {
+      this.publicParents.set(recovered, publicSourceThreadId);
+      const response = await this.cleanupStock.request("thread/resume", { threadId: recovered }) as ThreadForkResponse;
+      return { response: { ...response, thread: this.projectThread(response.thread) }, backendThreadId: recovered };
+    }
     const pending = this.optimisticBySource.get(params.threadId) ?? [];
     pending.push(publicSideThreadId);
     this.optimisticBySource.set(params.threadId, pending);
@@ -174,7 +178,7 @@ export class StockSideThreads {
       const response = await this.cleanupStock.request("thread/fork", {
         ...params,
         ephemeral: false,
-        threadSource: STOCK_SIDE_THREAD_SOURCE,
+        threadSource: `${STOCK_SIDE_THREAD_SOURCE}:${publicSideThreadId}`,
       }) as ThreadForkResponse;
       this.bindOptimistic(response.thread, publicSideThreadId);
       return {
@@ -187,6 +191,12 @@ export class StockSideThreads {
       if (index >= 0) queued!.splice(index, 1);
       if (queued?.length === 0) this.optimisticBySource.delete(params.threadId);
     }
+  }
+
+  public restoreOptimistic(publicThreadId: string, backendThreadId: string, publicParentId: string | null): void {
+    this.hidden.add(backendThreadId);
+    this.publicIds.set(backendThreadId, publicThreadId);
+    if (publicParentId) this.publicParents.set(backendThreadId, publicParentId);
   }
 
   public async discardOptimistic(publicThreadId: string): Promise<void> {
@@ -259,6 +269,11 @@ export class StockSideThreads {
       if (pending?.kind === "delete" && "result" in message && pending.threadId) this.forget(pending.threadId);
       if (pending?.kind === "promote" && "result" in message && pending.threadId) {
         this.detachThread(pending.connectionId, pending.threadId);
+        const threadId = pending.threadId;
+        void this.cleanupStock.request("thread/delete", { threadId }).then(
+          () => this.forget(threadId),
+          (error: unknown) => this.logger.warn("stock.side.cleanup-failed", { threadId, error: String(error) }),
+        );
       }
       if (pending?.kind === "create" && "result" in message) {
         const thread = this.resultThread(message.result);
@@ -287,9 +302,15 @@ export class StockSideThreads {
         : undefined;
       const backendThreadId = typeof params?.threadId === "string" ? params.threadId : undefined;
       const publicThreadId = backendThreadId ? this.publicIds.get(backendThreadId) : undefined;
-      return forward(publicThreadId
+      const projected = publicThreadId
         ? projectRpcToPublicThread(message, { backendThreadId: backendThreadId!, publicThreadId })
-        : message);
+        : message;
+      if (backendThreadId && this.hidden.has(backendThreadId)
+        && "method" in projected && projected.method === "thread/status/changed"
+        && (projected.params as { status: { type: string } }).status.type === "notLoaded") {
+        return forward({ ...projected, params: { ...projected.params as object, status: { type: "idle" } } });
+      }
+      return forward(projected);
     }
     if (isMarked(thread)) {
       if (trackConnection) this.attach(connectionId, thread.id);
@@ -322,6 +343,10 @@ export class StockSideThreads {
     return this.hidden;
   }
 
+  public loadedSideIds(): string[] {
+    return [...this.hidden].map((id) => this.publicIds.get(id) ?? id);
+  }
+
   public detachConnection(connectionId: string): void {
     for (const threadId of this.threadsByConnection.get(connectionId) ?? []) this.detachThread(connectionId, threadId);
     this.threadsByConnection.delete(connectionId);
@@ -331,9 +356,6 @@ export class StockSideThreads {
   }
 
   public close(): void {
-    this.closed = true;
-    for (const timer of this.cleanupTimers.values()) clearTimeout(timer);
-    this.cleanupTimers.clear();
     this.pending.clear();
     this.publicParents.clear();
     this.publicSources.clear();
@@ -363,9 +385,6 @@ export class StockSideThreads {
 
   private attach(connectionId: string, threadId: string): void {
     this.hidden.add(threadId);
-    const timer = this.cleanupTimers.get(threadId);
-    if (timer) clearTimeout(timer);
-    this.cleanupTimers.delete(threadId);
     const connections = this.connectionsByThread.get(threadId) ?? new Set<string>();
     connections.add(connectionId);
     this.connectionsByThread.set(threadId, connections);
@@ -381,30 +400,9 @@ export class StockSideThreads {
     const threads = this.threadsByConnection.get(connectionId);
     threads?.delete(threadId);
     if (threads?.size === 0) this.threadsByConnection.delete(connectionId);
-    if (!this.connectionsByThread.has(threadId)) this.scheduleCleanup(threadId, this.graceMs);
-  }
-
-  private scheduleCleanup(threadId: string, delayMs: number): void {
-    if (this.closed || this.cleanupTimers.has(threadId)) return;
-    const timer = setTimeout(() => {
-      this.cleanupTimers.delete(threadId);
-      if (this.connectionsByThread.has(threadId)) return;
-      void this.cleanupStock.request("thread/delete", { threadId }).then(
-        () => this.forget(threadId),
-        (error: unknown) => {
-          this.logger.warn("stock.side.cleanup-failed", { threadId, error: String(error) });
-          this.scheduleCleanup(threadId, Math.min(this.graceMs, 60_000));
-        },
-      );
-    }, delayMs);
-    timer.unref();
-    this.cleanupTimers.set(threadId, timer);
   }
 
   private forget(threadId: string): void {
-    const timer = this.cleanupTimers.get(threadId);
-    if (timer) clearTimeout(timer);
-    this.cleanupTimers.delete(threadId);
     this.hidden.delete(threadId);
     this.publicParents.delete(threadId);
     this.publicIds.delete(threadId);
@@ -426,9 +424,11 @@ export class StockSideThreads {
     return {
       ...thread,
       id: this.publicIds.get(thread.id) ?? thread.id,
+      sessionId: this.publicIds.get(thread.id) ?? thread.sessionId,
       ephemeral: true,
       path: null,
       threadSource: "user",
+      status: thread.status.type === "notLoaded" ? { type: "idle" } : thread.status,
       forkedFromId: this.publicParents.get(thread.id)
         ?? (thread.forkedFromId
           ? this.publicIds.get(thread.forkedFromId) ?? this.publicSources.get(thread.forkedFromId)

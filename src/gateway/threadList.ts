@@ -99,7 +99,7 @@ export class ThreadCatalog {
     private readonly claude: ClaudeService,
     private readonly cursors: CursorCodec,
     private readonly logical?: ThreadCatalogProjection,
-    private readonly sideThreads?: Partial<Pick<StockSideThreads, "filterThreads" | "hiddenIds">>,
+    private readonly sideThreads?: Partial<Pick<StockSideThreads, "filterThreads" | "hiddenIds" | "loadedSideIds">>,
   ) {}
 
   private async projected(params: ThreadListParams): Promise<Thread[]> {
@@ -190,11 +190,14 @@ export class ThreadCatalog {
     };
   }
 
-  public async loaded(params: ThreadLoadedListParams): Promise<ThreadLoadedListResponse> {
+  public async loaded(params: ThreadLoadedListParams, projectSides?: (ids: string[]) => string[]): Promise<ThreadLoadedListResponse> {
     const hidden = this.sideThreads?.hiddenIds
-      ? { hiddenIds: this.sideThreads.hiddenIds.bind(this.sideThreads) }
+      ? {
+          hiddenIds: this.sideThreads.hiddenIds.bind(this.sideThreads),
+          loadedSideIds: () => this.sideThreads?.loadedSideIds?.() ?? [],
+        }
       : undefined;
-    return mergedLoadedList(params, this.stock, this.claude, this.cursors, this.logical, hidden);
+    return mergedLoadedList(params, this.stock, this.claude, this.cursors, this.logical, hidden, projectSides);
   }
 
   public async remoteSnapshot(): Promise<RemoteCatalogSnapshot> {
@@ -269,7 +272,8 @@ export async function mergedLoadedList(
   claude: ClaudeService,
   cursors: CursorCodec,
   logical?: { projectLoadedThreadIds(stock: string[], claude: string[]): string[] },
-  sideThreads?: Pick<StockSideThreads, "hiddenIds">,
+  sideThreads?: Pick<StockSideThreads, "hiddenIds"> & Partial<Pick<StockSideThreads, "loadedSideIds">>,
+  projectSides?: (ids: string[]) => string[],
 ): Promise<ThreadLoadedListResponse> {
   const [stockIds, stockThreads] = await Promise.all([
     allStockLoaded(stock),
@@ -278,9 +282,11 @@ export async function mergedLoadedList(
   const hidden = sideThreads?.hiddenIds(stockThreads) ?? new Set<string>();
   const visibleStockIds = stockIds.filter((id) => !hidden.has(id));
   const claudeIds = claude.loadedThreadIds();
-  const data = logical
+  const projected = logical
     ? logical.projectLoadedThreadIds(visibleStockIds, claudeIds)
     : [...new Set([...visibleStockIds, ...claudeIds])];
+  const retained = [...new Set([...projected, ...sideThreads?.loadedSideIds?.() ?? []])];
+  const data = projectSides ? projectSides(retained) : retained;
   const version = createHash("sha256").update(data.join("\0")).digest("hex").slice(0, 16);
   const query = queryFingerprint({});
   const cursor = cursors.decode<OffsetCursor>("loaded", params.cursor);

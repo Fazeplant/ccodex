@@ -263,7 +263,7 @@ interface TurnLifecycle {
   commandCompleted: boolean;
   notifications: number;
   acknowledged: number;
-  request?: { covers: number; started: boolean };
+  request?: { covers: number; beforeFirstToken: number; started: boolean };
   diagnosed: number;
   goals: number;
   goalInFlight: boolean;
@@ -1849,13 +1849,23 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           });
         }
         if (failure) {
+          this.runtimeDependencies?.logger.error("claude.provider.projection-failed", {
+            threadId: this.threadId, providerEventType: fact.providerEventType, error: failure,
+          });
           await this.submitProviderProjection(fact.runtimeGeneration, {
-            type: "runtimeExited",
+            type: "runtimeFailed",
             runtimeGeneration: fact.runtimeGeneration,
             message: `Claude provider projection failed: ${failure}`,
             codexErrorInfo: null,
           });
           runtime.beginClose();
+          // Retire outside the provider consumer: close() drains that same
+          // consumer, so awaiting it here would deadlock.
+          void this.retireRuntime(`Claude provider projection failed: ${failure}`).catch((error: unknown) => {
+            this.runtimeDependencies?.logger.error("claude.runtime.retirement-failed", {
+              threadId: this.threadId, error: String(error),
+            });
+          });
         }
       },
     );
@@ -4859,7 +4869,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
             ...record,
             thread: {
               ...record.thread,
-              status: { type: command.type === "runtimeFailed" ? "systemError" as const : "notLoaded" as const },
+              status: { type: command.type === "runtimeFailed" ? "systemError" as const
+                : record.thread.ephemeral && record.thread.threadSource === "user" && !record.thread.parentThreadId
+                  ? "idle" as const : "notLoaded" as const },
               updatedAt: Math.floor(Date.now() / 1_000),
             },
           };
@@ -6453,20 +6465,18 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     }
     else if (fact.type === "taskNotification" && active) {
       active.notifications += 1;
-      if (active.request && !active.request.started) active.request.covers = active.notifications;
       if (active.result && (!active.commandObserved || active.commandCompleted)) this.scheduleContinuation(true);
     } else if (fact.type === "request" && active) {
-      if (!fact.messageStarted && active.request?.started
-        && active.notifications > active.request.covers) {
-        active.request = { covers: active.notifications, started: false };
-        this.cancelContinuation();
-      } else if (!active.request && (this.hasNotifications() || active.result)) {
-        active.request = { covers: active.notifications, started: false };
+      if (!fact.messageStarted || !active.request) {
+        active.request = { covers: active.notifications, beforeFirstToken: active.notifications, started: false };
         this.cancelContinuation();
       }
       if (fact.messageStarted) {
         if (active.result && (this.hasNotifications() || active.goals > 0)) delete active.result;
-        if (active.request) active.request.started = true;
+        if (active.request && !active.request.started) {
+          active.request.beforeFirstToken = active.notifications;
+          active.request.started = true;
+        }
         active.goalInFlight = active.goals > 0;
         this.cancelContinuation();
       }
@@ -6482,7 +6492,14 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       }
     } else if (fact.type === "result" && active) {
       if (active.goalInFlight) { active.goals = Math.max(0, active.goals - 1); active.goalInFlight = false; }
-      if (active.request) { active.acknowledged = Math.max(active.acknowledged, active.request.covers); delete active.request; }
+      if (active.request) {
+        // A human request cannot consume notifications that arrive while it is
+        // already in flight. A task-notification request may announce its own
+        // notification after requesting, but before its first streamed token.
+        const covers = fact.origin === "task-notification" ? active.request.beforeFirstToken : active.request.covers;
+        active.acknowledged = Math.max(active.acknowledged, covers);
+        delete active.request;
+      }
       else if (fact.origin === "task-notification") active.acknowledged = active.notifications;
       active.result = { status: fact.status, codexErrorInfo: fact.codexErrorInfo,
         ...(fact.errorMessage ? { errorMessage: fact.errorMessage } : {}) };

@@ -189,7 +189,7 @@ function fakeClaude() {
       };
     }),
     prepareResume: vi.fn(async (params: { threadId: string }) => ({
-      response: { thread: { id: params.threadId } },
+      response: { thread: stockThread(params.threadId) },
       notifyGoalSnapshot: vi.fn(),
     })),
     listQueue: vi.fn((_params: { threadId: string }) => ({ data: [], nextCursor: null })),
@@ -2253,6 +2253,17 @@ describe("provider-aware rate-limit gateway routing", () => {
     }));
     expect(claude.replayPendingRequests).toHaveBeenCalledWith("claude-side-backend", expect.any(String));
     expect(JSON.stringify(second.client.sent)).not.toContain("claude-side-backend");
+
+    second.client.request("unsubscribe", "thread/unsubscribe", { threadId: publicSideId });
+    await settle();
+    expect(messages(second, "unsubscribe")[0]).toMatchObject({ result: { status: "unsubscribed" } });
+    expect(claude.deleteThread).not.toHaveBeenCalled();
+    expect(optimistic.owns(publicSideId)).toBe(true);
+    second.client.request("resume-again", "thread/resume", { threadId: publicSideId });
+    await settle();
+    expect(messages(second, "resume-again")[0]).toMatchObject({ result: {
+      thread: { id: publicSideId, sessionId: publicSideId, ephemeral: true, status: { type: "idle" } },
+    } });
   });
 
   it("reports a preparation failure once after reconnect instead of losing it with the old socket", async () => {

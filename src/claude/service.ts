@@ -486,7 +486,7 @@ export class ClaudeService {
           invalidateModelCatalog: () => this.modelCatalog?.invalidate?.(),
           ...(this.skillsChanged ? { skillsChanged: this.skillsChanged } : {}),
           isClosing: () => this.closing,
-          persistUserSideSessions: this.config.features?.sideChatPromotion ?? true,
+          persistUserSideSessions: true,
           interactiveQuestions: this.config.features?.interactiveQuestions ?? true,
           resolveChildModel: (model) => {
             const value = normalizeClaudeModelIdentifier(model);
@@ -1371,7 +1371,7 @@ export class ClaudeService {
   public scheduleEphemeralRelease(threadId: string, delayMs = EPHEMERAL_DISCONNECT_GRACE_MS): void {
     if (this.closing || this.ephemeralReleaseTimers.has(threadId)) return;
     const record = this.store.getThreadRecord(threadId, false);
-    if (!record?.thread.ephemeral || record.thread.parentThreadId) return;
+    if (!record?.thread.ephemeral || record.thread.parentThreadId || record.thread.threadSource === "user") return;
     const timer = setTimeout(() => {
       this.ephemeralReleaseTimers.delete(threadId);
       void this.releaseEphemeralThread(threadId).catch((error: unknown) => {
@@ -1430,7 +1430,13 @@ export class ClaudeService {
   public async forkThread(
     params: ThreadForkParams,
     visibleForkedFromId: string = params.threadId,
+    reservedSideId?: string,
   ): Promise<ThreadForkResponse> {
+    if (reservedSideId && this.store.hasThread(reservedSideId)) {
+      const session = await this.sessions.getOrCreate(reservedSideId);
+      await session.ensureEphemeralRuntime();
+      return threadResponse(this.requireRecord(reservedSideId, false), false) as ThreadForkResponse;
+    }
     if (params.path) throw invalidParams("Claude thread forks must use threadId, not a Codex rollout path.");
     this.requireIndependentThread(params.threadId, "fork");
     if (params.lastTurnId && params.beforeTurnId)
@@ -1525,7 +1531,7 @@ export class ClaudeService {
       cwd: sourceRecord.thread.cwd,
       runtimeWorkspaceRoots: storedWorkspaceRoots(sourceRecord),
     });
-    const threadId = uuidv7();
+    const threadId = reservedSideId ?? uuidv7();
     const thread: Thread = {
       ...sourceRecord.thread, id: threadId, ephemeral: params.ephemeral ?? false,
       section: null, sectionEnteredAt: null, projectId: null,
@@ -2108,6 +2114,10 @@ export class ClaudeService {
   }
 
   private withNativeMetadata(record: ClaudeThreadRecord): Thread {
+    if (record.thread.ephemeral && record.thread.threadSource === "user"
+      && !record.thread.parentThreadId && record.thread.status.type === "notLoaded") {
+      record = { ...record, thread: { ...record.thread, status: { type: "idle" } } };
+    }
     const native = this.nativeMetadata.get(record.claudeSessionId);
     if (!native) return {
       ...record.thread,

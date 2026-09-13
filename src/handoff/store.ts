@@ -2,11 +2,24 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Thread } from "../codex/generated/v2/Thread.js";
+import type { ThreadForkParams } from "../codex/generated/v2/ThreadForkParams.js";
+import type { ThreadForkResponse } from "../codex/generated/v2/ThreadForkResponse.js";
+import type { ThreadInjectItemsParams } from "../codex/generated/v2/ThreadInjectItemsParams.js";
 import type { ThreadSettingsUpdateParams } from "../codex/generated/v2/ThreadSettingsUpdateParams.js";
 import type { Turn } from "../codex/generated/v2/Turn.js";
 import type { TurnStartParams } from "../codex/generated/v2/TurnStartParams.js";
 
 export type ProviderKind = "claude" | "stock";
+
+/** Routing and preparation metadata only; the provider owns the conversation. */
+export interface SideThreadRecord {
+  readonly response: ThreadForkResponse;
+  readonly preparation?: { provider: ProviderKind; params: ThreadForkParams };
+  readonly target?: { provider: ProviderKind; backendThreadId: string };
+  readonly failure?: string;
+  readonly deleted?: boolean;
+  readonly injections?: Array<ThreadInjectItemsParams["items"]>;
+}
 
 export interface PendingProviderSwitch {
   readonly threadId: string;
@@ -276,6 +289,10 @@ export class HandoffStore {
       PRAGMA synchronous=FULL;
       PRAGMA busy_timeout=5000;
       PRAGMA foreign_keys=ON;
+      CREATE TABLE IF NOT EXISTS side_threads (
+        public_thread_id TEXT PRIMARY KEY,
+        record_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS pending_provider_switches (
         thread_id TEXT PRIMARY KEY,
         source_provider TEXT NOT NULL,
@@ -1062,6 +1079,20 @@ export class HandoffStore {
 
   public clearOverlay(threadId: string): void {
     this.database.prepare("DELETE FROM stock_history_overlays WHERE thread_id = ?").run(threadId);
+  }
+
+  public saveSideThread(record: SideThreadRecord): void {
+    this.database.prepare("INSERT OR REPLACE INTO side_threads (public_thread_id, record_json) VALUES (?, ?)")
+      .run(record.response.thread.id, JSON.stringify(record));
+  }
+
+  public sideThreads(): SideThreadRecord[] {
+    return (this.database.prepare("SELECT record_json FROM side_threads").all() as Array<{ record_json: string }>)
+      .map((row) => JSON.parse(row.record_json) as SideThreadRecord);
+  }
+
+  public deleteSideThread(threadId: string): void {
+    this.database.prepare("DELETE FROM side_threads WHERE public_thread_id = ?").run(threadId);
   }
 
   public close(): void {

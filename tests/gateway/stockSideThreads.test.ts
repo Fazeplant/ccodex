@@ -35,7 +35,7 @@ describe("stock side-chat promotion", () => {
       requests.push({ method, params });
       return method === "thread/list" ? { data: [], nextCursor: null } : {};
     } };
-    const sides = new StockSideThreads(true, cleanupStock as never, new Logger("error"), 10);
+    const sides = new StockSideThreads(true, cleanupStock as never, new Logger("error"));
     const create = await sides.prepareRequest("app", {
       id: "create", method: "thread/fork", params: {
         threadId: "parent", ephemeral: true, excludeTurns: true,
@@ -182,30 +182,33 @@ describe("stock side-chat promotion", () => {
     sides.close();
   });
 
-  it("deletes an abandoned hidden rollout after the disconnect grace", async () => {
+  it("keeps a disconnected hidden rollout beyond 24 hours", async () => {
     vi.useFakeTimers();
     const deleted: string[] = [];
     const stock = { request: async (method: string, params: unknown) => {
       if (method === "thread/delete") deleted.push((params as { threadId: string }).threadId);
       return method === "thread/list" ? { data: [], nextCursor: null } : {};
     } };
-    const sides = new StockSideThreads(true, stock as never, new Logger("error"), 1_000);
+    const sides = new StockSideThreads(true, stock as never, new Logger("error"));
     sides.projectMessage("app", { method: "thread/started", params: { thread: thread("side") } });
     sides.detachConnection("app");
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(deleted).toEqual(["side"]);
+    await vi.advanceTimersByTimeAsync(25 * 60 * 60_000);
+    expect(deleted).toEqual([]);
+    expect(forwarded(sides.projectMessage("second-app", {
+      method: "thread/status/changed", params: { threadId: "side", status: { type: "notLoaded" } },
+    }))).toMatchObject({ params: { threadId: "side", status: { type: "idle" } } });
     sides.close();
     vi.useRealTimers();
   });
 
-  it("starts the cleanup grace after a successful promotion", async () => {
+  it("removes the obsolete hidden rollout after a successful explicit promotion", async () => {
     vi.useFakeTimers();
     const deleted: string[] = [];
     const stock = { request: async (method: string, params: unknown) => {
       if (method === "thread/delete") deleted.push((params as { threadId: string }).threadId);
       return method === "thread/list" ? { data: [], nextCursor: null } : {};
     } };
-    const sides = new StockSideThreads(true, stock as never, new Logger("error"), 1_000);
+    const sides = new StockSideThreads(true, stock as never, new Logger("error"));
     sides.projectMessage("app", { method: "thread/started", params: { thread: thread("side") } });
     await sides.prepareRequest("app", {
       id: "promote", method: "thread/fork", params: { threadId: "side", threadSource: "user" },
@@ -219,25 +222,36 @@ describe("stock side-chat promotion", () => {
     vi.useRealTimers();
   });
 
-  it("recovers a hidden rollout when stock thread/list drops its custom threadSource", async () => {
+  it.each([STOCK_SIDE_THREAD_SOURCE, `${STOCK_SIDE_THREAD_SOURCE}:public-side`])(
+    "recovers a hidden rollout with marker %s when stock thread/list drops its custom threadSource", async (marker) => {
     const directory = await mkdtemp(join(tmpdir(), "ccodex-side-recovery-"));
     try {
       const hidden = thread("hidden", null);
       hidden.path = join(directory, "hidden.jsonl");
       await writeFile(hidden.path, `${JSON.stringify({
         type: "session_meta",
-        payload: { id: hidden.id, thread_source: STOCK_SIDE_THREAD_SOURCE },
+        payload: { id: hidden.id, thread_source: marker },
       })}\n`);
       const visible = thread("visible", "user");
       const stock = { request: vi.fn(async (method: string) =>
         method === "thread/list"
           ? { data: [hidden, visible], nextCursor: null }
-          : {}) };
+          : { thread: hidden }) };
       const sides = new StockSideThreads(true, stock as never, new Logger("error"));
 
       await sides.recover();
 
       expect(sides.filterThreads([hidden, visible]).map((item) => item.id)).toEqual(["visible"]);
+      if (marker.endsWith(":public-side")) {
+        const prepared = await sides.prepareOptimisticSide({
+          threadId: "parent", ephemeral: true, excludeTurns: true,
+        }, "public-parent", "public-side");
+        expect(prepared).toMatchObject({
+          backendThreadId: "hidden",
+          response: { thread: { id: "public-side", sessionId: "public-side", forkedFromId: "public-parent" } },
+        });
+        expect(stock.request.mock.calls.map(([method]) => method)).toEqual(["thread/list", "thread/resume"]);
+      }
       sides.close();
     } finally {
       await rm(directory, { recursive: true, force: true });

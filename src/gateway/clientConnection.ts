@@ -437,11 +437,18 @@ export function attachClientConnection(
     subscribeClaude(threadId);
     subscriptions.mute(threadId, connectionId);
   };
-  const projectSideResult = (publicThreadId: string, target: OptimisticSideTarget, result: unknown) =>
-    projectRpcToPublicThread(
+  const projectSideResult = (publicThreadId: string, target: OptimisticSideTarget, result: unknown) => {
+    const projected = projectRpcToPublicThread(
       { result },
       { publicThreadId, backendThreadId: target.backendThreadId },
     ).result;
+    const thread = (projected as { thread?: Thread })?.thread;
+    if (!thread || thread.id !== publicThreadId) return projected;
+    return { ...projected as object, thread: {
+      ...thread, sessionId: publicThreadId, ephemeral: true, path: null, threadSource: "user",
+      status: thread.status.type === "notLoaded" ? { type: "idle" } : thread.status,
+    } };
+  };
   const projectSideParams = (publicThreadId: string, target: OptimisticSideTarget, params: unknown) =>
     projectRpcToPublicThread(
       { params },
@@ -461,6 +468,7 @@ export function attachClientConnection(
     snapshot: ThreadForkResponse,
     provider: OptimisticSideTarget["provider"],
     prepare: () => Promise<OptimisticSideTarget>,
+    forkParams: ThreadForkParams,
   ) => {
     const threadId = snapshot.thread.id;
     subscriptions.subscribe(threadId, connectionId, notificationSink, serverRequestSink);
@@ -477,6 +485,7 @@ export function attachClientConnection(
         }
       },
       reportOptimisticFailure,
+      { provider, params: forkParams },
     );
     sendResult(requestId, response);
     sendJson({ method: "thread/started", params: { thread: response.thread } });
@@ -527,7 +536,7 @@ export function attachClientConnection(
     }
     if (request.method === "thread/unsubscribe") {
       subscriptions.unsubscribe(publicThreadId, connectionId);
-      await sides.delete(publicThreadId);
+      sides.detach(publicThreadId, connectionId);
       sendResult(request.id, { status: "unsubscribed" });
       clearForeground(publicThreadId);
       return;
@@ -540,8 +549,8 @@ export function attachClientConnection(
       return;
     }
     if (request.method === "thread/inject_items") {
-      const queued = sides.run(publicThreadId, async (target) => {
-        const params = { ...publicParams, threadId: target.backendThreadId };
+      const queued = sides.inject(publicThreadId, (publicParams as ThreadInjectItemsParams).items, async (target, items) => {
+        const params = { ...publicParams, items, threadId: target.backendThreadId };
         try {
           if (target.provider === "claude") {
             await claude.injectItems(params as unknown as ThreadInjectItemsParams);
@@ -838,7 +847,10 @@ export function attachClientConnection(
           return;
         }
         if (message.method === "thread/loaded/list") {
-          sendResult(message.id, await catalog.loaded((message.params ?? {}) as ThreadLoadedListParams));
+          sendResult(message.id, await catalog.loaded(
+            (message.params ?? {}) as ThreadLoadedListParams,
+            optimisticSideThreads?.projectLoadedIds.bind(optimisticSideThreads),
+          ));
           return;
         }
         if (message.method === "thread/search") {
@@ -1116,7 +1128,7 @@ export function attachClientConnection(
                     const result = await claude.forkThread({
                       ...forkParams,
                       threadId: logicalSource.epoch.backendThreadId,
-                    }, forkParams.threadId);
+                    }, forkParams.threadId, targetThreadId);
                     subscriptions.aliasThread(result.thread.id, targetThreadId);
                     claude.cancelEphemeralRelease(result.thread.id);
                     return { provider: "claude", backendThreadId: result.thread.id };
@@ -1129,6 +1141,7 @@ export function attachClientConnection(
                   );
                   return { provider: "stock", backendThreadId: prepared.backendThreadId };
                 },
+                { ...forkParams, threadId: logicalSource.epoch.backendThreadId },
               );
               return;
             }
@@ -1171,7 +1184,7 @@ export function attachClientConnection(
                 sourceProvider,
                 async () => {
                   if (sourceProvider === "claude") {
-                    const result = await claude.forkThread(completedParams, forkParams.threadId);
+                    const result = await claude.forkThread(completedParams, forkParams.threadId, targetThreadId);
                     subscriptions.aliasThread(result.thread.id, targetThreadId);
                     claude.cancelEphemeralRelease(result.thread.id);
                     return { provider: "claude", backendThreadId: result.thread.id };
@@ -1184,6 +1197,7 @@ export function attachClientConnection(
                   );
                   return { provider: "stock", backendThreadId: prepared.backendThreadId };
                 },
+                completedParams,
               );
               return;
             }

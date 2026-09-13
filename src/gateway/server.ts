@@ -144,10 +144,39 @@ async function startGatewayOwner(
   handoffs.configureSubscriptions(subscriptions);
   activeHandoffs = handoffs;
   handoffs.configureDaemonStock(handoffStockRpc);
-  const optimisticSideThreads = new OptimisticSideThreads();
+  const optimisticSideThreads = new OptimisticSideThreads(persistence.operational);
   await stockSideThreads.recover().catch((error: unknown) => {
     logger.warn("stock.side.recovery-failed", { error: String(error) });
   });
+  optimisticSideThreads.recover(
+    async (record) => {
+      const { provider, params } = record.preparation!;
+      const publicId = record.response.thread.id;
+      const publicParentId = record.response.thread.forkedFromId ?? params.threadId;
+      if (provider === "claude") {
+        const result = await claude.forkThread(params, publicParentId, publicId);
+        return { provider, backendThreadId: result.thread.id };
+      }
+      const result = await stockSideThreads.prepareOptimisticSide(params, publicParentId, publicId);
+      return { provider, backendThreadId: result.backendThreadId };
+    },
+    async (publicId, target) => {
+      if (target.provider === "claude") {
+        if (claude.ownsThread(target.backendThreadId)) await claude.deleteThread(target.backendThreadId);
+        subscriptions.unaliasThread(target.backendThreadId);
+      } else await stockSideThreads.discardOptimistic(publicId);
+    },
+    (publicId, target, response) => {
+      if (target.provider === "claude") subscriptions.aliasThread(target.backendThreadId, publicId);
+      else stockSideThreads.restoreOptimistic(publicId, target.backendThreadId, response.thread.forkedFromId);
+    },
+    (threadId, error) => logger.error("side.recovery-failed", { threadId, error: error.message }),
+    async (target, items) => {
+      const params = { threadId: target.backendThreadId, items };
+      if (target.provider === "claude") await claude.injectItems(params);
+      else await stockSideThreads.request("thread/inject_items", params);
+    },
+  );
   const threadCatalog = new ThreadCatalog(
     handoffStockRpc,
     claude,

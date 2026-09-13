@@ -1,6 +1,6 @@
 import type { ThreadForkResponse } from "../codex/generated/v2/ThreadForkResponse.js";
-
-export const OPTIMISTIC_SIDE_GRACE_MS = 60 * 60_000;
+import type { ThreadInjectItemsParams } from "../codex/generated/v2/ThreadInjectItemsParams.js";
+import type { HandoffStore, SideThreadRecord } from "../handoff/store.js";
 
 export interface OptimisticSideTarget {
   readonly provider: "claude" | "stock";
@@ -14,12 +14,14 @@ interface State {
   readonly ready: Promise<OptimisticSideTarget>;
   readonly resolve: (target: OptimisticSideTarget) => void;
   readonly reject: (error: Error) => void;
+  readonly preparation?: SideThreadRecord["preparation"];
   tail: Promise<void>;
   target?: OptimisticSideTarget;
   failure?: Error;
   failureReported: boolean;
   deleted: boolean;
-  timer?: NodeJS.Timeout;
+  deletion?: Promise<void>;
+  readonly injections: Array<ThreadInjectItemsParams["items"]>;
 }
 
 function deferred<T>(): {
@@ -38,8 +40,9 @@ function deferred<T>(): {
 
 export class OptimisticSideThreads {
   private readonly states = new Map<string, State>();
+  private closed = false;
 
-  public constructor(private readonly graceMs = OPTIMISTIC_SIDE_GRACE_MS) {}
+  public constructor(private readonly store?: Pick<HandoffStore, "saveSideThread" | "sideThreads" | "deleteSideThread">) {}
 
   public open(
     connectionId: string,
@@ -47,6 +50,8 @@ export class OptimisticSideThreads {
     prepare: () => Promise<OptimisticSideTarget>,
     cleanup: (target: OptimisticSideTarget) => Promise<void>,
     failed: (threadId: string, error: Error) => void,
+    preparation?: SideThreadRecord["preparation"],
+    restored?: SideThreadRecord,
   ): ThreadForkResponse {
     const ready = deferred<OptimisticSideTarget>();
     const state: State = {
@@ -58,32 +63,89 @@ export class OptimisticSideThreads {
       reject: ready.reject,
       tail: Promise.resolve(),
       failureReported: false,
-      deleted: false,
+      deleted: restored?.deleted ?? false,
+      preparation,
+      injections: restored?.injections ?? [],
+      ...(restored?.target ? { target: restored.target } : {}),
+      ...(restored?.failure ? { failure: new Error(restored.failure) } : {}),
     };
     void state.ready.catch(() => undefined);
     this.states.set(response.thread.id, state);
+    this.persist(state);
     queueMicrotask(() => {
-      void prepare().then(async (target) => {
+      if (this.closed) return;
+      const pending = state.target ? Promise.resolve(state.target)
+        : state.failure ? Promise.reject(state.failure) : prepare();
+      void pending.then(async (target) => {
+        if (this.closed) return;
+        state.target = target;
+        this.persist(state);
         if (state.deleted) {
-          await cleanup(target).catch(() => undefined);
-          this.states.delete(response.thread.id);
+          await this.delete(response.thread.id);
           return;
         }
-        state.target = target;
         state.resolve(target);
       }, (value: unknown) => {
+        if (this.closed) return;
         const error = value instanceof Error ? value : new Error(String(value));
         state.failure = error;
+        this.persist(state);
         state.reject(error);
-        if (state.deleted) this.states.delete(response.thread.id);
+        if (state.deleted) this.forgetPromoted(response.thread.id);
         else failed(response.thread.id, error);
-      });
+      }).catch((error: unknown) => failed(response.thread.id, error instanceof Error ? error : new Error(String(error))));
     });
     return response;
   }
 
+  public recover(
+    prepare: (record: SideThreadRecord) => Promise<OptimisticSideTarget>,
+    cleanup: (threadId: string, target: OptimisticSideTarget) => Promise<void>,
+    restored: (threadId: string, target: OptimisticSideTarget, response: ThreadForkResponse) => void,
+    failed: (threadId: string, error: Error) => void,
+    inject?: (target: OptimisticSideTarget, items: ThreadInjectItemsParams["items"]) => Promise<void>,
+  ): void {
+    for (const record of this.store?.sideThreads() ?? []) {
+      const threadId = record.response.thread.id;
+      if (record.target) restored(threadId, record.target, record.response);
+      this.open("", record.response, async () => {
+        const target = await prepare(record);
+        restored(threadId, target, record.response);
+        return target;
+      }, (target) => cleanup(threadId, target), failed, record.preparation, record);
+      if (!record.deleted && record.injections?.length) {
+        void this.run(threadId, (target) => this.flushInjections(this.states.get(threadId)!, target, inject!))
+          .catch((error: unknown) => {
+            const failure = error instanceof Error ? error : new Error(String(error));
+            this.fail(threadId, failure);
+            failed(threadId, failure);
+          });
+      }
+    }
+  }
+
+  private persist(state: State): void {
+    if (this.closed) return;
+    this.store?.saveSideThread({
+      response: state.response,
+      ...(state.preparation ? { preparation: state.preparation } : {}),
+      ...(state.target ? { target: state.target } : {}),
+      ...(state.failure ? { failure: state.failure.message } : {}),
+      ...(state.deleted ? { deleted: true } : {}),
+      ...(state.injections.length ? { injections: state.injections } : {}),
+    });
+  }
+
   public owns(threadId: string): boolean {
     return this.states.has(threadId);
+  }
+
+  public projectLoadedIds(ids: readonly string[]): string[] {
+    const backends = new Set([...this.states.values()].flatMap((state) => state.target?.backendThreadId ?? []));
+    return [...new Set([
+      ...ids.filter((id) => !backends.has(id) && !this.states.get(id)?.deleted),
+      ...[...this.states].filter(([, state]) => !state.deleted).map(([id]) => id),
+    ])];
   }
 
   public snapshot(threadId: string): ThreadForkResponse | undefined {
@@ -109,22 +171,48 @@ export class OptimisticSideThreads {
     if (!state) return Promise.reject(new Error(`Unknown optimistic side thread '${threadId}'.`));
     const result = state.tail.then(async () => {
       if (state.failure) throw state.failure;
-      return operation(await state.ready);
+      const target = await state.ready;
+      if (state.deleted || this.closed) throw new Error(`Side thread '${threadId}' is no longer accepting operations.`);
+      return operation(target);
     });
     state.tail = result.then(() => undefined, () => undefined);
     return result;
   }
 
+  public inject(
+    threadId: string,
+    items: ThreadInjectItemsParams["items"],
+    apply: (target: OptimisticSideTarget, items: ThreadInjectItemsParams["items"]) => Promise<void>,
+  ): Promise<void> {
+    const state = this.states.get(threadId)!;
+    state.injections.push(items);
+    this.persist(state);
+    return this.run(threadId, (target) => this.flushInjections(state, target, apply));
+  }
+
+  private async flushInjections(
+    state: State,
+    target: OptimisticSideTarget,
+    apply: (target: OptimisticSideTarget, items: ThreadInjectItemsParams["items"]) => Promise<void>,
+  ): Promise<void> {
+    while (state.injections.length) {
+      await apply(target, state.injections[0]!);
+      state.injections.shift();
+      this.persist(state);
+    }
+  }
+
   public fail(threadId: string, error: Error): void {
     const state = this.states.get(threadId);
-    if (state && !state.failure) state.failure = error;
+    if (state && !state.failure) {
+      state.failure = error;
+      this.persist(state);
+    }
   }
 
   public attach(threadId: string, connectionId: string): void {
     const state = this.states.get(threadId);
     if (!state) return;
-    if (state.timer) clearTimeout(state.timer);
-    delete state.timer;
     state.connections.add(connectionId);
   }
 
@@ -132,34 +220,36 @@ export class OptimisticSideThreads {
     const state = this.states.get(threadId);
     if (!state) return;
     state.connections.delete(connectionId);
-    if (state.connections.size === 0) this.scheduleCleanup(threadId, state);
   }
 
   public detachConnection(connectionId: string): void {
-    for (const [threadId, state] of this.states) {
-      if (!state.connections.delete(connectionId) || state.connections.size > 0) continue;
-      this.scheduleCleanup(threadId, state);
+    for (const state of this.states.values()) {
+      state.connections.delete(connectionId);
     }
   }
 
   public async delete(threadId: string): Promise<void> {
     const state = this.states.get(threadId);
-    if (!state || state.deleted) return;
+    if (!state) return;
+    if (state.deletion) return state.deletion;
     state.deleted = true;
-    if (state.timer) clearTimeout(state.timer);
+    this.persist(state);
     state.reject(new Error("Optimistic side thread was deleted before preparation completed."));
-    if (state.failure) {
-      this.states.delete(threadId);
+    if (state.failure && !state.target) {
+      this.forgetPromoted(threadId);
       return;
     }
     if (!state.target) return;
-    await state.cleanup(state.target);
-    this.states.delete(threadId);
+    state.deletion = state.cleanup(state.target).then(() => this.forgetPromoted(threadId));
+    try {
+      await state.deletion;
+    } finally {
+      delete state.deletion;
+    }
   }
 
   public forgetPromoted(threadId: string): void {
-    const state = this.states.get(threadId);
-    if (state?.timer) clearTimeout(state.timer);
+    if (!this.closed) this.store?.deleteSideThread(threadId);
     this.states.delete(threadId);
   }
 
@@ -171,16 +261,6 @@ export class OptimisticSideThreads {
   }
 
   public close(): void {
-    for (const state of this.states.values()) if (state.timer) clearTimeout(state.timer);
-  }
-
-  private scheduleCleanup(threadId: string, state: State): void {
-    if (state.timer || state.deleted) return;
-    state.timer = setTimeout(() => {
-      delete state.timer;
-      if (state.connections.size > 0) return;
-      void this.delete(threadId);
-    }, this.graceMs);
-    state.timer.unref();
+    this.closed = true;
   }
 }
