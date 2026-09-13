@@ -54,6 +54,26 @@ describe("merged thread listing", () => {
     await expect(mergedThreadList({ limit: 2, sortDirection: "desc", cursor: `${first.nextCursor}x` }, stock as never, claude as never, cursors)).rejects.toThrow("signature");
   });
 
+  it("forwards state-db and lineage filters to stock instead of scanning the full catalog", async () => {
+    const requests: unknown[] = [];
+    const stock = {
+      request: async (_method: string, params: unknown) => {
+        requests.push(params);
+        return { data: [thread("root", 1), thread("child", 2, "root")], nextCursor: null, backwardsCursor: null };
+      },
+    };
+    const claude = { listThreads: () => [] };
+    const cursors = new CursorCodec(Buffer.alloc(32, 9));
+    const plain = await mergedThreadList({ useStateDbOnly: true, sortDirection: "asc" }, stock as never, claude as never, cursors);
+    expect(requests).toEqual([{ archived: false, cursor: null, limit: 100, useStateDbOnly: true }]);
+    expect(plain.data.map((item) => item.id)).toEqual(["root", "child"]);
+    const descendants = await mergedThreadList({ ancestorThreadId: "root", useStateDbOnly: true }, stock as never, claude as never, cursors);
+    expect(requests[1]).toEqual({ archived: false, cursor: null, limit: 100, useStateDbOnly: true, ancestorThreadId: "root" });
+    expect(descendants.data.map((item) => item.id)).toEqual(["child"]);
+    await mergedThreadList({ parentThreadId: "root" }, stock as never, claude as never, cursors);
+    expect(requests[2]).toEqual({ archived: false, cursor: null, limit: 100, parentThreadId: "root" });
+  });
+
   it("merges stock and Claude search results onto public threads with snippets", async () => {
     const stockThreads = [thread("stock-4", 4), thread("backend-2", 2)];
     const stock = {

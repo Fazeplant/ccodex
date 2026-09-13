@@ -111,10 +111,15 @@ export class ThreadCatalog {
     // minutes while a turn is active, and the app drops the connection after
     // 30s. Refresh native metadata in the background; it applies next poll.
     void this.claude.refreshNativeMetadata?.();
+    // Stock scans rollout files unless `useStateDbOnly` is forwarded, and it
+    // omits sub-agent threads unless a parent/ancestor filter is forwarded.
     const providerParams: ThreadListParams = {
       archived: params.archived ?? false,
       cursor: null,
       limit: 100,
+      ...(params.useStateDbOnly ? { useStateDbOnly: true } : {}),
+      ...(params.parentThreadId ? { parentThreadId: params.parentThreadId } : {}),
+      ...(params.ancestorThreadId ? { ancestorThreadId: params.ancestorThreadId } : {}),
     };
     const [stockCatalog, claudeCatalog] = await Promise.all([
       allStockThreads(this.stock, providerParams),
