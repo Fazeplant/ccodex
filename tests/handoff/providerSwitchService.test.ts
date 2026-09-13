@@ -1389,6 +1389,11 @@ describe("provider switch service", () => {
       ...turn("short-compact", ""), status: "inProgress", completedAt: null, durationMs: null,
     }, stock as never, "client", vi.fn());
 
+    // Durable Claude threads are paginated; the ephemeral summary fork must opt
+    // out of turn hydration or the paginated fork gate rejects the switch.
+    expect(claude.forkThread).toHaveBeenCalledWith({
+      threadId: source.id, model: "claude:sonnet", ephemeral: true, excludeTurns: true, threadSource: "subAgent",
+    });
     expect(claude.summarizeHandoff).toHaveBeenCalledWith(
       source.id,
       expect.stringContaining("one short answer"),

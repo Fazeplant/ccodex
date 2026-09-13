@@ -2282,6 +2282,7 @@ export class CrossProviderForks {
         threadId: resolved.epoch.backendThreadId,
         model: resolved.epoch.model,
         ephemeral: true,
+        excludeTurns: true,
         threadSource: "subAgent",
       });
       try {
