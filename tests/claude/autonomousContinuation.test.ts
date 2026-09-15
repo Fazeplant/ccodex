@@ -179,12 +179,17 @@ class ControlledClaudeQuery {
 
 type RecordedEvent = { method: string; params: unknown };
 
+// The runtime hops a macrotask mid-batch and orders SDK callbacks after it,
+// so draining needs real setImmediate turns (kept unfaked by the fake-timer
+// setup below).
+const macrotask = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 async function flush(): Promise<void> {
-  for (let index = 0; index < 300; index += 1) await Promise.resolve();
+  for (let index = 0; index < 100; index += 1) await macrotask();
 }
 
 async function flushUntil(predicate: () => boolean): Promise<void> {
-  for (let index = 0; index < 1_000 && !predicate(); index += 1) await Promise.resolve();
+  for (let index = 0; index < 1_000 && !predicate(); index += 1) await macrotask();
   expect(predicate()).toBe(true);
 }
 
@@ -294,7 +299,7 @@ describe("Claude autonomous continuation lifecycle", () => {
   });
 
   it("keeps the captured 6047ms requesting TTFT in one original turn", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { service, provider, threadId, turnId, events } = await fixture();
     primeInitialResult(provider, ["calibration"]);
     provider.push(tasksChanged([]), taskNotification("calibration"), status("requesting"));
@@ -351,7 +356,7 @@ describe("Claude autonomous continuation lifecycle", () => {
     ["notification then requesting", false],
     ["requesting then notification", true],
   ])("fences the legal %s ordering", async (_label, requestFirst) => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { service, provider, threadId, events } = await fixture();
     primeInitialResult(provider, ["ordered"]);
     await flush();
@@ -404,7 +409,7 @@ describe("Claude autonomous continuation lifecycle", () => {
   });
 
   it("completes when a later request generation covers a notification that arrived during the command", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { service, provider, threadId, turnId, events } = await fixture();
     primeInitialResult(provider, ["captured-race"]);
     await flush();
@@ -440,7 +445,7 @@ describe("Claude autonomous continuation lifecycle", () => {
   });
 
   it("uses explicit idle as the no-follow-up compatibility boundary", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { service, provider, threadId, events } = await fixture();
     primeInitialResult(provider, ["idle-compatible"]);
     await flush();
@@ -454,7 +459,7 @@ describe("Claude autonomous continuation lifecycle", () => {
   });
 
   it("keeps a signal-less legacy provider active without fabricating UI output or success", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { service, provider, threadId, turnId, events } = await fixture();
     primeInitialResult(provider, ["signal-less"]);
     await flush();
@@ -474,7 +479,7 @@ describe("Claude autonomous continuation lifecycle", () => {
   });
 
   it("Stop during delayed requesting completes once and fences every late provider event", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { service, provider, threadId, turnId, events } = await fixture();
     primeInitialResult(provider, ["stop-delayed"]);
     await flush();
@@ -495,7 +500,7 @@ describe("Claude autonomous continuation lifecycle", () => {
   });
 
   it("reconnects during requesting to the same durable in-progress turn", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { service, provider, threadId, turnId, events } = await fixture();
     primeInitialResult(provider, ["reconnect"]);
     await flush();
@@ -520,7 +525,7 @@ describe("Claude autonomous continuation lifecycle", () => {
   });
 
   it("keeps one turn identity when reconnect is followed by Stop during delayed requesting", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const { service, provider, threadId, turnId, events } = await fixture();
     primeInitialResult(provider, ["reconnect-stop"]);
     await flush();

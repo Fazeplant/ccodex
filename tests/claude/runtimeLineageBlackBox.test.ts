@@ -1088,6 +1088,9 @@ describe("Claude runtime lineage through public service and Query contracts", ()
       items: [{ type: "message", role: "user", content: [{ type: "input_text", text: "prelude" }] }],
     });
     const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    // Attach the handler before close(): the rejection may land a macrotask
+    // earlier than close() resolves, which Node would report as unhandled.
+    const updatingRejected = expect(updating).rejects.toThrow();
     await waitFor(() => replacement.prompts.length === 1, "hung replacement replay");
     const session = await (service as unknown as {
       sessions: { getOrCreate(threadId: string): Promise<ClaudeSession> };
@@ -1098,7 +1101,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("close waited for replay acknowledgement")), 1_000)),
     ]);
-    await expect(updating).rejects.toThrow();
+    await updatingRejected;
   });
 
   it("atomically reserves an exact ephemeral replay snapshot before a concurrent injection", async () => {

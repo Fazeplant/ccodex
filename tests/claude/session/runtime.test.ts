@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ClaudeRuntime,
   ClaudeRuntimeStartupError,
+  EVENT_LOOP_YIELD_BUDGET_MS,
   type ClaudeRuntimeFact,
 } from "../../../src/claude/session/runtime.js";
 import { FakeClaudeQuery } from "../../fixtures/fakeClaudeQuery.js";
@@ -67,6 +68,37 @@ describe("ClaudeRuntime", () => {
     expect(delivered[0]?.type).toBe("system");
     release();
     await vi.waitFor(() => expect(delivered.some((value) => value.type === "result")).toBe(true));
+    await runtime.close();
+  });
+
+  it("yields to the event loop between buffered SDK messages", async () => {
+    const query = new FakeClaudeQuery();
+    const delivered: SDKMessage[] = [];
+    const runtime = new ClaudeRuntime(
+      1,
+      { cwd: "/workspace", model: "haiku" },
+      query.factory,
+      async (fact) => {
+        if (fact.kind !== "message") return;
+        delivered.push(fact.message);
+        // Synchronous per-message work, like persisting a large tool result.
+        const until = performance.now() + EVENT_LOOP_YIELD_BUDGET_MS / 4;
+        while (performance.now() < until) { /* hold the loop */ }
+      },
+    );
+    runtime.start();
+    await runtime.initializationResult();
+    await vi.waitFor(() => expect(delivered).toHaveLength(1));
+
+    const batch = 20;
+    for (let index = 0; index < batch; index += 1) {
+      query.emit({ type: "stream_event", session_id: "session", uuid: `event-${index}`, event: {} } as unknown as SDKMessage);
+    }
+    // A macrotask stands in for the poll phase: it must run before the whole
+    // buffered batch (5x the yield budget of loop time) has been consumed.
+    const seenAtMacrotask = await new Promise<number>((resolve) => setImmediate(() => resolve(delivered.length)));
+    expect(seenAtMacrotask).toBeLessThan(1 + batch);
+    await vi.waitFor(() => expect(delivered).toHaveLength(1 + batch));
     await runtime.close();
   });
 

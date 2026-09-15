@@ -161,7 +161,14 @@ export function createProviderRuntime(
   if (startup.reasoningEffort && !selectedEffort) throw new Error(`Unsupported Claude effort '${startup.reasoningEffort}'.`);
   const outputSchema = claudeOutputSchema(startup.outputSchema);
   const additionalDirectories = startup.runtimeWorkspaceRoots.filter((root) => root !== startup.cwd);
-  return new ProviderRuntime(
+  // SDK callbacks arrive outside the message stream; order them after every
+  // message the runtime has already buffered (see ProviderRuntime.drained).
+  let runtime: ProviderRuntime;
+  const ordered = <A extends unknown[], R>(callback: (...args: A) => R) => async (...args: A): Promise<Awaited<R>> => {
+    await runtime.drained();
+    return await callback(...args);
+  };
+  runtime = new ProviderRuntime(
     startup.runtimeGeneration,
     {
         cwd: startup.cwd,
@@ -188,18 +195,18 @@ export function createProviderRuntime(
         ...(!startup.interactiveQuestions && selectedPermissionMode === "auto" && !startup.ephemeral
           ? {}
           : {
-              canUseTool: (
+              canUseTool: ordered((
                 name: Parameters<CanUseTool>[0],
                 input: Parameters<CanUseTool>[1],
                 options: Parameters<CanUseTool>[2],
-              ) => callbacks.canUseTool(name, input, options),
+              ) => callbacks.canUseTool(name, input, options)),
             }),
-        onElicitation: (request, options) => callbacks.onElicitation(request, options.signal),
+        onElicitation: ordered((request, options) => callbacks.onElicitation(request, options.signal)),
         hooks: {
-          PreToolUse: [{ hooks: [(input, toolUseId) => callbacks.beforeToolUse(input, toolUseId)] }],
-          PostToolUse: [{ matcher: "Edit|Write|NotebookEdit", hooks: [(input, toolUseId) => callbacks.captureFileAfter(input, toolUseId)] }],
-          PostToolUseFailure: [{ matcher: "Edit|Write|NotebookEdit", hooks: [(input, toolUseId) => callbacks.captureFileAfter(input, toolUseId)] }],
-          PostCompact: [{ hooks: [(input) => callbacks.afterCompact(input)] }],
+          PreToolUse: [{ hooks: [ordered((input, toolUseId) => callbacks.beforeToolUse(input, toolUseId))] }],
+          PostToolUse: [{ matcher: "Edit|Write|NotebookEdit", hooks: [ordered((input, toolUseId) => callbacks.captureFileAfter(input, toolUseId))] }],
+          PostToolUseFailure: [{ matcher: "Edit|Write|NotebookEdit", hooks: [ordered((input, toolUseId) => callbacks.captureFileAfter(input, toolUseId))] }],
+          PostCompact: [{ hooks: [ordered((input) => callbacks.afterCompact(input))] }],
         },
         settings: {
           ...(startup.serviceTier === "fast" ? { fastMode: true } : {}),
@@ -225,4 +232,5 @@ export function createProviderRuntime(
     queryFactory,
     submitFact,
   );
+  return runtime;
 }

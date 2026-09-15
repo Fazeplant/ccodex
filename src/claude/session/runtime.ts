@@ -5,6 +5,7 @@ import type {
   Query,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { AsyncQueue } from "../asyncQueue.js";
 import { interruptAndCancelOwned, type InterruptCancellation } from "../interruptCompat.js";
 import type { ClaudeQueryFactory } from "../queryFactory.js";
@@ -14,6 +15,9 @@ import {
 } from "./providerFacts.js";
 
 export type ClaudeRuntimeFact = ClaudeProviderFact;
+
+/** Longest stretch a buffered SDK batch may hold the event loop before socket reads get a turn. */
+export const EVENT_LOOP_YIELD_BUDGET_MS = 20;
 
 export interface ClaudeRuntimeSettings {
   readonly model: string;
@@ -48,6 +52,7 @@ export class ClaudeRuntime {
   private closed = false;
   private closing = false;
   private exited = false;
+  private awaitingNext = false;
   private readonly capabilities = new Set<string>();
   private readonly ownedMessageIds = new Set<string>();
   private stderrTail = "";
@@ -186,9 +191,33 @@ export class ClaudeRuntime {
   private async consume(): Promise<void> {
     let exitSubmitted = false;
     try {
-      for await (const message of this.query) {
+      // A buffered SDK batch resolves through microtasks only, so the poll
+      // phase never runs and every stock/App socket stays unread until the
+      // batch drains. Hop a macrotask once a batch has held the loop for the
+      // budget; hopping after every message would widen the window in which
+      // an SDK callback (canUseTool) outruns its preceding message.
+      const iterator = this.query[Symbol.asyncIterator]();
+      let loopHeldSince = performance.now();
+      for (;;) {
+        const waitedFrom = performance.now();
+        this.awaitingNext = true;
+        const next = await iterator.next();
+        this.awaitingNext = false;
+        if (next.done) break;
+        // A next() that had to wait means the loop ran other work meanwhile;
+        // only an instantly resolved (buffered) message accrues held time.
+        if (performance.now() - waitedFrom >= 1) loopHeldSince = performance.now();
         this.providerOutputSeen = true;
-        await this.submitFact(normalizeProviderMessage(this.runtimeGeneration, message));
+        try {
+          await this.submitFact(normalizeProviderMessage(this.runtimeGeneration, next.value));
+        } catch (error) {
+          await iterator.return?.(undefined).catch(() => undefined);
+          throw error;
+        }
+        if (performance.now() - loopHeldSince >= EVENT_LOOP_YIELD_BUDGET_MS) {
+          await yieldToEventLoop();
+          loopHeldSince = performance.now();
+        }
       }
       this.markExited();
       exitSubmitted = true;
@@ -205,6 +234,17 @@ export class ClaudeRuntime {
         error,
       });
     }
+  }
+
+  /**
+   * Resolves once every SDK message buffered before now has been submitted.
+   * SDK callbacks (canUseTool, hooks, elicitation) bypass the message stream;
+   * gating them here keeps a callback from outrunning the message that
+   * precedes it while the consumer yields the event loop mid-batch.
+   */
+  public async drained(): Promise<void> {
+    do await yieldToEventLoop();
+    while (!this.awaitingNext && !this.exited);
   }
 
   private markExited(error?: unknown): void {

@@ -1188,7 +1188,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         runtimeGeneration: startup.runtimeGeneration,
         fact: { type: "sync" },
         source: { providerEventId: null, providerEventType: null },
-      });
+      }).catch(() => undefined);
       return candidate;
     } catch (error) {
       if (runtime) {
@@ -2149,7 +2149,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
               type: "runtimeLineage",
               action: "catalogInvalidated",
               runtimeGeneration,
-            });
+            }).catch(() => undefined);
           }
         }
         await this.submitProviderProjection(runtimeGeneration, {
@@ -2262,7 +2262,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           type: "runtimeLineage",
           action: "catalogInvalidated",
           runtimeGeneration,
-        });
+        }).catch(() => undefined);
       }
       if (result.status === "completed" && message.subtype === "success") {
         if (message.structured_output !== undefined) {
@@ -2321,7 +2321,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           action: "authFailure",
           runtimeGeneration,
           reason: message.error,
-        });
+        }).catch(() => undefined);
         await this.providerSystemMessage(
           projection,
           runtimeGeneration,
@@ -5532,7 +5532,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
             type: "cancelInteraction",
             runtimeGeneration: command.runtimeGeneration,
             requestId: command.requestId,
-          });
+          }).catch(() => undefined);
         };
         if (command.signal?.aborted) queueMicrotask(cancel);
         else command.signal?.addEventListener("abort", cancel, { once: true });
@@ -6874,7 +6874,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const generation = this.lifecycle.notifications;
     this.continuationTimer = setTimeout(() => {
       void this.submit({ type: "lifecycle", runtimeGeneration: this.runtimeGeneration!,
-        fact: { type: "timer", generation }, source: nullSource });
+        fact: { type: "timer", generation }, source: nullSource }).catch(() => undefined);
     }, 5_000);
     this.continuationTimer.unref();
   }
