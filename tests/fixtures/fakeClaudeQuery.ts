@@ -102,7 +102,7 @@ export class FakeClaudeQuery {
       permissionMode: input.options.permissionMode ?? "default", slash_commands: [], output_style: "default", skills: [], plugins: [],
       ...(this.interruptReceipt ? { capabilities: ["interrupt_receipt_v1"] } : {}),
     } as unknown as SDKMessage);
-    void this.consumePrompts(input, output);
+    void this.consumePrompts(input, output).catch(() => undefined);
     return this.query(
       sessionId,
       output,
