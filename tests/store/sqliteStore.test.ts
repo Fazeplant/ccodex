@@ -133,6 +133,36 @@ describe("SqliteHybridStore", () => {
     migrated.close();
   });
 
+  it("assigns a duplicated native session alias to the newest non-ephemeral root", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-store-duplicate-session-flags-"));
+    directories.push(directory);
+    const path = join(directory, "state.sqlite");
+    const store = new SqliteHybridStore(path);
+    store.createThread({
+      ...record("older"), claudeSessionId: "shared-native",
+      thread: { ...thread("older"), createdAt: 10, updatedAt: 20 },
+    });
+    store.createThread({
+      ...record("owner"), claudeSessionId: "shared-native",
+      thread: { ...thread("owner"), createdAt: 11, updatedAt: 30 },
+    });
+    store.createThread({
+      ...record("ephemeral"), claudeSessionId: "shared-native",
+      thread: { ...thread("ephemeral"), ephemeral: true, createdAt: 12, updatedAt: 40 },
+    });
+    store.close();
+
+    const legacy = new DatabaseSync(path);
+    legacy.exec("DROP TABLE claude_session_flags; DELETE FROM schema_migrations WHERE version = 13;");
+    legacy.close();
+
+    const migrated = new SqliteHybridStore(path);
+    expect(migrated.sessionFlags().get("shared-native")).toMatchObject({
+      sessionId: "shared-native", threadId: "owner", archived: false, ephemeral: false,
+    });
+    migrated.close();
+  });
+
   it("round-trips Claude session flags and deletes the default row", () => {
     const store = createStore();
     const section = { id: "section-1", name: "Pinned", appearance: null };

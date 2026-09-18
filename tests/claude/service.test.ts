@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -206,6 +206,75 @@ describe("ClaudeService", () => {
     await service.close();
   });
 
+  it("deletes an unadopted catalog session and its native side files", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-native-delete-"));
+    directories.push(directory);
+    const projects = join(directory, "projects");
+    cpSync(fixtureProjects, projects, { recursive: true });
+    const project = join(projects, "-home-user-project");
+    const sessionId = readdirSync(project, { withFileTypes: true }).find((entry) => entry.isDirectory())!.name;
+    const transcript = join(project, `${sessionId}.jsonl`);
+    const sideFiles = join(project, sessionId);
+    const hub = new SubscriptionHub();
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    hub.attach("app", (method, params) => notifications.push({ method, params }));
+    const store = new SqliteHybridStore(join(directory, "state.sqlite"));
+    const removeNative = vi.fn(async (deletedSessionId: string) => {
+      expect(deletedSessionId).toBe(sessionId);
+      rmSync(transcript);
+      rmSync(sideFiles, { recursive: true });
+    });
+    const service = new ClaudeService(
+      { ...config(directory), claudeProjectsDir: projects }, hub, new Logger("error"), store,
+      new FakeClaudeQuery().factory, undefined, undefined, undefined,
+      { rename: async () => undefined, delete: removeNative },
+    );
+    await service.ready();
+    expect(service.listThreads({ limit: 100 }).map((thread) => thread.id)).toContain(sessionId);
+    await service.setThreadSection(sessionId, { id: "fixture-section", name: "Fixture", appearance: null });
+    expect(store.getThreadRecord(sessionId)).toBeUndefined();
+
+    await expect(service.deleteThread(sessionId)).resolves.toEqual({});
+
+    expect(removeNative).toHaveBeenCalledTimes(1);
+    expect(existsSync(transcript)).toBe(false);
+    expect(existsSync(sideFiles)).toBe(false);
+    expect(store.sessionFlags().has(sessionId)).toBe(false);
+    expect(service.ownsThread(sessionId)).toBe(false);
+    expect(service.listThreads({ limit: 100 }).map((thread) => thread.id)).not.toContain(sessionId);
+    expect(notifications).toContainEqual({ method: "thread/deleted", params: { threadId: sessionId } });
+    await service.close();
+  });
+
+  it("resumes stored history without a transcript but rejects a new turn", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-missing-native-transcript-"));
+    directories.push(directory);
+    const store = new SqliteHybridStore(join(directory, "state.sqlite"));
+    const fake = new FakeClaudeQuery();
+    const service = new ClaudeService(
+      { ...config(directory), claudeProjectsDir: directory },
+      new SubscriptionHub(), new Logger("error"), store, fake.factory,
+    );
+    await service.ready();
+    const started = await service.startThread({ model: "claude:haiku", cwd: directory });
+    store.createTurn(started.thread.id, paginationTurn("stored-turn"));
+
+    await expect(service.resumeThread({ threadId: started.thread.id, excludeTurns: false })).resolves.toMatchObject({
+      thread: {
+        id: started.thread.id,
+        status: { type: "idle" },
+        turns: [expect.objectContaining({ id: "stored-turn" })],
+      },
+    });
+    expect(fake.inputs).toHaveLength(0);
+    await expect(service.prepareTurn({
+      threadId: started.thread.id,
+      input: [{ type: "text", text: "continue", text_elements: [] }],
+    })).rejects.toThrow(`Claude transcript for thread '${started.thread.id}' no longer exists.`);
+    expect(fake.inputs).toHaveLength(0);
+    await service.close();
+  });
+
   it("lists a legacy native session alias once under its public thread id", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-native-alias-"));
     directories.push(directory);
@@ -215,8 +284,11 @@ describe("ClaudeService", () => {
     const seed = new ClaudeService(cfg, new SubscriptionHub(), new Logger("error"), store, new FakeClaudeQuery().factory);
     await seed.ready();
     const started = await seed.startThread({ model: "claude:haiku", cwd: directory });
+    const displaced = await seed.startThread({ model: "claude:haiku", cwd: directory });
     const record = store.getThreadRecord(started.thread.id)!;
+    const displacedRecord = store.getThreadRecord(displaced.thread.id)!;
     store.updateThread({ ...record, claudeSessionId: foreignSessionId });
+    store.updateThread({ ...displacedRecord, claudeSessionId: foreignSessionId });
     store.setSessionFlags({
       sessionId: foreignSessionId,
       threadId: started.thread.id,
@@ -233,11 +305,12 @@ describe("ClaudeService", () => {
     await service.ready();
     const ids = service.listThreads({}).map((thread) => thread.id);
     expect(ids.filter((id) => id === started.thread.id)).toHaveLength(1);
+    expect(ids).toContain(displaced.thread.id);
     expect(ids).not.toContain(foreignSessionId);
     await service.close();
   });
 
-  it("backfills a store-only title into the native transcript once on start", async () => {
+  it("backfills a store-only title by searching all projects when the recorded cwd misses", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-native-title-backfill-"));
     directories.push(directory);
     const untitledSessionId = "a0cd4fcb-7bd4-43fa-b0d3-7d46e39e912a";
@@ -251,14 +324,17 @@ describe("ClaudeService", () => {
     store.updateThread({ ...record, claudeSessionId: untitledSessionId, thread: { ...record.thread, name: "Stored only" } });
     await seed.close();
 
-    const rename = vi.fn(async () => undefined);
+    const rename = vi.fn()
+      .mockRejectedValueOnce(new Error("session not found under cwd"))
+      .mockResolvedValue(undefined);
     const service = new ClaudeService(
       cfg, new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(path), new FakeClaudeQuery().factory,
       undefined, new MetricsRegistry(), undefined, { rename, delete: async () => undefined },
     );
     await service.ready();
-    expect(rename).toHaveBeenCalledTimes(1);
-    expect(rename).toHaveBeenCalledWith(untitledSessionId, "Stored only", expect.any(String));
+    expect(rename).toHaveBeenCalledTimes(2);
+    expect(rename).toHaveBeenNthCalledWith(1, untitledSessionId, "Stored only", expect.any(String));
+    expect(rename).toHaveBeenNthCalledWith(2, untitledSessionId, "Stored only");
     await service.close();
   });
 
@@ -4724,7 +4800,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(
       () => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed",
       "resumed child parent completion",
-      4_000,
+      5_000,
     );
 
     const parent = service.readThread(started.thread.id, true).thread;

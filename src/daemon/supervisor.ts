@@ -7,6 +7,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
@@ -113,7 +114,32 @@ function removeRecord(path: string, expected?: PidRecord): void {
   if (!expected || sameRecord(path, expected)) rmSync(path, { force: true });
 }
 
+const DEAD_STATES = new Set(["Z", "X", "x"]);
+
+function linuxGroupHasLiveMember(processGroup: number): boolean | undefined {
+  if (process.platform !== "linux") return undefined;
+  // kill(-pgid, 0) succeeds for zombie-only groups. Minimal container PID 1
+  // processes may never reap detached orphans, so inspect member states.
+  try {
+    return readdirSync("/proc").some((name) => {
+      if (!/^\d+$/u.test(name)) return false;
+      let stat: string;
+      try {
+        stat = readFileSync(`/proc/${name}/stat`, "utf8");
+      } catch {
+        return false;
+      }
+      const [state, , group] = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+      return Number(group) === processGroup && !DEAD_STATES.has(state!);
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 function groupExists(processGroup: number): boolean {
+  const liveLinuxMember = linuxGroupHasLiveMember(processGroup);
+  if (liveLinuxMember !== undefined) return liveLinuxMember;
   try {
     process.kill(-processGroup, 0);
     return true;
