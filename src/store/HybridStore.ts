@@ -5,6 +5,7 @@ import type { ThreadGoal } from "../codex/generated/v2/ThreadGoal.js";
 import type { QueuedSubmission } from "../codex/generated/v2/QueuedSubmission.js";
 import type { TokenUsageBreakdown } from "../codex/generated/v2/TokenUsageBreakdown.js";
 import type { ApprovalsReviewer } from "../codex/generated/v2/ApprovalsReviewer.js";
+import type { ThreadSection } from "../codex/generated/v2/ThreadSection.js";
 
 export interface InternalGoal extends ThreadGoal {
   readonly goalId: string;
@@ -54,6 +55,15 @@ export interface ClaudeThreadRecord {
   readonly modelContextWindow: number | null;
   readonly providerCostUsdTotal?: number;
   readonly settingsGeneration?: number;
+}
+
+export interface ClaudeSessionFlags {
+  readonly sessionId: string;
+  readonly threadId: string;
+  readonly archived: boolean;
+  readonly ephemeral: boolean;
+  readonly section: ThreadSection | null;
+  readonly sectionEnteredAt: number | null;
 }
 
 export function settingsGeneration(record: ClaudeThreadRecord): number {
@@ -203,6 +213,9 @@ export interface HybridStore {
   getThreadRecord(threadId: string, includeTurns?: boolean): ClaudeThreadRecord | undefined;
   allThreadRecords(): ClaudeThreadRecord[];
   listThreads(params: ThreadListParams): Thread[];
+  sessionFlags(): ReadonlyMap<string, ClaudeSessionFlags>;
+  setSessionFlags(flags: ClaudeSessionFlags): void;
+  adoptTransient(record: ClaudeThreadRecord, turns: readonly Turn[]): void;
   /** Gateway-owned manual order of every section, keyed by section id (stock cannot order Claude threads). */
   sectionOrders(): Map<string, string[]>;
   setSectionOrder(sectionId: string, threadIds: readonly string[]): void;

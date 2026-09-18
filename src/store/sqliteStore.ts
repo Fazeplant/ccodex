@@ -10,7 +10,7 @@ import type { Turn } from "../codex/generated/v2/Turn.js";
 import type { ApprovalsReviewer } from "../codex/generated/v2/ApprovalsReviewer.js";
 import type { QueuedSubmission } from "../codex/generated/v2/QueuedSubmission.js";
 import type {
-  AppendProviderEvent, ClaudeThreadRecord, EventPersistence, GoalPatch, GoalUsageInput, HybridStore, InternalGoal,
+  AppendProviderEvent, ClaudeSessionFlags, ClaudeThreadRecord, EventPersistence, GoalPatch, GoalUsageInput, HybridStore, InternalGoal,
   PendingRequestRecord, PendingThreadRemoval, ProviderEventDisposition, ProviderEventRecord, ProviderItemCorrelation,
   ProviderRetractionMutation, StoredEvent, ThreadStateCommit, TurnProviderBoundary,
 } from "./HybridStore.js";
@@ -297,6 +297,58 @@ export class SqliteHybridStore implements HybridStore {
     const archived = params.archived === true ? 1 : 0;
     const rows = this.database.prepare("SELECT thread_json FROM threads WHERE archived = ?").all(archived) as unknown as Array<{ thread_json: string }>;
     return filterSortThreads(rows.map((row) => JSON.parse(row.thread_json) as Thread), params);
+  }
+
+  public sessionFlags(): ReadonlyMap<string, ClaudeSessionFlags> {
+    const rows = this.database.prepare(`
+      SELECT session_id, thread_id, archived, ephemeral, section_json, section_entered_at
+      FROM claude_session_flags
+    `).all() as unknown as Array<{
+      session_id: string;
+      thread_id: string;
+      archived: number;
+      ephemeral: number;
+      section_json: string | null;
+      section_entered_at: number | null;
+    }>;
+    return new Map(rows.map((row) => [row.session_id, {
+      sessionId: row.session_id,
+      threadId: row.thread_id,
+      archived: row.archived === 1,
+      ephemeral: row.ephemeral === 1,
+      section: row.section_json === null ? null : JSON.parse(row.section_json),
+      sectionEnteredAt: row.section_entered_at,
+    }]));
+  }
+
+  public setSessionFlags(flags: ClaudeSessionFlags): void {
+    if (flags.threadId === flags.sessionId && !flags.archived && !flags.ephemeral
+      && flags.section === null && flags.sectionEnteredAt === null) {
+      this.database.prepare("DELETE FROM claude_session_flags WHERE session_id = ?").run(flags.sessionId);
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO claude_session_flags (
+        session_id, thread_id, archived, ephemeral, section_json, section_entered_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        thread_id = excluded.thread_id,
+        archived = excluded.archived,
+        ephemeral = excluded.ephemeral,
+        section_json = excluded.section_json,
+        section_entered_at = excluded.section_entered_at
+    `).run(
+      flags.sessionId,
+      flags.threadId,
+      flags.archived ? 1 : 0,
+      flags.ephemeral ? 1 : 0,
+      flags.section === null ? null : json(flags.section),
+      flags.sectionEnteredAt,
+    );
+  }
+
+  public adoptTransient(_record: ClaudeThreadRecord, _turns: readonly Turn[]): void {
+    throw new Error("SqliteHybridStore cannot adopt transient Claude sessions");
   }
 
   public updateThread(record: ClaudeThreadRecord): void {
@@ -1167,6 +1219,42 @@ export class SqliteHybridStore implements HybridStore {
           WHERE json_extract(thread_json, '$.source') = 'appServer';
         `);
         this.database.exec("INSERT INTO schema_migrations(version) VALUES (12)");
+      }
+      const claudeSessionFlags = this.database.prepare("SELECT 1 FROM schema_migrations WHERE version = 13").get();
+      if (!claudeSessionFlags) {
+        this.database.exec(`
+          CREATE TABLE claude_session_flags (
+            session_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL UNIQUE,
+            archived INTEGER NOT NULL DEFAULT 0,
+            ephemeral INTEGER NOT NULL DEFAULT 0,
+            section_json TEXT,
+            section_entered_at INTEGER
+          );
+        `);
+        if (["claude_session_id", "archived", "ephemeral", "thread_json"].every((column) => threadColumns.has(column))) {
+          this.database.exec(`
+          INSERT INTO claude_session_flags (
+            session_id, thread_id, archived, ephemeral, section_json, section_entered_at
+          )
+          SELECT
+            claude_session_id,
+            id,
+            archived,
+            ephemeral,
+            json_extract(thread_json, '$.section'),
+            json_extract(thread_json, '$.sectionEnteredAt')
+          FROM threads
+          WHERE json_extract(thread_json, '$.parentThreadId') IS NULL
+            AND (
+              id != claude_session_id
+              OR archived != 0
+              OR ephemeral != 0
+              OR json_type(thread_json, '$.section') NOT IN ('null')
+            );
+          `);
+        }
+        this.database.exec("INSERT INTO schema_migrations(version) VALUES (13)");
       }
       this.database.exec("DROP TABLE IF EXISTS items");
     });

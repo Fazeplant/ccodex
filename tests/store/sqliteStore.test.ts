@@ -78,6 +78,81 @@ afterEach(() => {
 });
 
 describe("SqliteHybridStore", () => {
+  it("backfills only non-default root Claude session flags in migration 13", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-store-session-flags-migration-"));
+    directories.push(directory);
+    const path = join(directory, "state.sqlite");
+    const store = new SqliteHybridStore(path);
+    const section = { id: "section-1", name: "Pinned", appearance: null };
+    store.createThread({ ...record("default"), claudeSessionId: "default" });
+    store.createThread({ ...record("public-alias"), claudeSessionId: "native-alias" });
+    store.createThread({ ...record("archived"), claudeSessionId: "archived" });
+    store.setThreadArchived("archived", true);
+    store.createThread({
+      ...record("ephemeral"),
+      claudeSessionId: "ephemeral",
+      thread: { ...thread("ephemeral"), ephemeral: true },
+    });
+    store.createThread({
+      ...record("sectioned"),
+      claudeSessionId: "sectioned",
+      thread: { ...thread("sectioned"), section, sectionEnteredAt: 42 },
+    });
+    store.createThread({
+      ...record("child"),
+      claudeSessionId: "native-child",
+      thread: { ...thread("child"), parentThreadId: "public-alias" },
+    });
+    store.close();
+
+    const legacy = new DatabaseSync(path);
+    legacy.exec("DROP TABLE claude_session_flags; DELETE FROM schema_migrations WHERE version = 13;");
+    legacy.close();
+
+    const migrated = new SqliteHybridStore(path);
+    expect([...migrated.sessionFlags().values()]).toEqual(expect.arrayContaining([
+      {
+        sessionId: "native-alias", threadId: "public-alias", archived: false, ephemeral: false,
+        section: null, sectionEnteredAt: null,
+      },
+      {
+        sessionId: "archived", threadId: "archived", archived: true, ephemeral: false,
+        section: null, sectionEnteredAt: null,
+      },
+      {
+        sessionId: "ephemeral", threadId: "ephemeral", archived: false, ephemeral: true,
+        section: null, sectionEnteredAt: null,
+      },
+      {
+        sessionId: "sectioned", threadId: "sectioned", archived: false, ephemeral: false,
+        section, sectionEnteredAt: 42,
+      },
+    ]));
+    expect(migrated.sessionFlags().has("default")).toBe(false);
+    expect(migrated.sessionFlags().has("native-child")).toBe(false);
+    migrated.close();
+  });
+
+  it("round-trips Claude session flags and deletes the default row", () => {
+    const store = createStore();
+    const section = { id: "section-1", name: "Pinned", appearance: null };
+    store.setSessionFlags({
+      sessionId: "native", threadId: "public", archived: true, ephemeral: true,
+      section, sectionEnteredAt: 123,
+    });
+    expect(store.sessionFlags().get("native")).toEqual({
+      sessionId: "native", threadId: "public", archived: true, ephemeral: true,
+      section, sectionEnteredAt: 123,
+    });
+
+    store.setSessionFlags({
+      sessionId: "native", threadId: "native", archived: false, ephemeral: false,
+      section: null, sectionEnteredAt: null,
+    });
+    expect(store.sessionFlags().has("native")).toBe(false);
+    store.close();
+  });
+
   it("persists provider-reported cumulative cost with runtime usage state", () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-store-cost-"));
     directories.push(directory);

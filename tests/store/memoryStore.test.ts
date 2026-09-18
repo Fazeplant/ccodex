@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Thread } from "../../src/codex/generated/v2/Thread.js";
 import type { Turn } from "../../src/codex/generated/v2/Turn.js";
 import type { ClaudeThreadRecord } from "../../src/store/HybridStore.js";
@@ -66,6 +66,38 @@ function record(): ClaudeThreadRecord {
 }
 
 describe("MemoryHybridStore thread-state commits", () => {
+  it("pins adopted native roots and every repository write to memory", () => {
+    const durable = new MemoryHybridStore();
+    const calls = [
+      vi.spyOn(durable, "createThread"),
+      vi.spyOn(durable, "createTurn"),
+      vi.spyOn(durable, "updateThread"),
+      vi.spyOn(durable, "commitThreadState"),
+      vi.spyOn(durable, "appendEvent"),
+      vi.spyOn(durable, "createPendingRequest"),
+      vi.spyOn(durable, "resolvePendingRequest"),
+    ];
+    const store = new LayeredHybridStore(durable);
+    const adopted = record();
+    const turn: Turn = {
+      id: "turn-1", items: [], itemsView: "full", status: "completed",
+      error: null, startedAt: 1, completedAt: 2, durationMs: 1_000,
+    };
+    store.adoptTransient(adopted, [turn]);
+    store.updateThread({ ...adopted, thread: { ...adopted.thread, updatedAt: 2 } });
+    store.commitThreadState({ record: adopted, events: [] });
+    store.appendEvent(adopted.thread.id, turn.id, "turn/completed", { turn });
+    store.createPendingRequest({
+      requestId: "request-1", threadId: adopted.thread.id, turnId: turn.id, claudeRequestId: "claude-1",
+      method: "item/commandExecution/requestApproval", params: {}, status: "pending", response: null,
+      createdAt: 1, resolvedAt: null,
+    });
+    store.resolvePendingRequest("request-1", "resolved", { decision: "accept" });
+
+    expect(store.getThreadRecord(adopted.thread.id, true)?.thread.turns).toEqual([turn]);
+    expect(calls.every((spy) => spy.mock.calls.length === 0)).toBe(true);
+  });
+
   it("persists user-created side roots while keeping internal ephemeral work process-local", () => {
     const durable = new MemoryHybridStore();
     const store = new LayeredHybridStore(durable);

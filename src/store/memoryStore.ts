@@ -3,7 +3,7 @@ import type { ThreadListParams } from "../codex/generated/v2/ThreadListParams.js
 import type { Turn } from "../codex/generated/v2/Turn.js";
 import type { QueuedSubmission } from "../codex/generated/v2/QueuedSubmission.js";
 import type {
-  AppendProviderEvent, ClaudeThreadRecord, EventPersistence, GoalPatch, GoalUsageInput, HybridStore, InternalGoal, PendingRequestRecord,
+  AppendProviderEvent, ClaudeSessionFlags, ClaudeThreadRecord, EventPersistence, GoalPatch, GoalUsageInput, HybridStore, InternalGoal, PendingRequestRecord,
   PendingThreadRemoval, ProviderEventDisposition, ProviderEventRecord, ProviderItemCorrelation, ProviderRetractionMutation,
   StoredEvent, ThreadStateCommit, TurnProviderBoundary,
 } from "./HybridStore.js";
@@ -28,6 +28,11 @@ function filteredThreads(records: Iterable<ClaudeThreadRecord>, params: ThreadLi
   return filterSortThreads([...records].map((record) => record.thread), params).map(copy);
 }
 
+function defaultSessionFlags(flags: ClaudeSessionFlags): boolean {
+  return flags.threadId === flags.sessionId && !flags.archived && !flags.ephemeral
+    && flags.section === null && flags.sectionEnteredAt === null;
+}
+
 export class MemoryHybridStore implements HybridStore {
   private readonly records = new Map<string, ClaudeThreadRecord>();
   private readonly turns = new Map<string, Turn[]>();
@@ -36,6 +41,7 @@ export class MemoryHybridStore implements HybridStore {
   private readonly pendingRemovals = new Map<string, PendingThreadRemoval>();
   private readonly goals = new Map<string, InternalGoal>();
   private readonly sectionOrderBySection = new Map<string, string[]>();
+  private readonly flagsBySession = new Map<string, ClaudeSessionFlags>();
   private readonly queues = new Map<string, QueuedSubmission[]>();
   private readonly goalCheckpoints = new Set<string>();
   private readonly turnMessages = new Map<string, string>();
@@ -68,6 +74,20 @@ export class MemoryHybridStore implements HybridStore {
   public listThreads(params: ThreadListParams): Thread[] {
     const archived = params.archived === true;
     return filteredThreads([...this.records.values()].filter((record) => this.archived.has(record.thread.id) === archived), params);
+  }
+
+  public sessionFlags(): ReadonlyMap<string, ClaudeSessionFlags> {
+    return new Map([...this.flagsBySession].map(([sessionId, flags]) => [sessionId, copy(flags)]));
+  }
+
+  public setSessionFlags(flags: ClaudeSessionFlags): void {
+    if (defaultSessionFlags(flags)) this.flagsBySession.delete(flags.sessionId);
+    else this.flagsBySession.set(flags.sessionId, copy(flags));
+  }
+
+  public adoptTransient(record: ClaudeThreadRecord, turns: readonly Turn[]): void {
+    this.createThread(record);
+    for (const turn of turns) this.createTurn(record.thread.id, turn);
   }
 
   public updateThread(record: ClaudeThreadRecord): void {
@@ -439,6 +459,7 @@ export class MemoryHybridStore implements HybridStore {
     this.archived.clear();
     this.pendingRemovals.clear();
     this.goals.clear();
+    this.flagsBySession.clear();
     this.queues.clear();
     this.goalCheckpoints.clear();
     this.turnMessages.clear();
@@ -470,6 +491,11 @@ export class LayeredHybridStore implements HybridStore {
   public allThreadRecords(): ClaudeThreadRecord[] { return [...this.durable.allThreadRecords(), ...this.ephemeral.allThreadRecords()]; }
   public listThreads(params: ThreadListParams): Thread[] {
     return filterSortThreads([...this.durable.listThreads(params), ...this.ephemeral.listThreads(params)], params);
+  }
+  public sessionFlags(): ReadonlyMap<string, ClaudeSessionFlags> { return this.durable.sessionFlags(); }
+  public setSessionFlags(flags: ClaudeSessionFlags): void { this.durable.setSessionFlags(flags); }
+  public adoptTransient(record: ClaudeThreadRecord, turns: readonly Turn[]): void {
+    this.ephemeral.adoptTransient(record, turns);
   }
   public updateThread(record: ClaudeThreadRecord): void { this.owner(record.thread.id).updateThread(record); }
   public isThreadArchived(threadId: string): boolean { return this.owner(threadId).isThreadArchived(threadId); }
