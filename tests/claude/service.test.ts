@@ -4775,6 +4775,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(
       () => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed",
       "resumed child parent completion",
+      5_000,
     );
 
     const parent = service.readThread(started.thread.id, true).thread;
