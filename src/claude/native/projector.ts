@@ -12,6 +12,7 @@ import {
   type ActiveTool,
 } from "../toolMapper.js";
 import { selectHistory, type SelectedHistory } from "./history.js";
+import { assistantBlockItemId } from "./ids.js";
 import {
   isCompactBoundary,
   readTranscriptRecords,
@@ -87,10 +88,6 @@ interface ToolCompletion {
   readonly block: ToolResultBlock;
 }
 
-interface ReasoningProjectionState {
-  open: Extract<ThreadItem, { type: "reasoning" }> | undefined;
-}
-
 const FILE_TOOLS = new Set(["Edit", "Write", "NotebookEdit", "MultiEdit"]);
 const NON_TERMINAL_STOPS = new Set(["tool_use", "pause_turn"]);
 
@@ -132,10 +129,6 @@ function assistantBlocks(record: AssistantRecord): readonly Record<string, unkno
   if (!Array.isArray(record.message.content)) return [];
   return record.message.content.filter((block): block is Record<string, unknown> =>
     block !== null && typeof block === "object");
-}
-
-function itemId(record: AssistantRecord, blockIndex: number, blockCount: number): string {
-  return blockCount === 1 ? record.uuid : `${record.uuid}:${blockIndex}`;
 }
 
 function outputText(value: unknown): string {
@@ -285,37 +278,56 @@ function responseHasTools(records: readonly TranscriptChainRecord[]): ReadonlySe
   return result;
 }
 
+interface ResponseBlock {
+  readonly record: AssistantRecord;
+  readonly block: Record<string, unknown>;
+  readonly apiBlockIndex: number;
+}
+
+function responseBlocks(records: readonly AssistantRecord[]): ResponseBlock[] {
+  const ordered = records
+    .map((record, order) => ({ record, order }))
+    .sort((left, right) =>
+      (left.record.apiBlockIndex ?? left.order) - (right.record.apiBlockIndex ?? right.order));
+  let fallbackIndex = 0;
+  return ordered.flatMap(({ record }) => assistantBlocks(record).map((block, blockIndex) => {
+    const apiBlockIndex = record.apiBlockIndex === undefined
+      ? fallbackIndex
+      : record.apiBlockIndex + blockIndex;
+    fallbackIndex = Math.max(fallbackIndex, apiBlockIndex + 1);
+    return { record, block, apiBlockIndex };
+  }));
+}
+
 function assistantItems(
-  record: AssistantRecord,
+  records: readonly AssistantRecord[],
   cwd: string,
   threadId: string,
   completions: ReadonlyMap<string, ToolCompletion>,
   toolResponses: ReadonlySet<string>,
-  reasoning: ReasoningProjectionState,
 ): ThreadItem[] {
-  const blocks = assistantBlocks(record);
-  return blocks.flatMap((block, index): ThreadItem[] => {
+  let reasoning: Extract<ThreadItem, { type: "reasoning" }> | undefined;
+  return responseBlocks(records).flatMap(({ record, block, apiBlockIndex }): ThreadItem[] => {
+    const messageId = record.message.id!;
     if (block.type === "text" && typeof block.text === "string") return [{
-      type: "agentMessage", id: itemId(record, index, blocks.length), text: block.text,
+      type: "agentMessage", id: assistantBlockItemId(messageId, apiBlockIndex), text: block.text,
       phase: record.message.id && toolResponses.has(record.message.id) ? "commentary" : "final_answer",
       memoryCitation: null, delivery: null, questions: null,
     }];
     if (block.type === "thinking" && typeof block.thinking === "string") {
-      const apiBlockIndex = record.apiBlockIndex ?? index;
-      if (reasoning.open) {
-        reasoning.open.summary.push(block.thinking);
-        if (apiBlockIndex === 0) reasoning.open = undefined;
+      if (reasoning) {
+        reasoning.summary.push(block.thinking);
         return [];
       }
       const item: Extract<ThreadItem, { type: "reasoning" }> = {
-        type: "reasoning", id: itemId(record, index, blocks.length), summary: [block.thinking], content: [],
+        type: "reasoning", id: assistantBlockItemId(messageId, apiBlockIndex), summary: [block.thinking], content: [],
       };
-      if (apiBlockIndex > 0) reasoning.open = item;
+      reasoning = item;
       return [item];
     }
     if (["tool_use", "server_tool_use", "mcp_tool_use"].includes(String(block.type))
       && typeof block.id === "string" && typeof block.name === "string") {
-      const item = projectTool(block as unknown as ToolUseBlock, index, record, cwd, threadId, completions);
+      const item = projectTool(block as unknown as ToolUseBlock, apiBlockIndex, record, cwd, threadId, completions);
       return item ? [item] : [];
     }
     return [];
@@ -357,10 +369,21 @@ function projectTurns(
     const prompt = records[start] as UserRecord;
     const turnRecords = records.slice(start, end);
     const items: ThreadItem[] = [{ type: "userMessage", id: prompt.uuid, clientId: null, content: userInputs(prompt) }];
-    const reasoning: ReasoningProjectionState = { open: undefined };
+    const responses = new Map<string, AssistantRecord[]>();
+    for (const record of turnRecords) {
+      if (record.type !== "assistant") continue;
+      const messageId = record.message.id!;
+      const response = responses.get(messageId) ?? [];
+      response.push(record);
+      responses.set(messageId, response);
+    }
+    const projectedResponses = new Set<string>();
     for (const record of turnRecords.slice(1)) {
       if (record.type === "assistant") {
-        items.push(...assistantItems(record, cwd, threadId, completions, toolResponses, reasoning));
+        const messageId = record.message.id!;
+        if (projectedResponses.has(messageId)) continue;
+        projectedResponses.add(messageId);
+        items.push(...assistantItems(responses.get(messageId)!, cwd, threadId, completions, toolResponses));
       }
       else if (isCompactBoundary(record)) items.push({ type: "contextCompaction", id: record.uuid });
     }

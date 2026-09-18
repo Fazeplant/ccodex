@@ -136,11 +136,13 @@ import {
   isNoQueryAcknowledgement,
   serverToolResult,
   toolResults,
+  ProviderResponseTracker,
   type ClaudeProviderFact,
   type RuntimeFactContext,
 } from "./providerFacts.js";
 import { normalizeClaudeModelIdentifier } from "../modelSelection.js";
 import { StreamingFileChangePreview } from "../streamingFilePreview.js";
+import { assistantBlockItemId } from "../native/ids.js";
 
 const nullSource = { providerEventId: null, providerEventType: null } as const;
 
@@ -330,6 +332,7 @@ interface ProviderProjectionState {
   readonly context: AsyncLocalStorage<RuntimeFactContext>;
   readonly processEpoch: string;
   readonly filePreviews: Map<string, { readonly providerId: string; readonly preview: StreamingFileChangePreview }>;
+  readonly responses: ProviderResponseTracker;
   providerSequence: number;
   runtime?: ProviderRuntime;
 }
@@ -1107,6 +1110,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       context: new AsyncLocalStorage<RuntimeFactContext>(),
       processEpoch: uuidv7(),
       filePreviews: new Map(),
+      responses: new ProviderResponseTracker(),
       providerSequence: 0,
     };
     try {
@@ -3122,15 +3126,17 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const event = message.event;
     if (event.type === "message_start") {
       await this.invalidateRuntimeUsageSnapshot(runtimeGeneration);
+      projection.responses.start(childThreadId, event.message.id);
       await this.applyProviderMainStream(
         projection,
         runtimeGeneration,
-        { kind: "messageStart" },
+        { kind: "messageStart", messageId: event.message.id },
         childThreadId,
       );
       return;
     }
     if (event.type === "content_block_start") {
+      if (!projection.responses.addBlock(childThreadId, event.index)) return;
       const block = event.content_block;
       const toolName = "name" in block && typeof block.name === "string" ? block.name : "";
       if (toolName.startsWith("mcp__ccodex_goal__")) return;
@@ -3201,8 +3207,14 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     ownerThreadId: string,
   ): Promise<string[]> {
     if (!Array.isArray(message.message.content)) return [];
+    const blockIndexes = projection.responses.complete(
+      message.message.id,
+      message.message.content.length,
+    );
+    if (!blockIndexes) return [];
     const itemIds: (string | null)[] = message.message.content.map(() => null);
-    for (const [index, block] of message.message.content.entries()) {
+    for (const [position, block] of message.message.content.entries()) {
+      const index = blockIndexes[position]!;
       const value = block as { type?: string; name?: string };
       if (["tool_use", "server_tool_use", "mcp_tool_use"].includes(value.type ?? "")
         && value.name?.startsWith("mcp__ccodex_goal__")) {
@@ -3211,7 +3223,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       if (block.type === "tool_use"
         || block.type === "server_tool_use"
         || block.type === "mcp_tool_use") {
-        itemIds[index] = (await this.applyProviderMainStream(
+        itemIds[position] = (await this.applyProviderMainStream(
           projection,
           runtimeGeneration,
           {
@@ -3224,7 +3236,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       } else {
         const result = serverToolResult(block);
         if (result) {
-          itemIds[index] = (await this.applyProviderMainStream(
+          itemIds[position] = (await this.applyProviderMainStream(
             projection,
             runtimeGeneration,
             {
@@ -3249,16 +3261,17 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       runtimeGeneration,
       {
         kind: "assistant",
-        blocks: message.message.content.map((block) => block.type === "text"
-          ? { block: "text" as const, text: block.text }
+        messageId: message.message.id,
+        blocks: message.message.content.map((block, position) => block.type === "text"
+          ? { index: blockIndexes[position]!, block: "text" as const, text: block.text }
           : block.type === "thinking"
-            ? { block: "reasoning" as const, text: block.thinking }
+            ? { index: blockIndexes[position]!, block: "reasoning" as const, text: block.thinking }
             : null),
         completeAsCommentary: assistantHasTools(message) || Boolean(pending),
       },
       ownerThreadId,
     );
-    return itemIds.flatMap((id, index) => id ?? stream?.itemIds[index] ?? []);
+    return itemIds.flatMap((id, position) => id ?? stream?.itemIds[position] ?? []);
   }
 
   private async providerProjectToolResults(
@@ -3595,6 +3608,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     message: Extract<SDKMessage, { type: "stream_event" }>,
   ): Promise<void> {
     const event = message.event;
+    if (event.type === "message_start") {
+      projection.responses.start(this.threadId, event.message.id);
+    }
     if (!projection.context.getStore()?.activeTurnId) return;
     if (event.type === "message_start") {
       await this.invalidateRuntimeUsageSnapshot(runtimeGeneration);
@@ -3606,11 +3622,12 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       await this.applyProviderMainStream(
         projection,
         runtimeGeneration,
-        { kind: "messageStart" },
+        { kind: "messageStart", messageId: event.message.id },
       );
       return;
     }
     if (event.type === "content_block_start") {
+      if (!projection.responses.addBlock(this.threadId, event.index)) return;
       const block = event.content_block;
       if (block.type === "text" || block.type === "thinking") {
         await this.applyProviderMainStream(projection, runtimeGeneration, {
@@ -4656,10 +4673,10 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           throw invalidParams(`Thread '${this.threadId}' already has an active turn.`);
         }
         if (!command.goalOperation) invalidateGoalEffect(this.goal);
-        const turnId = uuidv7();
+        const turnId = command.stagedMessageUuid ?? uuidv7();
         const userItem: ThreadItem = {
           type: "userMessage",
-          id: command.review ? turnId : uuidv7(),
+          id: turnId,
           clientId: command.params.clientUserMessageId ?? null,
           content: normalizeUserInput(command.params.input),
         };
@@ -4704,7 +4721,10 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         }
         if (command.text) {
           this.projectMainStream(this.threadId, {
-            kind: "assistant", blocks: [{ block: "text", text: command.text }], completeAsCommentary: false,
+            kind: "assistant",
+            messageId: state.turnId,
+            blocks: [{ index: 0, block: "text", text: command.text }],
+            completeAsCommentary: false,
           }, nullSource);
           this.settleRootMessages("final_answer", nullSource);
         }
@@ -5184,7 +5204,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         }
         const item: ThreadItem = {
           type: "userMessage",
-          id: uuidv7(),
+          id: command.messageUuid,
           clientId: command.clientUserMessageId ?? null,
           content: normalizeUserInput(command.input),
         };
@@ -6021,15 +6041,32 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const item = automatic
       ? turn.items.find((candidate) => candidate.id === automatic.itemId)
       : undefined;
+    const completedItem: Extract<ThreadItem, { type: "contextCompaction" }> = {
+      type: "contextCompaction",
+      id: boundary,
+    };
+    const projectedTurn: Turn = {
+      ...turn,
+      items: item
+        ? turn.items.map((candidate) => candidate.id === item.id ? completedItem : candidate)
+        : [...turn.items, completedItem],
+    };
     const updated = { ...record, lastClaudeMessageUuid: boundary };
     this.commitState(updated, [
-      ...(item?.type === "contextCompaction" ? [{
+      ...(!item ? [{
         turnId: turn.id,
-        method: "item/completed",
-        params: { item, threadId: this.threadId, turnId: turn.id, completedAtMs: Date.now() },
+        method: "item/started",
+        params: { item: completedItem, threadId: this.threadId, turnId: turn.id, startedAtMs: Date.now() },
         providerEventId: source.providerEventId,
         providerEventType: source.providerEventType,
       }] : []),
+      {
+        turnId: turn.id,
+        method: "item/completed",
+        params: { item: completedItem, threadId: this.threadId, turnId: turn.id, completedAtMs: Date.now() },
+        providerEventId: source.providerEventId,
+        providerEventType: source.providerEventType,
+      },
       {
         turnId: turn.id,
         method: "thread/compacted",
@@ -6037,7 +6074,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         providerEventId: source.providerEventId,
         providerEventType: source.providerEventType,
       },
-    ], turn, false, {
+    ], projectedTurn, false, {
       ownerThreadId: this.threadId,
       turnId: turn.id,
       messageUuid: boundary,
@@ -6095,8 +6132,14 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const operation = this.compaction;
     if (!operation) return undefined;
     const active = this.repository.readTurn(this.threadId, operation.turnId)!;
-    const item = active.items[0]!;
-    const turn = this.terminalTurn(active, status, errorMessage, codexErrorInfo);
+    const placeholder = active.items[0]!;
+    const item = status === "completed" && boundary
+      ? { type: "contextCompaction" as const, id: boundary }
+      : placeholder;
+    const projected = item.id === placeholder.id
+      ? active
+      : { ...active, items: active.items.map((candidate) => candidate.id === placeholder.id ? item : candidate) };
+    const turn = this.terminalTurn(projected, status, errorMessage, codexErrorInfo);
     const completed = this.finishTurn(turn, source, true, [
       {
         turnId: turn.id,
@@ -7592,10 +7635,13 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     switch (fact.kind) {
       case "messageStart":
         this.settleAgentMessages(turn, state, "commentary", source);
+        if (state.reasoningItemId) this.completeStreamItem(turn, state, state.reasoningItemId, source);
         state.blockItems.clear();
         state.reasoningSummaryIndices.clear();
         state.openBlocks.clear();
         state.suppressedBlocks.clear();
+        state.messageId = fact.messageId;
+        state.reasoningItemId = undefined;
         break;
       case "blockStart":
         state.openBlocks.add(fact.index);
@@ -7624,7 +7670,14 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         state.openBlocks.delete(fact.index);
         break;
       case "assistant":
-        itemIds = this.reconcileAssistant(turn, state, fact.blocks, fact.completeAsCommentary, source);
+        itemIds = this.reconcileAssistant(
+          turn,
+          state,
+          fact.messageId,
+          fact.blocks,
+          fact.completeAsCommentary,
+          source,
+        );
         state.openBlocks.clear();
         break;
       case "instantAgent": {
@@ -8284,7 +8337,14 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const turn = state && this.repository.readTurn(childThreadId, state.turnId);
     if (!state || !record || !turn) return;
     if (status === "completed" && !turn.items.some((item) => item.type === "agentMessage")) {
-      this.reconcileAssistant(turn, state, [{ block: "text", text: summary }], false, source);
+      this.reconcileAssistant(
+        turn,
+        state,
+        state.messageId,
+        [{ index: 0, block: "text", text: summary }],
+        false,
+        source,
+      );
     }
     this.settleAgentMessages(turn, state, status === "completed" ? "final_answer" : "commentary", source);
     for (const tool of state.tools.values()) if (!state.completedItems.has(tool.itemId)) {
@@ -8318,28 +8378,23 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private reconcileAssistant(
     turn: Turn,
     state: MainStreamState,
-    blocks: readonly ({ readonly block: "text" | "reasoning"; readonly text: string } | null)[],
+    messageId: string,
+    blocks: Extract<MainStreamFact, { kind: "assistant" }>["blocks"],
     completeAsCommentary: boolean,
     source: RuntimeFactSource,
   ): readonly (string | null)[] {
-    return blocks.map((block, index) => {
+    state.messageId = messageId;
+    return blocks.map((block) => {
       if (!block) return null;
-      let item = streamItem(turn, state, index);
+      let item = streamItem(turn, state, block.index);
       if (block.block === "text") {
         if (!item || item.type !== "agentMessage") {
-          const duplicate = turn.items.find((candidate) =>
-            candidate.type === "agentMessage" && candidate.text === block.text);
-          if (duplicate?.type === "agentMessage") {
-            item = duplicate;
-            state.blockItems.set(index, item.id);
-          } else {
-            item = this.ensureStreamItem(turn, state, index, "text", source);
-            if (item.type === "agentMessage" && block.text) {
-              item.text = block.text;
-              this.publishTurn(turn, "item/agentMessage/delta", {
-                threadId: state.ownerThreadId, turnId: turn.id, itemId: item.id, delta: block.text,
-              }, source);
-            }
+          item = this.ensureStreamItem(turn, state, block.index, "text", source);
+          if (item.type === "agentMessage" && block.text) {
+            item.text = block.text;
+            this.publishTurn(turn, "item/agentMessage/delta", {
+              threadId: state.ownerThreadId, turnId: turn.id, itemId: item.id, delta: block.text,
+            }, source);
           }
         }
         if (item.type === "agentMessage") {
@@ -8354,9 +8409,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         }
         return item.id;
       }
-      if (!item || item.type !== "reasoning") item = this.ensureStreamItem(turn, state, index, "reasoning", source);
+      if (!item || item.type !== "reasoning") {
+        item = this.ensureStreamItem(turn, state, block.index, "reasoning", source);
+      }
       if (item.type === "reasoning") {
-        const summaryIndex = state.reasoningSummaryIndices.get(index) ?? 0;
+        const summaryIndex = state.reasoningSummaryIndices.get(block.index) ?? 0;
         const current = item.summary[summaryIndex] ?? "";
         const delta = block.text.startsWith(current) ? block.text.slice(current.length) : "";
         if (delta) {
@@ -8366,7 +8423,6 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           }, source);
         }
       }
-      this.completeStreamItem(turn, state, item.id, source);
       return item.id;
     });
   }
@@ -8384,7 +8440,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     if (block === "text") {
       const item: ThreadItem = {
         // Stock never announces a phase-less message; stream as the answer and relabel to commentary if tools follow.
-        type: "agentMessage", id: uuidv7(), text: "", phase: "final_answer", memoryCitation: null, questions: null, delivery: null,
+        type: "agentMessage", id: assistantBlockItemId(state.messageId, index), text: "", phase: "final_answer",
+        memoryCitation: null, questions: null, delivery: null,
       };
       state.blockItems.set(index, item.id);
       turn.items.push(item);
@@ -8393,18 +8450,20 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       }, source);
       return item;
     }
-    const reusable = [...turn.items].reverse().find((item) => item.type === "reasoning"
-      && !state.completedItems.has(item.id)
-      && ![...state.openBlocks].some((blockIndex) => blockIndex !== index
-        && state.blockItems.get(blockIndex) === item.id));
+    const reusable = state.reasoningItemId
+      ? turn.items.find((item) => item.id === state.reasoningItemId)
+      : undefined;
     const item: Extract<ThreadItem, { type: "reasoning" }> = reusable?.type === "reasoning"
       ? reusable
-      : { type: "reasoning", id: uuidv7(), summary: [], content: [] };
+      : { type: "reasoning", id: assistantBlockItemId(state.messageId, index), summary: [], content: [] };
     const summaryIndex = reusable ? item.summary.length : 0;
     if (reusable) item.summary.push("");
     state.blockItems.set(index, item.id);
     state.reasoningSummaryIndices.set(index, summaryIndex);
-    if (!reusable) turn.items.push(item);
+    if (!reusable) {
+      state.reasoningItemId = item.id;
+      turn.items.push(item);
+    }
     this.publishTurn(turn, reusable ? "item/reasoning/summaryPartAdded" : "item/started", reusable
       ? { threadId: state.ownerThreadId, turnId: turn.id, itemId: item.id, summaryIndex }
       : { item, threadId: state.ownerThreadId, turnId: turn.id, startedAtMs: Date.now() }, source);

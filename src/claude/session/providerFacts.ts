@@ -11,6 +11,39 @@ export interface ProviderEventIdentity {
   readonly providerEventType: string;
 }
 
+interface ProviderResponse {
+  readonly blockIndexes: number[];
+  completedBlocks: number;
+}
+
+/** Joins completed assistant frames back to their streamed API block indexes. */
+export class ProviderResponseTracker {
+  private readonly currentResponseIds = new Map<string, string>();
+  private readonly responses = new Map<string, ProviderResponse>();
+
+  public start(ownerThreadId: string, messageId: string): void {
+    const previousMessageId = this.currentResponseIds.get(ownerThreadId);
+    if (previousMessageId) this.responses.delete(previousMessageId);
+    this.currentResponseIds.set(ownerThreadId, messageId);
+    this.responses.set(messageId, { blockIndexes: [], completedBlocks: 0 });
+  }
+
+  public addBlock(ownerThreadId: string, index: number): boolean {
+    const messageId = this.currentResponseIds.get(ownerThreadId);
+    if (!messageId) return false;
+    this.responses.get(messageId)!.blockIndexes.push(index);
+    return true;
+  }
+
+  public complete(messageId: string, blockCount: number): readonly number[] | undefined {
+    const response = this.responses.get(messageId);
+    if (!response) return undefined;
+    const start = response.completedBlocks;
+    response.completedBlocks += blockCount;
+    return response.blockIndexes.slice(start, response.completedBlocks);
+  }
+}
+
 interface ProviderFactEnvelope extends ProviderEventIdentity {
   readonly runtimeGeneration: number;
 }

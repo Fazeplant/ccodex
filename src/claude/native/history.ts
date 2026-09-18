@@ -58,19 +58,15 @@ function relinkCompactions(records: ReadonlyMap<string, TranscriptChainRecord>):
 function siblingBlocks(
   records: ReadonlyMap<string, TranscriptChainRecord>,
   selected: readonly TranscriptChainRecord[],
-  selectedUuids: Set<string>,
 ): TranscriptChainRecord[] {
   const selectedAssistants = selected.filter((record): record is AssistantRecord => record.type === "assistant");
   if (selectedAssistants.length === 0) return [...selected];
 
-  const insertionPoint = new Map<string, AssistantRecord>();
-  for (const record of selectedAssistants) {
-    const messageId = apiMessageId(record);
-    if (messageId) insertionPoint.set(messageId, record);
-  }
   const assistantsByMessage = new Map<string, TranscriptChainRecord[]>();
   const resultsByParent = new Map<string, TranscriptChainRecord[]>();
-  for (const record of records.values()) {
+  const fileOrder = new Map<string, number>();
+  for (const [index, record] of [...records.values()].entries()) {
+    fileOrder.set(record.uuid, index);
     const messageId = apiMessageId(record);
     if (messageId) {
       const values = assistantsByMessage.get(messageId) ?? [];
@@ -83,31 +79,41 @@ function siblingBlocks(
     }
   }
 
-  const additions = new Map<string, TranscriptChainRecord[]>();
-  const seenMessages = new Set<string>();
-  for (const record of selectedAssistants) {
+  const byResponseOrder = (left: TranscriptChainRecord, right: TranscriptChainRecord) => {
+    if (left.type === "assistant" && right.type === "assistant"
+      && left.apiBlockIndex !== undefined && right.apiBlockIndex !== undefined) {
+      return left.apiBlockIndex - right.apiBlockIndex;
+    }
+    return fileOrder.get(left.uuid)! - fileOrder.get(right.uuid)!;
+  };
+  const expandedMessages = new Set<string>();
+  const expandedUuids = new Set<string>();
+  const expanded: TranscriptChainRecord[] = [];
+  for (const record of selected) {
+    if (expandedUuids.has(record.uuid)) continue;
     const messageId = apiMessageId(record);
-    if (!messageId || seenMessages.has(messageId)) continue;
-    seenMessages.add(messageId);
-    const responseRecords = assistantsByMessage.get(messageId) ?? [record];
-    const assistantSiblings = responseRecords.filter((candidate) => !selectedUuids.has(candidate.uuid));
+    if (!messageId) {
+      expandedUuids.add(record.uuid);
+      expanded.push(record);
+      continue;
+    }
+    if (expandedMessages.has(messageId)) continue;
+    expandedMessages.add(messageId);
+    const responseRecords = [...(assistantsByMessage.get(messageId) ?? [record])].sort(byResponseOrder);
     const toolResults: TranscriptChainRecord[] = [];
     for (const responseRecord of responseRecords) {
       for (const result of resultsByParent.get(responseRecord.uuid) ?? []) {
-        if (!selectedUuids.has(result.uuid)) toolResults.push(result);
+        toolResults.push(result);
       }
     }
-    const byTimestamp = (left: TranscriptChainRecord, right: TranscriptChainRecord) =>
-      left.timestamp.localeCompare(right.timestamp);
-    assistantSiblings.sort(byTimestamp);
-    toolResults.sort(byTimestamp);
-    const values = [...assistantSiblings, ...toolResults];
-    if (values.length === 0) continue;
-    for (const value of values) selectedUuids.add(value.uuid);
-    additions.set(insertionPoint.get(messageId)!.uuid, values);
+    toolResults.sort((left, right) => fileOrder.get(left.uuid)! - fileOrder.get(right.uuid)!);
+    for (const value of [...responseRecords, ...toolResults]) {
+      if (expandedUuids.has(value.uuid)) continue;
+      expandedUuids.add(value.uuid);
+      expanded.push(value);
+    }
   }
-
-  return selected.flatMap((record) => [record, ...(additions.get(record.uuid) ?? [])]);
+  return expanded;
 }
 
 function visible(record: TranscriptChainRecord): boolean {
@@ -182,7 +188,7 @@ export function selectHistory(input: readonly TranscriptRecord[]): SelectedHisto
         : undefined;
     }
   }
-  const selected = siblingBlocks(records, reversed.reverse(), selectedUuids).filter(visible);
+  const selected = siblingBlocks(records, reversed.reverse()).filter(visible);
   return {
     records: selected,
     compactionBoundaries: new Set(selected.filter(isCompactBoundary).map((record) => record.uuid)),

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { fileURLToPath } from "node:url";
 import { projectTranscript } from "../../../src/claude/native/projector.js";
 import type {
   AssistantRecord,
@@ -9,6 +10,11 @@ import type {
 } from "../../../src/claude/native/records.js";
 
 const timestamp = (second: number) => `2026-09-18T01:00:${String(second).padStart(2, "0")}.000Z`;
+const indexedFixtureSessionId = "a0cd4fcb-7bd4-43fa-b0d3-7d46e39e912a";
+const indexedFixturePath = fileURLToPath(new URL(
+  `../../fixtures/nativeClaudeHome/projects/-home-user-project/${indexedFixtureSessionId}.jsonl`,
+  import.meta.url,
+));
 const envelope = (uuid: string, parentUuid: string | null, second: number) => ({
   uuid, parentUuid, timestamp: timestamp(second), sessionId: "session", isSidechain: false,
   cwd: "/workspace", gitBranch: "main", version: "2.1.261",
@@ -67,10 +73,10 @@ describe("native Claude transcript projector", () => {
     expect(turn.status).toBe("completed");
     expect(turn.items.map((item) => [item.type, item.id])).toEqual([
       ["userMessage", "prompt-1"],
-      ["reasoning", "thinking-1"],
-      ["agentMessage", "text-1"],
+      ["reasoning", "message-1:0"],
+      ["agentMessage", "message-1:1"],
       ["commandExecution", "toolu-bash"],
-      ["agentMessage", "final-1"],
+      ["agentMessage", "message-2:0"],
     ]);
     expect(turn.items[1]).toMatchObject({ type: "reasoning", summary: ["Inspect first"], content: [] });
     expect(JSON.stringify(turn.items)).not.toContain("secret-signature");
@@ -100,7 +106,7 @@ describe("native Claude transcript projector", () => {
     expect(after.thread.updatedAt).toBe(1_789_693_207);
   });
 
-  it("suffixes block indexes only for multi-block assistant records", async () => {
+  it("uses content positions for a legacy multi-block record without apiBlockIndex", async () => {
     const user = prompt("prompt", null, "Question", 1);
     const multi = assistant("answer", user.uuid, "message", [
       { type: "thinking", thinking: "Reason", signature: "hidden" },
@@ -109,6 +115,46 @@ describe("native Claude transcript projector", () => {
     const projection = await projectTranscript({
       sessionId: "session", path: "/tmp/session.jsonl", records: [user, multi],
     });
-    expect(projection.turns[0]!.items.map((item) => item.id)).toEqual(["prompt", "answer:0", "answer:1"]);
+    expect(projection.turns[0]!.items.map((item) => item.id)).toEqual(["prompt", "message:0", "message:1"]);
+  });
+
+  it("orders an indexed text, tool, and thinking fixture response by API block index", async () => {
+    const projection = await projectTranscript({
+      sessionId: indexedFixtureSessionId,
+      path: indexedFixturePath,
+    });
+    const items = projection.turns[0]!.items;
+    const start = items.findIndex((item) => item.id === "msg_011CezukZZwYK9qbQqHK4dXw:0");
+
+    expect(items.slice(start, start + 3).map((item) => [item.type, item.id])).toEqual([
+      ["reasoning", "msg_011CezukZZwYK9qbQqHK4dXw:0"],
+      ["agentMessage", "msg_011CezukZZwYK9qbQqHK4dXw:1"],
+      ["commandExecution", "toolu_01VsEQQKaRdxjvWsj5NeXnS6"],
+    ]);
+  });
+
+  it("groups two thinking fixture blocks into one reasoning item", async () => {
+    const projection = await projectTranscript({
+      sessionId: indexedFixtureSessionId,
+      path: indexedFixturePath,
+    });
+    const reasoning = projection.turns[0]!.items.find((item) =>
+      item.id === "msg_011Cezuoy2vGZPzXLyrRUhqN:0");
+
+    expect(reasoning).toMatchObject({ type: "reasoning", id: "msg_011Cezuoy2vGZPzXLyrRUhqN:0" });
+    expect(reasoning?.type === "reasoning" ? reasoning.summary : []).toHaveLength(2);
+  });
+
+  it("keeps reasoning from two fixture responses as two items in one turn", async () => {
+    const projection = await projectTranscript({
+      sessionId: indexedFixtureSessionId,
+      path: indexedFixturePath,
+    });
+    const ids = projection.turns[0]!.items
+      .filter((item) => item.type === "reasoning")
+      .map((item) => item.id);
+
+    expect(ids).toContain("msg_011CezukZZwYK9qbQqHK4dXw:0");
+    expect(ids).toContain("msg_011Cezuoy2vGZPzXLyrRUhqN:0");
   });
 });

@@ -18,6 +18,8 @@ export interface MainStreamState {
   readonly completedItems: Set<string>;
   readonly pendingAgentItemIds: Set<string>;
   readonly tools: Map<string, SessionTool>;
+  messageId: string;
+  reasoningItemId: string | undefined;
   readonly review?: string;
 }
 
@@ -66,6 +68,8 @@ export function newMainStreamState(
     completedItems: new Set(),
     pendingAgentItemIds: new Set(),
     tools: new Map(),
+    messageId: turnId,
+    reasoningItemId: undefined,
     ...(review ? { review } : {}),
   };
 }

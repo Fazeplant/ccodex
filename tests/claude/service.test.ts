@@ -5696,8 +5696,12 @@ You are in a side conversation, not the main thread.`,
     await vi.advanceTimersByTimeAsync(0);
     const completed = service.readThread(started.thread.id, true).thread.turns[0]!;
     expect(completed).toMatchObject({
-      id: inProgress.id, status: "completed", items: [{ id: inProgress.items[0]!.id, type: "contextCompaction" }],
+      id: inProgress.id, status: "completed", items: [{
+        id: store.getThreadRecord(started.thread.id, false)!.lastClaudeMessageUuid,
+        type: "contextCompaction",
+      }],
     });
+    expect(completed.items[0]!.id).not.toBe(inProgress.items[0]!.id);
     expect(events.find((event) => event.method === "thread/tokenUsage/updated")?.params).toMatchObject({
       tokenUsage: { total: { totalTokens: 0 }, last: { totalTokens: 24 }, modelContextWindow: 200_000 },
     });
@@ -6075,10 +6079,11 @@ You are in a side conversation, not the main thread.`,
     directories.push(directory);
     const hub = new SubscriptionHub();
     const fake = new FakeClaudeQuery(undefined, undefined, [], true);
+    const store = new SqliteHybridStore(join(directory, "state.sqlite"));
     let releaseBoundary!: () => void;
     fake.compactBoundaryWait = new Promise<void>((resolve) => { releaseBoundary = resolve; });
     const service = new ClaudeService(
-      config(directory), hub, new Logger("error"), new SqliteHybridStore(join(directory, "state.sqlite")), fake.factory,
+      config(directory), hub, new Logger("error"), store, fake.factory,
       undefined, undefined, immediateCompactionBoundary,
     );
     const started = await service.startThread({ model: "claude:haiku", cwd: directory });
@@ -6101,7 +6106,10 @@ You are in a side conversation, not the main thread.`,
     expect(first.filter((method) => method === "turn/completed")).toHaveLength(1);
     expect(second.filter((method) => method === "turn/completed")).toHaveLength(1);
     expect(service.readThread(started.thread.id, true).thread.turns[0]).toMatchObject({
-      id: inProgress.id, status: "completed", items: [{ id: inProgress.items[0]!.id, type: "contextCompaction" }],
+      id: inProgress.id, status: "completed", items: [{
+        id: store.getThreadRecord(started.thread.id, false)!.lastClaudeMessageUuid,
+        type: "contextCompaction",
+      }],
     });
     await service.close();
   });

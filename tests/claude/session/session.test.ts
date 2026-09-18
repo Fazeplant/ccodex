@@ -1828,10 +1828,20 @@ describe("ClaudeSession Phase 3 slice", () => {
     const { store, hub, registry } = harness();
     await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
     await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
+    const stagedUuid = "staged-user-uuid";
+    await registry.submit("thread-1", {
+      type: "stageRuntimeTurn",
+      runtimeGeneration: 1,
+      settingsGeneration: 0,
+      messageUuid: stagedUuid,
+    });
     const prepared = await registry.submit<{ turn: Turn }>("thread-1", {
       type: "prepareTurn",
       params: { threadId: "thread-1", input: [{ type: "text", text: "work", text_elements: [] }] },
+      stagedMessageUuid: stagedUuid,
     });
+    expect(prepared.turn.id).toBe(stagedUuid);
+    expect(prepared.turn.items[0]!.id).toBe(stagedUuid);
     const methods: string[] = [];
     hub.subscribe("thread-1", "stream", (method) => {
       methods.push(method);
@@ -1848,15 +1858,16 @@ describe("ClaudeSession Phase 3 slice", () => {
       { type: "mainStream", runtimeGeneration: 1, source, fact },
     );
 
-    await stream({ kind: "messageStart" });
+    await stream({ kind: "messageStart", messageId: "message-text" });
     await stream({ kind: "blockStart", index: 0, block: "text" });
     await stream({ kind: "blockDelta", index: 0, block: "text", delta: "Working" });
     await stream({
       kind: "assistant",
-      blocks: [{ block: "text", text: "Working" }],
+      messageId: "message-text",
+      blocks: [{ index: 0, block: "text", text: "Working" }],
       completeAsCommentary: false,
     });
-    await stream({ kind: "messageStart" });
+    await stream({ kind: "messageStart", messageId: "message-reasoning" });
     await stream({ kind: "blockStart", index: 0, block: "reasoning" });
     await stream({ kind: "blockDelta", index: 0, block: "reasoning", delta: "Inspecting" });
     await stream({ kind: "blockStop", index: 0 });
@@ -1864,18 +1875,21 @@ describe("ClaudeSession Phase 3 slice", () => {
     await stream({ kind: "blockDelta", index: 1, block: "reasoning", delta: "Drafting" });
     await stream({
       kind: "assistant",
+      messageId: "message-reasoning",
       blocks: [
-        { block: "reasoning", text: "Inspecting" },
-        { block: "reasoning", text: "Drafting" },
+        { index: 0, block: "reasoning", text: "Inspecting" },
+        { index: 1, block: "reasoning", text: "Drafting" },
       ],
       completeAsCommentary: false,
     });
     await stream({ kind: "finish" });
 
     expect(store.getTurn("thread-1", prepared.turn.id)?.items).toEqual([
-      expect.objectContaining({ type: "userMessage" }),
-      expect.objectContaining({ type: "agentMessage", text: "Working", phase: "commentary" }),
-      expect.objectContaining({ type: "reasoning", summary: ["Inspecting", "Drafting"], content: [] }),
+      expect.objectContaining({ type: "userMessage", id: stagedUuid }),
+      expect.objectContaining({ type: "agentMessage", id: "message-text:0", text: "Working", phase: "commentary" }),
+      expect.objectContaining({
+        type: "reasoning", id: "message-reasoning:0", summary: ["Inspecting", "Drafting"], content: [],
+      }),
     ]);
     expect(methods.filter((method) => method === "item/reasoning/summaryPartAdded")).toHaveLength(1);
     expect(methods.filter((method) => method === "item/completed")).toHaveLength(2);
@@ -2127,7 +2141,8 @@ describe("ClaudeSession Phase 3 slice", () => {
     for (const fact of [
       { kind: "blockStart", index: 0, block: "text" },
       { kind: "blockDelta", index: 0, block: "text", delta: "Approved work" },
-      { kind: "assistant", blocks: [{ block: "text", text: "Approved work" }], completeAsCommentary: true },
+      { kind: "assistant", messageId: "approval-message",
+        blocks: [{ index: 0, block: "text", text: "Approved work" }], completeAsCommentary: true },
     ] as MainStreamFact[]) {
       await registry.submit("thread-1", { type: "mainStream", runtimeGeneration: 1, source, fact });
     }
@@ -2575,7 +2590,8 @@ describe("ClaudeSession Phase 3 slice", () => {
     });
     await registry.submit("thread-1", {
       type: "mainStream", runtimeGeneration: 1, source,
-      fact: { kind: "assistant", blocks: [{ block: "text", text: "P1 finding" }], completeAsCommentary: false },
+      fact: { kind: "assistant", messageId: "review-message",
+        blocks: [{ index: 0, block: "text", text: "P1 finding" }], completeAsCommentary: false },
     });
     await lifecycle({ type: "result", status: "completed", codexErrorInfo: null, origin: null });
     expect(store.getTurn("thread-1", completed.turn.id)?.items.at(-1)).toMatchObject({
@@ -2637,7 +2653,8 @@ describe("ClaudeSession Phase 3 slice", () => {
     for (const fact of [
       { kind: "blockStart", index: 0, block: "text" },
       { kind: "blockDelta", index: 0, block: "text", delta: "done" },
-      { kind: "assistant", blocks: [{ block: "text", text: "done" }], completeAsCommentary: false },
+      { kind: "assistant", messageId: "answer-message",
+        blocks: [{ index: 0, block: "text", text: "done" }], completeAsCommentary: false },
     ] as MainStreamFact[]) {
       await registry.submit("thread-1", { type: "mainStream", runtimeGeneration: 1, source, fact });
     }
@@ -3309,7 +3326,9 @@ describe("ClaudeSession Phase 3 slice", () => {
     expect(store.getTurn("thread-1", prepared.turn.id)?.items
       .filter((item) => item.type === "userMessage")).toEqual([
       expect.objectContaining({ content: [expect.objectContaining({ text: "first" })] }),
-      expect.objectContaining({ clientId: "client-steer", content: [expect.objectContaining({ text: "second" })] }),
+      expect.objectContaining({
+        id: "steer-1", clientId: "client-steer", content: [expect.objectContaining({ text: "second" })],
+      }),
     ]);
     await expect(registry.submit("thread-1", {
       type: "steer", runtimeGeneration: 1, messageUuid: "steer-2", expectedTurnId: "wrong",

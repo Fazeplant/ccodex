@@ -64,8 +64,11 @@ export class FakeClaudeQuery {
   public permissionAgentID: string | undefined;
   public readonly beforePermissionMessages: SDKMessage[] = [];
   public noQueryAcknowledgementBatchSize = 1;
+  public emitDefaultMessageStart = true;
+  public scriptedTurnMessages: readonly SDKMessage[] | undefined;
   private permissionToolSequence = 0;
   private readonly outputs: AsyncQueue<SDKMessage>[] = [];
+  private readonly responseIds: Array<string | undefined> = [];
 
   public constructor(
     public toolRequest?: { name: string; input: Record<string, unknown> },
@@ -93,7 +96,9 @@ export class FakeClaudeQuery {
     this.inputs.push(input);
     const sessionId = input.options.resume ?? input.options.sessionId ?? "session";
     const output = new AsyncQueue<SDKMessage>();
+    const queryIndex = this.outputs.length;
     this.outputs.push(output);
+    this.responseIds.push(undefined);
     const iterator = output[Symbol.asyncIterator]();
     output.push({
       type: "system", subtype: "init", model: input.options.model ?? "haiku",
@@ -102,7 +107,7 @@ export class FakeClaudeQuery {
       permissionMode: input.options.permissionMode ?? "default", slash_commands: [], output_style: "default", skills: [], plugins: [],
       ...(this.interruptReceipt ? { capabilities: ["interrupt_receipt_v1"] } : {}),
     } as unknown as SDKMessage);
-    void this.consumePrompts(input, output).catch(() => undefined);
+    void this.consumePrompts(input, output, queryIndex).catch(() => undefined);
     return this.query(
       sessionId,
       output,
@@ -112,14 +117,58 @@ export class FakeClaudeQuery {
   };
 
   public emit(message: SDKMessage, queryIndex = this.outputs.length - 1): void {
-    this.outputs[queryIndex]!.push(message);
+    this.pushProviderMessage(this.outputs[queryIndex]!, queryIndex, message);
   }
 
   public exit(queryIndex = this.outputs.length - 1): void {
     this.outputs[queryIndex]!.close();
   }
 
-  private async consumePrompts(input: ClaudeQueryInput, output: AsyncQueue<SDKMessage>): Promise<void> {
+  private pushProviderMessage(output: AsyncQueue<SDKMessage>, queryIndex: number, message: SDKMessage): void {
+    if (message.type === "stream_event" && message.event.type === "message_start") {
+      const messageId = message.event.message.id ?? `msg_${message.uuid}`;
+      this.responseIds[queryIndex] = messageId;
+      output.push({
+        ...message,
+        event: { ...message.event, message: { ...message.event.message, id: messageId } },
+      });
+      return;
+    }
+    if (message.type === "stream_event" && message.event.type === "content_block_start"
+      && !this.responseIds[queryIndex]) {
+      const messageId = `msg_${message.uuid}`;
+      this.responseIds[queryIndex] = messageId;
+      output.push({
+        type: "stream_event",
+        event: { type: "message_start", message: { id: messageId } },
+        parent_tool_use_id: message.parent_tool_use_id,
+        uuid: `start_${message.uuid}`,
+        session_id: message.session_id,
+      } as unknown as SDKMessage);
+    }
+    if (message.type === "assistant") {
+      const messageId = message.message.id ?? this.responseIds[queryIndex] ?? `msg_${message.uuid}`;
+      if (!this.responseIds[queryIndex]) {
+        this.responseIds[queryIndex] = messageId;
+        output.push({
+          type: "stream_event",
+          event: { type: "message_start", message: { id: messageId } },
+          parent_tool_use_id: message.parent_tool_use_id,
+          uuid: `start_${message.uuid}`,
+          session_id: message.session_id,
+        } as unknown as SDKMessage);
+      }
+      output.push({ ...message, message: { ...message.message, id: messageId } });
+      return;
+    }
+    output.push(message);
+  }
+
+  private async consumePrompts(
+    input: ClaudeQueryInput,
+    output: AsyncQueue<SDKMessage>,
+    queryIndex: number,
+  ): Promise<void> {
     let pendingNoQueryAcknowledgements = 0;
     for await (const _message of input.prompt) {
       this.prompts.push(_message);
@@ -142,11 +191,16 @@ export class FakeClaudeQuery {
         }
         continue;
       }
+      this.responseIds[queryIndex] = undefined;
       if (this.emitSessionStateChanges) {
         output.push({
           type: "system", subtype: "session_state_changed", state: "running",
           uuid: randomUUID(), session_id: sessionId,
         } as unknown as SDKMessage);
+      }
+      if (this.scriptedTurnMessages) {
+        for (const message of this.scriptedTurnMessages) this.pushProviderMessage(output, queryIndex, message);
+        continue;
       }
       const content = Array.isArray(_message.message.content) ? _message.message.content : [];
       if (this.compactBoundary && content.some((block) =>
@@ -207,7 +261,7 @@ export class FakeClaudeQuery {
       }
       let deferredPermission: Promise<unknown> | undefined;
       let deferredPermissionToolId: string | undefined;
-      for (const message of this.beforePermissionMessages) output.push(message);
+      for (const message of this.beforePermissionMessages) this.pushProviderMessage(output, queryIndex, message);
       if (this.beforePermissionMessages.length > 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
@@ -355,12 +409,15 @@ export class FakeClaudeQuery {
         } as unknown as SDKMessage);
       }
       for (const [index, message] of this.beforeResultMessages.entries()) {
-        output.push(message);
+        this.pushProviderMessage(output, queryIndex, message);
         if (this.beforeResultPause?.afterIndex === index) await this.beforeResultPause.wait;
       }
-      if (this.toolExecution) {
+      const existingResponseId = this.responseIds[queryIndex];
+      const responseId = existingResponseId ?? `msg_${randomUUID()}`;
+      if (!existingResponseId && this.emitDefaultMessageStart) {
+        this.responseIds[queryIndex] = responseId;
         output.push({
-          type: "stream_event", event: { type: "message_start", message: {} },
+          type: "stream_event", event: { type: "message_start", message: { id: responseId } },
           parent_tool_use_id: null, uuid: randomUUID(), session_id: sessionId,
         } as unknown as SDKMessage);
       }
@@ -388,7 +445,7 @@ export class FakeClaudeQuery {
       } as unknown as SDKMessage);
       output.push({
         type: "assistant",
-        message: { role: "assistant", content: [{ type: "text", text: "OK" }] },
+        message: { id: responseId, role: "assistant", content: [{ type: "text", text: "OK" }] },
         parent_tool_use_id: null,
         uuid: randomUUID(),
         session_id: sessionId,
@@ -422,7 +479,7 @@ export class FakeClaudeQuery {
         }
       }
       for (const [index, message] of this.afterResultMessages.entries()) {
-        output.push(message);
+        this.pushProviderMessage(output, queryIndex, message);
         if (this.afterResultPause?.afterIndex === index) await this.afterResultPause.wait;
       }
       if (this.emitSessionStateChanges) {

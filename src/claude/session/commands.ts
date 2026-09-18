@@ -100,7 +100,7 @@ export type RuntimeTurnStage =
   };
 
 export type MainStreamFact =
-  | { readonly kind: "messageStart" }
+  | { readonly kind: "messageStart"; readonly messageId: string }
   | { readonly kind: "blockStart"; readonly index: number; readonly block: "text" | "reasoning" }
   | {
     readonly kind: "blockDelta";
@@ -111,7 +111,12 @@ export type MainStreamFact =
   | { readonly kind: "blockStop"; readonly index: number }
   | {
     readonly kind: "assistant";
-    readonly blocks: readonly ({ readonly block: "text" | "reasoning"; readonly text: string } | null)[];
+    readonly messageId: string;
+    readonly blocks: readonly ({
+      readonly index: number;
+      readonly block: "text" | "reasoning";
+      readonly text: string;
+    } | null)[];
     readonly completeAsCommentary: boolean;
   }
   | { readonly kind: "instantAgent"; readonly text: string }

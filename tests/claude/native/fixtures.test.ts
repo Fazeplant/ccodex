@@ -31,10 +31,10 @@ describe("native Claude fixtures", () => {
     expect(projection.compactionBoundaries.size).toBe(1);
     expect(projection.turns.at(-1)!.items.map((item) => item.type)).toEqual([
       "userMessage", "reasoning", "agentMessage", "commandExecution", "reasoning",
-      "commandExecution", "commandExecution", "reasoning", "reasoning", "commandExecution",
-      "commandExecution", "reasoning", "reasoning", "commandExecution", "reasoning",
+      "commandExecution", "commandExecution", "reasoning", "commandExecution", "reasoning",
       "commandExecution", "reasoning", "commandExecution", "reasoning", "commandExecution",
-      "reasoning", "commandExecution", "reasoning", "commandExecution", "contextCompaction",
+      "reasoning", "commandExecution", "reasoning", "commandExecution", "reasoning",
+      "commandExecution", "reasoning", "commandExecution", "contextCompaction",
     ]);
   });
 

@@ -199,6 +199,7 @@ describe("Claude context usage", () => {
       secondResult,
     ] as unknown as SDKMessage[];
     const fake = new FakeClaudeQuery(undefined, undefined, after, false, undefined, capturedResult(), undefined, before);
+    fake.emitDefaultMessageStart = false;
     let releaseProbe!: () => void;
     fake.contextUsageWait = new Promise<void>((resolve) => { releaseProbe = resolve; });
     let releaseContinuation!: () => void;
