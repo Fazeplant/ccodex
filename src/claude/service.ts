@@ -1,5 +1,5 @@
 import { isAbsolute, join, resolve } from "node:path";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import {
   deleteSession, renameSession, type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -197,12 +197,12 @@ export interface ClaudeHandoffSource {
 }
 
 export interface ClaudeThreadAdminEffects {
-  rename(sessionId: string, name: string, cwd: string): Promise<void>;
+  rename(sessionId: string, name: string, cwd?: string): Promise<void>;
   delete(sessionId: string, cwd: string): Promise<void>;
 }
 
 const sdkThreadAdminEffects: ClaudeThreadAdminEffects = {
-  rename: async (sessionId, name, cwd) => renameSession(sessionId, name, { dir: cwd }),
+  rename: async (sessionId, name, cwd) => renameSession(sessionId, name, cwd ? { dir: cwd } : undefined),
   delete: async (sessionId, cwd) => deleteSession(sessionId, { dir: cwd }),
 };
 
@@ -622,10 +622,16 @@ export class ClaudeService {
     for (const record of this.store.allThreadRecords()) {
       const summary = this.catalog.get(record.claudeSessionId);
       const name = record.thread.name;
-      if (!summary || summary.customTitle || !name || record.thread.parentThreadId || record.thread.ephemeral) continue;
-      await this.threadAdminEffects.rename(summary.sessionId, name, summary.cwd).catch((error: unknown) => {
-        this.logger.warn("claude.catalog.title-backfill-failed", { threadId: record.thread.id, error: String(error) });
-      });
+      const flags = summary && this.flagsBySession.get(summary.sessionId);
+      if (!summary || (flags && flags.threadId !== record.thread.id)
+        || summary.customTitle || !name || record.thread.parentThreadId || record.thread.ephemeral) continue;
+      try {
+        await this.threadAdminEffects.rename(summary.sessionId, name, summary.cwd);
+      } catch {
+        await this.threadAdminEffects.rename(summary.sessionId, name).catch((error: unknown) => {
+          this.logger.warn("claude.catalog.title-backfill-failed", { threadId: record.thread.id, error: String(error) });
+        });
+      }
     }
     await this.catalog.refresh();
   }
@@ -647,6 +653,12 @@ export class ClaudeService {
   private catalogSession(threadId: string): SessionSummary | undefined {
     const sessionId = this.sessionId(threadId);
     return sessionId ? this.catalog.get(sessionId) : undefined;
+  }
+
+  private missingNativeTranscript(threadId: string): boolean {
+    return existsSync(this.config.claudeProjectsDir)
+      && !this.catalogSession(threadId)
+      && this.store.listTurns(threadId).length > 0;
   }
 
   private claim(sessionId: string): string {
@@ -1023,6 +1035,22 @@ export class ClaudeService {
           : null,
       };
     }
+    if (this.missingNativeTranscript(threadId)) {
+      record = this.withCatalogModel(record);
+      record = { ...record, thread: { ...this.effectiveThread(record), status: { type: "idle" } } };
+      return {
+        ...threadResponse(record, !resume.excludeTurns),
+        ...historyCursors(record.thread.turns),
+        initialTurnsPage: resume.initialTurnsPage
+          ? this.turnsPage({
+            threadId,
+            ...(resume.initialTurnsPage.limit !== undefined ? { limit: resume.initialTurnsPage.limit } : {}),
+            ...(resume.initialTurnsPage.sortDirection !== undefined ? { sortDirection: resume.initialTurnsPage.sortDirection } : {}),
+            ...(resume.initialTurnsPage.itemsView !== undefined ? { itemsView: resume.initialTurnsPage.itemsView } : {}),
+          })
+          : null,
+      };
+    }
     if (resume.cwd !== undefined || resume.runtimeWorkspaceRoots !== undefined) {
       await this.applySettings({
         threadId,
@@ -1110,6 +1138,9 @@ export class ClaudeService {
   }> {
     await this.adoptCatalogThread(params.threadId);
     this.requireIndependentThread(params.threadId, "start a turn in");
+    if (this.missingNativeTranscript(params.threadId)) {
+      throw invalidRequest(`Claude transcript for thread '${params.threadId}' no longer exists.`);
+    }
     if (params.toolOutput) throw invalidParams("Claude threads do not support toolOutput.");
     if (params.serviceTierForTurn != null) this.logger.warn("claude.turn.service-tier-for-turn.ignored",
       { threadId: params.threadId, serviceTierForTurn: params.serviceTierForTurn });
@@ -1501,7 +1532,8 @@ export class ClaudeService {
     });
     const storedThreads = this.store.listThreads(params).filter((thread) => {
       const record = this.store.getThreadRecord(thread.id, false);
-      return !record || !this.catalog.get(record.claudeSessionId);
+      return !record || !this.catalog.get(record.claudeSessionId)
+        || this.publicId(record.claudeSessionId) !== record.thread.id;
     });
     const threads = new Map([...catalogThreads, ...storedThreads].map((thread) => [thread.id, thread]));
     return [...threads.values()].filter((thread) => {
@@ -1636,17 +1668,25 @@ export class ClaudeService {
   public async deleteThread(threadId: string): Promise<Record<string, never>> {
     const sessionId = this.sessionId(threadId);
     const pending = this.pendingThreadRemoval(threadId);
+    let notifyDeleted = false;
     if (pending) {
       if (pending.rootThreadId !== threadId || pending.kind !== "delete") this.throwPendingRemoval(threadId, pending);
       await this.resumeThreadRemoval(threadId);
-      if (sessionId) this.writeFlags(defaultFlags(sessionId));
-      this.stickySessions.delete(threadId);
-      return {};
+    } else {
+      const summary = this.catalogSession(threadId);
+      if (summary && !this.store.hasThread(threadId)) {
+        await this.deleteProviderSession(summary.sessionId, summary.cwd);
+        notifyDeleted = true;
+      } else {
+        this.requireIndependentThread(threadId, "delete");
+        await this.removeThread(threadId, "delete", "Claude thread deleted during an active turn.");
+      }
     }
-    this.requireIndependentThread(threadId, "delete");
-    await this.removeThread(threadId, "delete", "Claude thread deleted during an active turn.");
     if (sessionId) this.writeFlags(defaultFlags(sessionId));
     this.stickySessions.delete(threadId);
+    this.transientThreadIds.delete(threadId);
+    await this.catalog.refresh();
+    if (notifyDeleted) this.sessionOutput.threadDeleted(threadId);
     return {};
   }
 

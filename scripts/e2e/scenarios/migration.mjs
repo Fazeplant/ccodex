@@ -66,6 +66,18 @@ try {
     .filter(({ archived, ephemeral }) => !archived && !ephemeral)
     .map(({ id }) => id));
   for (const id of diskIds) if (!referencedSessionIds.has(id)) expectedActive.add(id);
+  const handoffs = openReadonly(`${stateDir}/handoffs.sqlite`);
+  const claudeEpochs = handoffs.prepare(`
+    SELECT public_thread_id, backend_thread_id, state
+    FROM lineage_epochs
+    WHERE provider = 'claude'
+  `).all();
+  handoffs.close();
+  const logicalBackendIds = new Set(claudeEpochs.map(({ backend_thread_id }) => backend_thread_id));
+  for (const { public_thread_id, backend_thread_id, state } of claudeEpochs) {
+    if (!expectedActive.delete(backend_thread_id)) continue;
+    if (state === "current") expectedActive.add(public_thread_id);
+  }
 
   const startup = await startGateway();
   client = startup.client;
@@ -108,9 +120,9 @@ try {
   });
 
   const withTranscript = rootRows.filter((thread) =>
-    !thread.ephemeral && transcriptById.has(thread.sessionId)).slice(0, 3);
+    !thread.ephemeral && !logicalBackendIds.has(thread.id) && transcriptById.has(thread.sessionId)).slice(0, 3);
   const withoutTranscript = rootRows.filter((thread) =>
-    !thread.ephemeral && !transcriptById.has(thread.sessionId)).slice(0, 2);
+    !thread.ephemeral && !logicalBackendIds.has(thread.id) && !transcriptById.has(thread.sessionId)).slice(0, 2);
   add("legacy_resume_sample_available", withTranscript.length === 3 && withoutTranscript.length === 2, {
     withTranscript: withTranscript.length,
     withoutTranscript: withoutTranscript.length,
@@ -134,9 +146,16 @@ try {
     attempted: withTranscript.length + withoutTranscript.length,
     failedIds: [...new Set(resumeFailures)],
   });
-  add("legacy_resume_read_only", sameSnapshots(countsBeforeResume, countsAfterResume), {
-    unchanged: sameSnapshots(countsBeforeResume, countsAfterResume),
-    changedTables: changedTables(countsBeforeResume, countsAfterResume),
+  // Stage 3 removes the legacy event/provider journals. Stage 2 only promises that
+  // resuming a SQLite-owned thread does not rewrite its core stored history.
+  const resumeChanges = changedTables(countsBeforeResume, countsAfterResume);
+  const coreHistoryChanges = resumeChanges.filter((name) => [
+    "state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items",
+  ].includes(name));
+  add("legacy_resume_core_history_read_only", coreHistoryChanges.length === 0, {
+    unchanged: coreHistoryChanges.length === 0,
+    changedTables: resumeChanges,
+    assertedTables: ["state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items"],
   });
 
   const beforeRestartTitles = await customTitleTotal(titleCandidates, transcriptById);

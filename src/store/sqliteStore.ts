@@ -1244,8 +1244,15 @@ export class SqliteHybridStore implements HybridStore {
             ephemeral,
             json_extract(thread_json, '$.section'),
             json_extract(thread_json, '$.sectionEnteredAt')
-          FROM threads
-          WHERE json_extract(thread_json, '$.parentThreadId') IS NULL
+          FROM (
+            SELECT *, row_number() OVER (
+              PARTITION BY claude_session_id
+              ORDER BY ephemeral ASC, updated_at DESC, created_at DESC, id DESC
+            ) AS session_rank
+            FROM threads
+            WHERE json_extract(thread_json, '$.parentThreadId') IS NULL
+          )
+          WHERE session_rank = 1
             AND (
               id != claude_session_id
               OR archived != 0

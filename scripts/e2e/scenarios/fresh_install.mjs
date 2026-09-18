@@ -29,11 +29,11 @@ try {
   const startup = await startGateway();
   client = startup.client;
   timings.daemonStartMs = startup.start.durationMs;
-  const status = await daemon("status", { allowFailure: true });
-  add("daemon_status", status.ok, status.ok
-    ? { durationMs: status.durationMs }
-    : { durationMs: status.durationMs, error: status.error });
-  if (!status.ok) evidence.push({ method: "ccodex app-server daemon status", paramsShape: [], error: status.error });
+  const version = await daemon("version", { allowFailure: true });
+  add("daemon_version", version.ok, version.ok
+    ? { durationMs: version.durationMs }
+    : { durationMs: version.durationMs, error: version.error });
+  if (!version.ok) evidence.push({ method: "ccodex app-server daemon version", paramsShape: [], error: version.error });
 
   const guard = readOnlyGuard();
   const unfiltered = await guard.step("thread/list no filters", () => pagedThreads(client, { limit: 100 }));
@@ -181,8 +181,10 @@ try {
       sectionJsonSet: flag?.section_json != null,
       changedTables: changedTables(beforeSection, afterSection),
     });
-    add("section_changes_only_flags", changedTables(beforeSection, afterSection)
-      .every((name) => name === "state.sqlite:claude_session_flags"), {
+    add("section_changes_only_expected_tables", setEqual(
+      new Set(changedTables(beforeSection, afterSection)),
+      new Set(["state.sqlite:claude_session_flags", "state.sqlite:section_orders"]),
+    ), {
       changedTables: changedTables(beforeSection, afterSection),
     });
   } catch (error) {
