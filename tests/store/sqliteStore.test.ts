@@ -155,6 +155,18 @@ describe("SqliteHybridStore", () => {
     migrated.close();
   });
 
+  it("persists gateway-owned section orders", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-store-section-order-"));
+    directories.push(directory);
+    const store = new SqliteHybridStore(join(directory, "state.sqlite"));
+    store.setSectionOrder("sec", ["a", "b"]);
+    store.setSectionOrder("sec", ["b", "a"]);
+    expect(store.sectionOrders()).toEqual(new Map([["sec", ["b", "a"]]]));
+    store.setSectionOrder("sec", []);
+    expect(store.sectionOrders().size).toBe(0);
+    store.close();
+  });
+
   it("relabels appServer Claude threads as vscode when migration 12 runs", () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-store-thread-source-"));
     directories.push(directory);

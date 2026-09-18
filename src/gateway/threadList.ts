@@ -7,6 +7,7 @@ import type { ThreadLoadedListResponse } from "../codex/generated/v2/ThreadLoade
 import type { ThreadSearchParams } from "../codex/generated/v2/ThreadSearchParams.js";
 import type { ThreadSearchResponse } from "../codex/generated/v2/ThreadSearchResponse.js";
 import type { ThreadSearchResult } from "../codex/generated/v2/ThreadSearchResult.js";
+import type { ThreadSectionMoveParams } from "../codex/generated/v2/ThreadSectionMoveParams.js";
 import type { ClaudeService } from "../claude/service.js";
 import type { StockRpc } from "./stockRpc.js";
 import { CursorCodec, queryFingerprint } from "../protocol/cursor.js";
@@ -30,10 +31,13 @@ export interface RemoteCatalogSnapshot {
 
 export type CatalogNotificationSink = (method: string, params: unknown) => void;
 
+type ThreadTimeKey = "createdAt" | "updatedAt" | "recencyAt" | "sectionEnteredAt";
+
 interface ThreadCursor {
   readonly query: string;
   readonly direction: "asc" | "desc";
-  readonly key: "createdAt" | "updatedAt" | "recencyAt" | "sectionEnteredAt";
+  /** `sectionRank`: position in the merged manual order of one section. */
+  readonly key: ThreadTimeKey | "sectionRank";
   readonly value: number;
   readonly id: string;
 }
@@ -47,7 +51,7 @@ interface OffsetCursor {
 function threadKey(params: ThreadListParams): ThreadCursor["key"] {
   return params.sortKey === "updated_at" ? "updatedAt"
     : params.sortKey === "recency_at" ? "recencyAt"
-    : params.sortKey === "section_position" ? "sectionEnteredAt"
+    : params.sortKey === "section_position" ? (typeof params.sectionId === "string" ? "sectionRank" : "sectionEnteredAt")
     : "createdAt";
 }
 
@@ -64,11 +68,6 @@ function threadQuery(params: ThreadListParams): string {
     useStateDbOnly: params.useStateDbOnly ?? false, searchTerm: params.searchTerm ?? null,
     parentThreadId: params.parentThreadId ?? null, ancestorThreadId: params.ancestorThreadId ?? null,
   });
-}
-
-function compareThreads(left: Thread, right: Thread, key: ThreadCursor["key"], direction: ThreadCursor["direction"]): number {
-  const sign = direction === "asc" ? 1 : -1;
-  return ((((left[key] ?? 0) - (right[key] ?? 0)) || left.id.localeCompare(right.id)) * sign);
 }
 
 async function allStockSearchResults(stock: StockRpc, params: ThreadSearchParams): Promise<ThreadSearchResult[]> {
@@ -129,11 +128,64 @@ export class ThreadCatalog {
     const projected = this.logical
       ? this.logical.projectThreadCatalog(stockThreads, claudeCatalog, providerParams)
       : [...stockThreads, ...claudeCatalog];
-    return filterSortThreads(projected, publicListParams(params));
+    const threads = filterSortThreads(projected, publicListParams(params));
+    return threadKey(params) === "sectionRank" ? this.orderedSection(params.sectionId as string, threads, params) : threads;
+  }
+
+  /**
+   * Manual order of one section, ascending: the gateway-owned order first, then
+   * stock's own order for threads it has not seen, then newcomers by entry time.
+   * Stock keeps positions server-internal, so its order is only visible as the
+   * order of a section-scoped `section_position` listing.
+   */
+  private async orderedSection(sectionId: string, members: Thread[], params: ThreadListParams): Promise<Thread[]> {
+    const stockOrder = await allStockThreads(this.stock, {
+      archived: params.archived ?? false, cursor: null, limit: 100, sectionId, sortKey: "section_position", sortDirection: "asc",
+      ...(params.useStateDbOnly ? { useStateDbOnly: true } : {}),
+    });
+    const stockRank = new Map(stockOrder.map((thread, index) => [thread.id, index]));
+    const ownRank = new Map((this.claude.sectionOrders().get(sectionId) ?? []).map((id, index) => [id, index]));
+    const rank = (thread: Thread): number => {
+      const own = ownRank.get(thread.id);
+      if (own !== undefined) return own;
+      const stock = stockRank.get(this.logical?.currentBackendId?.(thread.id) ?? thread.id);
+      return stock === undefined ? 2e15 + (thread.sectionEnteredAt ?? 0) : 1e15 + stock;
+    };
+    return [...members].sort((left, right) => (rank(left) - rank(right)) || left.id.localeCompare(right.id));
   }
 
   public async list(params: ThreadListParams): Promise<ThreadListResponse> {
-    return this.paginate("thread", await this.projected(params), (thread) => thread, params, threadQuery(params), threadKey(params));
+    const key = threadKey(params);
+    const threads = await this.projected(params);
+    if (key !== "sectionRank") return this.paginate("thread", threads, (thread) => thread, params, threadQuery(params), key);
+    const rank = new Map(threads.map((thread, index) => [thread.id, index]));
+    // Stock defaults section_position to ascending.
+    const sortDirection = params.sortDirection ?? "asc";
+    return this.paginate(
+      "thread", sortDirection === "asc" ? threads : [...threads].reverse(), (thread) => thread,
+      { ...params, sortDirection }, threadQuery(params), key, (thread) => rank.get(thread.id) ?? 0,
+    );
+  }
+
+  /**
+   * Records `thread/section/move` in the gateway-owned order and returns the
+   * `beforeThreadId` stock can honor for the same move: the next stock-owned
+   * thread after the new position, since stock never sees Claude threads.
+   */
+  public async moveInSection(move: ThreadSectionMoveParams, stockOwned: (threadId: string) => boolean): Promise<string | null> {
+    for (const [sectionId, ids] of this.claude.sectionOrders()) {
+      if (sectionId !== move.sectionId && ids.includes(move.threadId)) {
+        this.claude.setSectionOrder(sectionId, ids.filter((id) => id !== move.threadId));
+      }
+    }
+    if (move.sectionId === null) return null;
+    const order = (await this.projected({ archived: false, sectionId: move.sectionId, sortKey: "section_position", useStateDbOnly: true }))
+      .map((thread) => thread.id).filter((id) => id !== move.threadId);
+    const at = move.beforeThreadId ? order.indexOf(move.beforeThreadId) : order.length;
+    if (at < 0) throw invalidRequest(`before thread ${move.beforeThreadId} is not in section ${move.sectionId}`);
+    order.splice(at, 0, move.threadId);
+    this.claude.setSectionOrder(move.sectionId, order);
+    return order.slice(at + 1).find(stockOwned) ?? null;
   }
 
   /** `thread/search`: stock matches plus Claude matches, projected onto public threads and sorted by time like stock. */
@@ -174,6 +226,7 @@ export class ThreadCatalog {
     params: { cursor?: string | null; limit?: number | null; sortDirection?: "asc" | "desc" | null },
     query: string,
     key: ThreadCursor["key"],
+    valueOf: (thread: Thread) => number = (thread) => (key === "sectionRank" ? 0 : thread[key] ?? 0),
   ): { data: T[]; nextCursor: string | null; backwardsCursor: string | null } {
     const direction = params.sortDirection === "asc" ? "asc" : "desc";
     const cursor = this.cursors.decode<ThreadCursor>(scope, params.cursor);
@@ -181,12 +234,14 @@ export class ThreadCatalog {
       || typeof cursor.value !== "number" || typeof cursor.id !== "string")) {
       throw invalidParams("Thread pagination query changed; restart pagination.");
     }
-    const anchor: Thread | undefined = cursor ? { [key]: cursor.value, id: cursor.id } as unknown as Thread : undefined;
-    const catalog = entries.filter((entry) => !anchor || compareThreads(threadOf(entry), anchor, key, direction) > 0);
+    const sign = direction === "asc" ? 1 : -1;
+    const afterCursor = (thread: Thread) => !cursor
+      || (((valueOf(thread) - cursor.value) || thread.id.localeCompare(cursor.id)) * sign) > 0;
+    const catalog = entries.filter((entry) => afterCursor(threadOf(entry)));
     const limit = Math.max(1, Math.min(params.limit ?? (scope === "thread" ? 50 : 25), 100));
     const data = catalog.slice(0, limit);
     const cursorFor = (thread: Thread, cursorDirection: ThreadCursor["direction"]) => this.cursors.encode(scope, {
-      query, direction: cursorDirection, key, value: thread[key] ?? 0, id: thread.id,
+      query, direction: cursorDirection, key, value: valueOf(thread), id: thread.id,
     });
     return {
       data,

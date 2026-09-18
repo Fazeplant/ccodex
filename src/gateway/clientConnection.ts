@@ -141,6 +141,8 @@ export function attachClientConnection(
     handoffs,
     stockSideThreads,
   );
+  const stockOwned = (threadId: string) =>
+    !claude.ownsThread(threadId) && handoffs.logical?.(threadId)?.epoch.provider !== "claude";
   const stockState = sharedStockState ?? new StockStateTracker();
   const queued: Array<{ data: WebSocket.RawData; isBinary: boolean }> = [];
   const requestStarted = new Map<string, number>();
@@ -1447,6 +1449,7 @@ export function attachClientConnection(
           }
           if (message.method === "thread/section/move") {
             const move = (message.params ?? {}) as ThreadSectionMoveParams;
+            await catalog.moveInSection(move, stockOwned);
             await claude.setThreadSection(
               params.threadId,
               move.sectionId === null ? null : await findStockSection(stockRpc, move.sectionId),
@@ -1644,6 +1647,17 @@ export function attachClientConnection(
       }
     }
     let forwarded = message;
+    if (message && isRequest(message) && message.method === "thread/section/move") {
+      // Stock only orders its own threads; the merged order lives in the gateway.
+      const move = (message.params ?? {}) as ThreadSectionMoveParams;
+      try {
+        forwarded = { ...message, params: { ...move, beforeThreadId: await catalog.moveInSection(move, stockOwned) } };
+      } catch (error) {
+        const failure = rpcError(error);
+        sendError(message.id, failure.code, failure.message);
+        return;
+      }
+    }
     if (message && isRequest(message) && message.method === "turn/start") {
       const params = handoffs.prepareTitleTurn(connectionId, (message.params ?? {}) as TurnStartParams);
       if (params !== message.params) forwarded = { ...message, params };

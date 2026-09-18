@@ -22,9 +22,11 @@ export const STORE_READS = new Set([
   "listProviderItemCorrelations",
   "listThreads",
   "listTurns",
+  "sectionOrders",
 ]);
 
-export const STORE_INFRASTRUCTURE = new Set(["close"]);
+// Gateway-owned catalog state (no Claude session writer): section order overlay.
+export const STORE_INFRASTRUCTURE = new Set(["close", "setSectionOrder"]);
 
 export const HUB_PRODUCT_OUTPUT = new Set([
   "emit",

@@ -168,6 +168,8 @@ function fakeClaude() {
     ownsThread: (threadId: string) => threads.has(threadId),
     readThread: vi.fn((threadId: string) => ({ thread: stockThread(threadId) })),
     listThreads: vi.fn(() => []),
+    sectionOrders: () => new Map<string, string[]>(),
+    setSectionOrder: vi.fn(),
     loadedThreadIds: vi.fn(() => []),
     isChildProjection: () => false,
     startThread: vi.fn(async (params: {

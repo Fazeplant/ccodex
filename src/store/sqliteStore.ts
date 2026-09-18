@@ -774,6 +774,23 @@ export class SqliteHybridStore implements HybridStore {
     return Number(this.database.prepare("DELETE FROM goals WHERE thread_id = ?").run(threadId).changes) > 0;
   }
 
+  public sectionOrders(): Map<string, string[]> {
+    const rows = this.database.prepare("SELECT section_id, order_json FROM section_orders").all() as unknown as
+      Array<{ section_id: string; order_json: string }>;
+    return new Map(rows.map((row) => [row.section_id, JSON.parse(row.order_json) as string[]]));
+  }
+
+  public setSectionOrder(sectionId: string, threadIds: readonly string[]): void {
+    if (threadIds.length === 0) {
+      this.database.prepare("DELETE FROM section_orders WHERE section_id = ?").run(sectionId);
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO section_orders (section_id, order_json) VALUES (?, ?)
+      ON CONFLICT(section_id) DO UPDATE SET order_json = excluded.order_json
+    `).run(sectionId, json(threadIds));
+  }
+
   public listQueuedSubmissions(threadId: string): QueuedSubmission[] {
     const row = this.database.prepare("SELECT queue_json FROM thread_queues WHERE thread_id = ?").get(threadId) as unknown as
       | { queue_json: string }
@@ -983,6 +1000,10 @@ export class SqliteHybridStore implements HybridStore {
       CREATE TABLE IF NOT EXISTS thread_queues (
         thread_id TEXT PRIMARY KEY,
         queue_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS section_orders (
+        section_id TEXT PRIMARY KEY,
+        order_json TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS goal_checkpoints (
         thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,

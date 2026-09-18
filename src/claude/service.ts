@@ -1304,6 +1304,9 @@ export class ClaudeService {
     });
   }
 
+  public sectionOrders(): Map<string, string[]> { return this.store.sectionOrders(); }
+  public setSectionOrder(sectionId: string, threadIds: readonly string[]): void { this.store.setSectionOrder(sectionId, threadIds); }
+
   /** Section registry stays stock-owned; CCodex records only the membership. */
   public setThreadSection(threadId: string, section: ThreadSection | null): Promise<{ thread: Thread }> {
     this.requireIndependentThread(threadId, "move into a section");

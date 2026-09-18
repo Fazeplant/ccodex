@@ -35,6 +35,7 @@ export class MemoryHybridStore implements HybridStore {
   private readonly archived = new Set<string>();
   private readonly pendingRemovals = new Map<string, PendingThreadRemoval>();
   private readonly goals = new Map<string, InternalGoal>();
+  private readonly sectionOrderBySection = new Map<string, string[]>();
   private readonly queues = new Map<string, QueuedSubmission[]>();
   private readonly goalCheckpoints = new Set<string>();
   private readonly turnMessages = new Map<string, string>();
@@ -369,6 +370,15 @@ export class MemoryHybridStore implements HybridStore {
     const request = this.pending.get(requestId);
     if (request?.status === "pending") this.pending.set(requestId, { ...request, status, response: copy(response), resolvedAt: Date.now() });
   }
+  public sectionOrders(): Map<string, string[]> {
+    return new Map([...this.sectionOrderBySection].map(([sectionId, ids]) => [sectionId, [...ids]]));
+  }
+
+  public setSectionOrder(sectionId: string, threadIds: readonly string[]): void {
+    if (threadIds.length === 0) this.sectionOrderBySection.delete(sectionId);
+    else this.sectionOrderBySection.set(sectionId, [...threadIds]);
+  }
+
   public getGoal(threadId: string): InternalGoal | undefined {
     const goal = this.goals.get(threadId);
     return goal ? copy(goal) : undefined;
@@ -584,6 +594,8 @@ export class LayeredHybridStore implements HybridStore {
     const request = this.getPendingRequest(requestId);
     if (request) this.owner(request.threadId).resolvePendingRequest(requestId, status, response);
   }
+  public sectionOrders(): Map<string, string[]> { return this.durable.sectionOrders(); }
+  public setSectionOrder(sectionId: string, threadIds: readonly string[]): void { this.durable.setSectionOrder(sectionId, threadIds); }
   public getGoal(threadId: string): InternalGoal | undefined { return this.owner(threadId).getGoal(threadId); }
   public setGoal(threadId: string, patch: GoalPatch): InternalGoal { return this.owner(threadId).setGoal(threadId, patch); }
   public clearGoal(threadId: string): boolean { return this.owner(threadId).clearGoal(threadId); }

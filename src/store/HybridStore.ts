@@ -203,6 +203,9 @@ export interface HybridStore {
   getThreadRecord(threadId: string, includeTurns?: boolean): ClaudeThreadRecord | undefined;
   allThreadRecords(): ClaudeThreadRecord[];
   listThreads(params: ThreadListParams): Thread[];
+  /** Gateway-owned manual order of every section, keyed by section id (stock cannot order Claude threads). */
+  sectionOrders(): Map<string, string[]>;
+  setSectionOrder(sectionId: string, threadIds: readonly string[]): void;
   updateThread(record: ClaudeThreadRecord): void;
   isThreadArchived(threadId: string): boolean;
   setThreadArchived(threadId: string, archived: boolean): void;

@@ -55,6 +55,49 @@ describe("merged thread listing", () => {
       .toEqual(["pinned", "regular"]);
   });
 
+  it("orders a section by the gateway-owned order, then stock's order, and translates moves for stock", async () => {
+    const pinned = (entry: Thread, enteredAt: number): Thread =>
+      ({ ...entry, section: { id: "sec", name: "Pinned" } as Thread["section"], sectionEnteredAt: enteredAt });
+    const stockA = pinned(thread("stock-a", 1), 10);
+    const stockB = pinned(thread("stock-b", 2), 20);
+    const claudeC = pinned(thread("claude-c", 3), 30);
+    const stock = {
+      // Stock's manual order (b before a) is only visible through a section-scoped section_position listing.
+      request: async (_method: string, params: { sectionId?: string }) => ({
+        data: params.sectionId ? [stockB, stockA] : [stockA, stockB, thread("stock-other", 9)], nextCursor: null, backwardsCursor: null,
+      }),
+    };
+    const orders = new Map<string, string[]>();
+    const claude = {
+      listThreads: () => [claudeC],
+      sectionOrders: () => orders,
+      setSectionOrder: (sectionId: string, ids: readonly string[]) => { orders.set(sectionId, [...ids]); },
+    };
+    const stockOwned = (id: string) => id.startsWith("stock");
+    const catalog = new ThreadCatalog(stock as never, claude as never, new CursorCodec(Buffer.alloc(32, 9)));
+    const params = { sectionId: "sec", sortKey: "section_position" as const, limit: 100 };
+    const ids = async (extra: object = {}) => (await catalog.list({ ...params, ...extra })).data.map((entry) => entry.id);
+
+    expect(await ids()).toEqual(["stock-b", "stock-a", "claude-c"]);
+    expect(await catalog.moveInSection({ threadId: "claude-c", sectionId: "sec", beforeThreadId: "stock-a" }, stockOwned)).toBe("stock-a");
+    expect(await ids()).toEqual(["stock-b", "claude-c", "stock-a"]);
+    expect(await catalog.moveInSection({ threadId: "stock-b", sectionId: "sec", beforeThreadId: null }, stockOwned)).toBeNull();
+    expect(await ids()).toEqual(["claude-c", "stock-a", "stock-b"]);
+    // Stock never sees claude-c, so "before claude-c" becomes "before the next stock thread".
+    expect(await catalog.moveInSection({ threadId: "stock-a", sectionId: "sec", beforeThreadId: "claude-c" }, stockOwned)).toBe("stock-b");
+    expect(await ids()).toEqual(["stock-a", "claude-c", "stock-b"]);
+    expect(await ids({ sortDirection: "desc" })).toEqual(["stock-b", "claude-c", "stock-a"]);
+    await expect(catalog.moveInSection({ threadId: "stock-a", sectionId: "sec", beforeThreadId: "stock-other" }, stockOwned))
+      .rejects.toThrow("before thread stock-other is not in section sec");
+
+    const first = await catalog.list({ ...params, limit: 2 });
+    expect(first.data.map((entry) => entry.id)).toEqual(["stock-a", "claude-c"]);
+    expect((await catalog.list({ ...params, limit: 2, cursor: first.nextCursor })).data.map((entry) => entry.id)).toEqual(["stock-b"]);
+
+    expect(await catalog.moveInSection({ threadId: "claude-c", sectionId: null }, stockOwned)).toBeNull();
+    expect(orders.get("sec")).toEqual(["stock-a", "stock-b"]);
+  });
+
   it("uses stable signed keyset cursors in both directions", async () => {
     const stockThreads = [thread("stock-4", 4), thread("stock-2", 2)];
     const claudeThreads = [thread("claude-3", 3), thread("claude-1", 1)];
