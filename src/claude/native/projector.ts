@@ -22,12 +22,19 @@ import {
   type TranscriptRecord,
   type UserRecord,
 } from "./records.js";
+import {
+  startsTurn,
+  summarizeTranscript,
+  timestampSeconds,
+  type TranscriptHeader,
+} from "./summary.js";
 
 export interface ProjectTranscriptInput {
   readonly sessionId: string;
   readonly path: string;
   readonly records?: readonly TranscriptRecord[];
   readonly history?: SelectedHistory;
+  readonly header?: TranscriptHeader;
   readonly parentThreadId?: string | null;
   readonly subagent?: {
     readonly promptRecordUuid: string;
@@ -63,33 +70,6 @@ function object(value: unknown): Record<string, unknown> | undefined {
 
 function string(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
-}
-
-function seconds(timestamp: string | undefined): number | null {
-  if (!timestamp) return null;
-  const milliseconds = Date.parse(timestamp);
-  return Number.isNaN(milliseconds) ? null : Math.floor(milliseconds / 1_000);
-}
-
-function textContent(record: UserRecord): string {
-  if (typeof record.message.content === "string") return record.message.content;
-  return record.message.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n");
-}
-
-function hasToolResult(record: UserRecord): boolean {
-  return Array.isArray(record.message.content)
-    && record.message.content.some((block) => block.type === "tool_result");
-}
-
-function startsTurn(record: UserRecord, subagentPromptUuid: string | undefined): boolean {
-  if (record.uuid === subagentPromptUuid) return true;
-  if (record.isMeta === true || record.isCompactSummary === true || hasToolResult(record)) return false;
-  if (record.origin?.kind === "human") return true;
-  if (record.origin !== undefined || !textContent(record)) return false;
-  const text = textContent(record);
-  return !/<command-name>|<command-message>|<command-args>|<local-command-[^>]*>|<task-notification>/u.test(text)
-    && !text.startsWith("[Injected model-visible history]")
-    && !/^\[Request interrupted by user(?: for tool use)?\]$/u.test(text);
 }
 
 function imageInput(source: unknown): UserInput | undefined {
@@ -353,8 +333,8 @@ function projectTurns(
       else if (isCompactBoundary(record)) items.push({ type: "contextCompaction", id: record.uuid });
     }
     const status = turnStatus(turnRecords, turnIndex + 1 < starts.length);
-    const startedAt = seconds(prompt.timestamp);
-    const completedAt = status === "inProgress" ? null : seconds(turnRecords.at(-1)?.timestamp);
+    const startedAt = timestampSeconds(prompt.timestamp);
+    const completedAt = status === "inProgress" ? null : timestampSeconds(turnRecords.at(-1)?.timestamp);
     return {
       id: prompt.uuid,
       items,
@@ -370,10 +350,6 @@ function projectTurns(
   });
 }
 
-function lastValue<T>(values: readonly T[]): T | undefined {
-  return values.at(-1);
-}
-
 export async function projectTranscript(input: ProjectTranscriptInput): Promise<TranscriptProjection> {
   let skippedLines = 0;
   let rawRecords: readonly TranscriptRecord[];
@@ -387,29 +363,11 @@ export async function projectTranscript(input: ProjectTranscriptInput): Promise<
     rawRecords = loaded;
   }
   const history = input.history ?? selectHistory(rawRecords);
-  const chain = rawRecords.filter((record): record is TranscriptChainRecord =>
-    record.type === "user" || record.type === "assistant" || record.type === "system" || record.type === "attachment");
   const selected = history.records;
-  const cwd = lastValue(chain.flatMap((record) => record.cwd ? [record.cwd] : [])) ?? "/";
-  const gitBranch = lastValue(chain.flatMap((record) => record.gitBranch ? [record.gitBranch] : []));
-  const turns = projectTurns(selected, cwd, input.sessionId, input.subagent?.promptRecordUuid);
-  const timestamps = rawRecords.flatMap((record) => "timestamp" in record && typeof record.timestamp === "string"
-    ? [record.timestamp] : []);
-  const createdAt = seconds(timestamps[0]) ?? 0;
-  const updatedAt = seconds(timestamps.at(-1)) ?? createdAt;
-  const customTitle = lastValue(rawRecords.flatMap((record) =>
-    record.type === "custom-title" && record.customTitle ? [record.customTitle] : []));
-  const aiTitle = lastValue(rawRecords.flatMap((record) =>
-    record.type === "ai-title" && record.aiTitle ? [record.aiTitle] : []));
-  const assistants = selected.filter((record): record is AssistantRecord => record.type === "assistant");
-  const model = lastValue(assistants.flatMap((record) => record.message.model ? [record.message.model] : []));
-  const reasoningEffort = lastValue(assistants.flatMap((record) => record.effort ? [record.effort] : [])) ?? null;
-  const firstPrompt = selected.find((record): record is UserRecord =>
-    record.type === "user" && startsTurn(record, input.subagent?.promptRecordUuid));
-  const preview = firstPrompt ? textContent(firstPrompt).trim() : "";
+  const header = input.header ?? summarizeTranscript(rawRecords, input.subagent?.promptRecordUuid);
+  const turns = projectTurns(selected, header.cwd, input.sessionId, input.subagent?.promptRecordUuid);
   const nickname = input.subagent?.nickname ?? null;
   const parentThreadId = input.parentThreadId ?? null;
-  const cliVersion = lastValue(chain.flatMap((record) => record.version ? [record.version] : [])) ?? "claude-code";
   const status: Thread["status"] = turns.at(-1)?.status === "inProgress"
     ? { type: "active", activeFlags: [] }
     : { type: "idle" };
@@ -419,22 +377,22 @@ export async function projectTranscript(input: ProjectTranscriptInput): Promise<
     sessionId: input.sessionId,
     forkedFromId: input.subagent ? parentThreadId : null,
     parentThreadId,
-    preview,
+    preview: header.preview,
     ephemeral: false,
     section: null,
     sectionEnteredAt: null,
     projectId: null,
     historyMode: "paginated",
     modelProvider: "claude",
-    model: model ? `claude:${normalizeClaudeModelIdentifier(model)}` : null,
-    reasoningEffort,
-    createdAt,
-    updatedAt,
-    recencyAt: updatedAt,
+    model: header.model ? `claude:${normalizeClaudeModelIdentifier(header.model)}` : null,
+    reasoningEffort: header.reasoningEffort,
+    createdAt: header.createdAt,
+    updatedAt: header.updatedAt,
+    recencyAt: header.updatedAt,
     status,
     path: null,
-    cwd,
-    cliVersion,
+    cwd: header.cwd,
+    cliVersion: header.cliVersion ?? "claude-code",
     source: input.subagent ? { subAgent: { thread_spawn: {
       parent_thread_id: parentThreadId!, depth: input.subagent.depth, agent_path: null,
       agent_nickname: nickname, agent_role: null,
@@ -443,8 +401,8 @@ export async function projectTranscript(input: ProjectTranscriptInput): Promise<
     threadSource: input.subagent ? "subagent" : "user",
     agentNickname: nickname,
     agentRole: null,
-    gitInfo: { sha: null, branch: gitBranch ?? null, originUrl: null },
-    name: nickname ?? customTitle ?? aiTitle ?? null,
+    gitInfo: { sha: null, branch: header.gitBranch, originUrl: null },
+    name: nickname ?? header.customTitle ?? header.aiTitle,
     turns,
   };
   return { thread, turns, skippedLines, compactionBoundaries: history.compactionBoundaries };

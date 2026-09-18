@@ -1,6 +1,5 @@
 /** Owns the typed, streaming view of Claude's append-only transcript records. */
 import { createReadStream } from "node:fs";
-import { createInterface } from "node:readline";
 
 export interface TextBlock { readonly type: "text"; readonly text: string }
 export interface ImageBlock { readonly type: "image"; readonly source: unknown }
@@ -131,6 +130,7 @@ export interface StateRecord {
     | "file-history-snapshot" | "file-history-delta" | "cost-state" | "fork-context-ref";
   readonly sessionId?: string;
   readonly timestamp?: string;
+  readonly permissionMode?: string;
   readonly [key: string]: unknown;
 }
 
@@ -153,30 +153,63 @@ function record(value: unknown): value is TranscriptRecord {
 export class TranscriptRecordReader implements AsyncIterable<TranscriptRecord> {
   public skippedLines = 0;
   public parsedLines = 0;
+  public bytesRead = 0;
+  public completeBytes = 0;
 
-  public constructor(public readonly path: string) {}
+  public constructor(
+    public readonly path: string,
+    private readonly options: { readonly start?: number; readonly end?: number } = {},
+  ) {}
 
   public async *[Symbol.asyncIterator](): AsyncIterator<TranscriptRecord> {
-    const lines = createInterface({ input: createReadStream(this.path), crlfDelay: Infinity });
-    for await (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const value: unknown = JSON.parse(line);
-        if (!record(value)) {
-          this.skippedLines += 1;
-          continue;
-        }
-        this.parsedLines += 1;
-        yield value;
-      } catch {
-        this.skippedLines += 1;
+    const input = createReadStream(this.path, { ...this.options, highWaterMark: 256 * 1_024 });
+    let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    for await (const value of input) {
+      const chunk = value as Buffer;
+      this.bytesRead += chunk.length;
+      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+      let newline = pending.indexOf(0x0a);
+      while (newline !== -1) {
+        const line = pending.subarray(0, newline);
+        pending = pending.subarray(newline + 1);
+        this.completeBytes += newline + 1;
+        const parsed = this.parseLine(line);
+        if (parsed) yield parsed;
+        newline = pending.indexOf(0x0a);
       }
+    }
+    if (pending.length > 0) {
+      const parsed = this.parseLine(pending);
+      if (parsed !== undefined) {
+        this.completeBytes += pending.length;
+        if (parsed) yield parsed;
+      }
+    }
+  }
+
+  private parseLine(bytes: Buffer): TranscriptRecord | null | undefined {
+    const line = bytes.toString("utf8").replace(/\r$/u, "");
+    if (!line.trim()) return null;
+    try {
+      const value: unknown = JSON.parse(line);
+      if (!record(value)) {
+        this.skippedLines += 1;
+        return null;
+      }
+      this.parsedLines += 1;
+      return value;
+    } catch {
+      this.skippedLines += 1;
+      return undefined;
     }
   }
 }
 
-export function readTranscriptRecords(path: string): TranscriptRecordReader {
-  return new TranscriptRecordReader(path);
+export function readTranscriptRecords(
+  path: string,
+  options?: { readonly start?: number; readonly end?: number },
+): TranscriptRecordReader {
+  return new TranscriptRecordReader(path, options);
 }
 
 export function isChainRecord(record: TranscriptRecord): record is TranscriptChainRecord {
