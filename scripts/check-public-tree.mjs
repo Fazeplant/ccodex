@@ -10,9 +10,11 @@ const allowedMarkdown = new Set([
 ]);
 const forbiddenCapture = /(^|\/)(captures?|fixtures\/protocol)(\/|$)|\.(?:capture|gateway|lab)\.json$|\.jsonl(?:\.gz)?$/u;
 const allowedMarkdownPattern = /^(?:agents|skills)\/.+\.md$/u;
+// Scrubbed native Claude transcripts (structure kept, free text replaced) used by tests/claude/native.
+const allowedFixtures = /^tests\/fixtures\/nativeClaudeHome\//u;
 const violations = files.filter((path) =>
   (path.endsWith(".md") && !allowedMarkdown.has(path) && !allowedMarkdownPattern.test(path))
-  || forbiddenCapture.test(path));
+  || (forbiddenCapture.test(path) && !allowedFixtures.test(path)));
 
 if (violations.length > 0) {
   throw new Error(`Private docs or captures are tracked:\n${violations.join("\n")}`);
