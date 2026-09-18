@@ -17,7 +17,7 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(
 async function harness(customTitle?: string, renamePrompt: string | null = DEFAULT_RENAME_PROMPT) {
   const directory = mkdtempSync(join(tmpdir(), "ccodex-generated-title-"));
   const config: HybridConfig = {
-    realCodex: "/bin/false", claudeBinary: "/bin/false", dataDir: directory,
+    realCodex: "/bin/false", claudeBinary: "/bin/false", claudeProjectsDir: join(directory, "claude-projects"), dataDir: directory,
     publicSocket: join(directory, "gateway.sock"), modelPrefix: "claude:",
     idleTimeoutSeconds: 900, modelCacheSeconds: 300, logLevel: "error",
     logPrompts: false, debugCapture: false, debugLogMaxBytes: 1_048_576,
@@ -31,10 +31,6 @@ async function harness(customTitle?: string, renamePrompt: string | null = DEFAU
     undefined, undefined, undefined,
     { rename: async () => undefined, delete: async () => undefined },
     undefined, undefined, undefined,
-    async () => [{
-      sessionId: store.getThreadRecord(threadId, false)!.claudeSessionId,
-      summary: "Native title without emoji", ...(customTitle ? { customTitle } : {}), lastModified: Date.now(),
-    }],
   );
   const handoffs = new CrossProviderForks(new HandoffStore(join(directory, "handoffs.sqlite")), service, renamePrompt);
   threadId = (await service.startThread({ model: "claude:haiku", cwd: directory })).thread.id;
@@ -75,7 +71,6 @@ describe("generated Claude title persistence", () => {
     h.handoffs.observeDurableThread("phone", "claude", "another-thread");
     await h.complete();
     await h.complete();
-    await h.service.refreshNativeMetadata();
     expect(h.service.readThread(h.threadId, false).thread.name).toBe(h.title);
     expect(h.events.filter((event) => event.method === "thread/name/updated")).toEqual([
       { method: "thread/name/updated", params: { threadId: h.threadId, threadName: h.title } },
@@ -101,15 +96,6 @@ describe("generated Claude title persistence", () => {
     else if (order === "after") { await h.complete(); await manual(); }
     else await Promise.all([manual(), h.complete()]);
     expect(h.service.readThread(h.threadId, false).thread.name).toBe("My manual name");
-  });
-
-  it("preserves a native Claude custom title", async () => {
-    const h = await harness("Native manual name");
-    await h.service.refreshNativeMetadata();
-    h.prepareTitle();
-    await h.complete();
-    expect(h.service.readThread(h.threadId, false).thread.name).toBe("Native manual name");
-    expect(h.events.filter((event) => event.method === "thread/name/updated")).toEqual([]);
   });
 
   it.each(["An unrelated task in another tab", "Research fill-conditioned maker orders."])("rejects an unrelated or incomplete first prompt: %s", async (prompt) => {

@@ -9,7 +9,7 @@ const directories: string[] = [];
 
 function config(dataDir: string, includeContent: boolean): HybridConfig {
   return {
-    realCodex: "/bin/false", claudeBinary: "/bin/false", dataDir, publicSocket: join(dataDir, "gateway.sock"),
+    realCodex: "/bin/false", claudeBinary: "/bin/false", claudeProjectsDir: join(dataDir, "claude-projects"), dataDir, publicSocket: join(dataDir, "gateway.sock"),
     modelPrefix: "claude:", idleTimeoutSeconds: 900, modelCacheSeconds: 300, logLevel: "error",
     logPrompts: false, debugCapture: false, debugLogMaxBytes: 1_048_576,
     rpcCapture: true, rpcCaptureIncludeContent: includeContent, rpcCaptureMaxBytes: 1_048_576,

@@ -1,7 +1,7 @@
 import { isAbsolute, join, resolve } from "node:path";
 import { statSync } from "node:fs";
 import {
-  deleteSession, listSessions, renameSession, type SDKSessionInfo, type SDKUserMessage,
+  deleteSession, renameSession, type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { v7 as uuidv7 } from "uuid";
 import type { Thread } from "../codex/generated/v2/Thread.js";
@@ -66,7 +66,7 @@ import type { HybridConfig } from "../config/config.js";
 import type { SubscriptionHub } from "../gateway/subscriptions.js";
 import type { Logger } from "../observability/logger.js";
 import type {
-  ClaudeThreadRecord, HybridStore, InternalGoal, PendingThreadRemoval, TurnProviderBoundary,
+  ClaudeSessionFlags, ClaudeThreadRecord, HybridStore, InternalGoal, PendingThreadRemoval, TurnProviderBoundary,
 } from "../store/HybridStore.js";
 import { runtimeWorkspaceRoots as storedWorkspaceRoots, settingsGeneration, withSettingsFrom } from "../store/HybridStore.js";
 import { SqliteHybridStore } from "../store/sqliteStore.js";
@@ -77,7 +77,7 @@ import type { Model } from "../codex/generated/v2/Model.js";
 import type { JsonValue } from "../codex/generated/serde_json/JsonValue.js";
 import { invalidParams, invalidRequest } from "../protocol/errors.js";
 import { historyCursors, paginateItems, paginateTurns, startedTurn, turnCursor } from "../protocol/turnPagination.js";
-import { searchTurnOccurrences, threadSearchSnippet } from "../protocol/search.js";
+import { searchTurnOccurrences } from "../protocol/search.js";
 import type { ThreadSearchParams } from "../codex/generated/v2/ThreadSearchParams.js";
 import type { ThreadSearchResult } from "../codex/generated/v2/ThreadSearchResult.js";
 import { MetricsRegistry } from "../observability/metrics.js";
@@ -133,6 +133,8 @@ import {
 } from "../state/stateCommand.js";
 import { syncedCollaborationMode, threadSettings } from "./threadSettings.js";
 import { claudeDeveloperInstructions } from "./developerInstructions.js";
+import { NativeSessionCatalog, type SessionSummary } from "./native/catalog.js";
+import type { TranscriptProjection } from "./native/projector.js";
 
 interface ModelCatalog {
   list(): Promise<Model[]>;
@@ -324,6 +326,34 @@ function approvalsReviewer(value: ApprovalsReviewer | null | undefined, fallback
   return value ?? fallback;
 }
 
+function nativePermissions(permissionMode: string | null, cwd: string): Pick<
+  ClaudeThreadRecord,
+  "approvalPolicy" | "approvalsReviewer" | "sandboxPolicy"
+> {
+  if (permissionMode === "bypassPermissions") {
+    return { approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: { type: "dangerFullAccess" } };
+  }
+  const workspace = sandboxPolicy("workspace-write", cwd);
+  if (permissionMode === "dontAsk") {
+    return { approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: workspace };
+  }
+  if (permissionMode === "auto") {
+    return { approvalPolicy: "on-request", approvalsReviewer: "auto_review", sandboxPolicy: workspace };
+  }
+  return { approvalPolicy: "on-request", approvalsReviewer: "user", sandboxPolicy: workspace };
+}
+
+function defaultFlags(sessionId: string, threadId = sessionId): ClaudeSessionFlags {
+  return {
+    sessionId,
+    threadId,
+    archived: false,
+    ephemeral: false,
+    section: null,
+    sectionEnteredAt: null,
+  };
+}
+
 function threadResponse(record: ClaudeThreadRecord, includeTurns: boolean): ThreadStartResponse {
   const {
     sandboxPolicy: sandbox, effort: reasoningEffort, summary: _summary,
@@ -431,6 +461,12 @@ export class ClaudeService {
   private readonly settingsUpdates = new Map<string, Promise<void>>();
   private readonly idleTimer: NodeJS.Timeout;
   private readonly store: HybridStore;
+  private readonly catalog: NativeSessionCatalog;
+  private readonly catalogReady: Promise<void>;
+  private stopCatalogWatch: (() => void) | undefined;
+  private catalogTitles = new Map<string, string | null>();
+  private readonly stickySessions = new Map<string, string>();
+  private readonly transientThreadIds = new Set<string>();
   private readonly sessionOutput: ClaudeOutputAdapter;
   private readonly sessions: ClaudeSessionRegistry<ClaudeSessionCommand, ClaudeSession>;
   private readonly rateLimits: ClaudeRateLimitCoordinator;
@@ -439,10 +475,6 @@ export class ClaudeService {
   private closing = false;
   private closePromise: Promise<void> | undefined;
   private standaloneStatusRead: Promise<ClaudeRateLimitStatus> | undefined;
-  private nativeMetadata = new Map<string, SDKSessionInfo>();
-  private nativeMetadataRead: Promise<void> | undefined;
-  private nativeMetadataReadAt = 0;
-
   public constructor(
     private readonly config: HybridConfig,
     private readonly hub: SubscriptionHub,
@@ -459,9 +491,9 @@ export class ClaudeService {
       state: "ready",
     }),
     private readonly skillsChanged?: (cwd: string) => void,
-    private readonly nativeSessionCatalog: () => Promise<SDKSessionInfo[]> = () => listSessions(),
   ) {
     this.store = new LayeredHybridStore(durableStore);
+    this.catalog = new NativeSessionCatalog(config.claudeProjectsDir);
     const sessionRepository = new ClaudeSessionRepository(this.store);
     this.sessionOutput = new ClaudeOutputAdapter(hub);
     this.rateLimits = new ClaudeRateLimitCoordinator(logger);
@@ -548,14 +580,75 @@ export class ClaudeService {
       this.idleSweep = this.idleSweep.then(() => this.unloadIdleRuntimes());
     }, intervalMs);
     this.idleTimer.unref();
+    this.catalogReady = Promise.all([this.restartRecovery, this.catalog.refresh()]).then(() => {
+      this.catalogTitles = this.nativeTitles();
+      this.stopCatalogWatch = this.catalog.watch(() => this.onCatalogChanged());
+    });
   }
 
   public ownsThread(threadId: string): boolean {
-    return this.store.hasThread(threadId);
+    return this.store.hasThread(threadId)
+      || this.sessionId(threadId) !== undefined
+      || this.stickySessions.has(threadId);
   }
 
   public ready(): Promise<void> {
-    return this.restartRecovery;
+    return this.catalogReady;
+  }
+
+  private flags(sessionId: string): ClaudeSessionFlags {
+    return this.store.sessionFlags().get(sessionId) ?? defaultFlags(sessionId);
+  }
+
+  private setFlags(sessionId: string, patch: Partial<Omit<ClaudeSessionFlags, "sessionId" | "threadId">>): ClaudeSessionFlags {
+    const flags = { ...this.flags(sessionId), ...patch };
+    this.store.setSessionFlags(flags);
+    return flags;
+  }
+
+  private publicId(sessionId: string): string {
+    return this.flags(sessionId).threadId;
+  }
+
+  private sessionId(threadId: string): string | undefined {
+    const stored = this.store.getThreadRecord(threadId, false)?.claudeSessionId;
+    if (stored) return stored;
+    for (const flags of this.store.sessionFlags().values()) {
+      if (flags.threadId === threadId) return flags.sessionId;
+    }
+    if (this.catalog.get(threadId) && this.publicId(threadId) === threadId) return threadId;
+    return this.stickySessions.get(threadId);
+  }
+
+  private catalogSession(threadId: string): SessionSummary | undefined {
+    const sessionId = this.sessionId(threadId);
+    return sessionId ? this.catalog.get(sessionId) : undefined;
+  }
+
+  private claim(sessionId: string): string {
+    const threadId = this.publicId(sessionId);
+    this.stickySessions.set(threadId, sessionId);
+    return threadId;
+  }
+
+  private nativeTitles(): Map<string, string | null> {
+    return new Map(this.catalog.sessions().map((summary) => [
+      this.publicId(summary.sessionId),
+      summary.customTitle ?? summary.aiTitle,
+    ]));
+  }
+
+  private onCatalogChanged(): void {
+    const titles = this.nativeTitles();
+    for (const [threadId, title] of titles) {
+      if (this.catalogTitles.has(threadId) && this.catalogTitles.get(threadId) !== title) {
+        this.hub.emitGlobal("thread/name/updated", {
+          threadId,
+          ...(title === null ? {} : { threadName: title }),
+        });
+      }
+    }
+    this.catalogTitles = titles;
   }
 
   public ownsModel(modelId: string): boolean {
@@ -605,7 +698,7 @@ export class ClaudeService {
     if (lastTurnId && through < 0) throw invalidParams(`Unknown Claude turn '${lastTurnId}'.`);
     const turns = snapshot.record.thread.turns.slice(0, through + 1);
     return {
-      thread: { ...this.withNativeMetadata(snapshot.record), turns },
+      thread: { ...this.effectiveThread(snapshot.record), turns },
       turns,
       settings: threadSettings(snapshot.record),
       runtimeWorkspaceRoots: storedWorkspaceRoots(snapshot.record),
@@ -613,7 +706,137 @@ export class ClaudeService {
   }
 
   public currentThreadSettings(threadId: string): ThreadSettings {
-    return threadSettings(this.withCatalogModel(this.requireRecord(threadId, false)));
+    const record = this.store.getThreadRecord(threadId, false)
+      ?? (this.catalogSession(threadId) ? this.catalogRecord(this.catalogSession(threadId)!) : undefined);
+    if (!record) throw invalidParams(`Unknown Claude thread '${threadId}'.`);
+    return threadSettings(this.withCatalogModel(record));
+  }
+
+  private nativeModel(model: string | null): ModelSelection & { readonly resolvedModel: string | null } {
+    if (!model) {
+      const modelPickerId = this.modelCatalog?.defaultModelId?.() ?? `${this.config.modelPrefix}default`;
+      return {
+        modelPickerId,
+        claudeModelValue: resolveClaudeModel(this.config, modelPickerId) ?? "default",
+        resolvedModel: null,
+      };
+    }
+    const resolvedModel = normalizeClaudeModelIdentifier(model);
+    const modelPickerId = this.modelCatalog?.cachedPickerId?.(resolvedModel)
+      ?? `${this.config.modelPrefix}${resolvedModel}`;
+    return {
+      modelPickerId,
+      claudeModelValue: resolveClaudeModel(this.config, modelPickerId) ?? resolvedModel,
+      resolvedModel,
+    };
+  }
+
+  private catalogRecord(summary: SessionSummary, projection?: TranscriptProjection): ClaudeThreadRecord {
+    const flags = this.flags(summary.sessionId);
+    const threadId = flags.threadId;
+    const model = this.nativeModel(summary.model);
+    const turns = (projection?.turns ?? []).map((turn) => ({
+      ...turn,
+      items: turn.items.map((item) => item.type === "collabAgentToolCall" && item.senderThreadId === summary.sessionId
+        ? { ...item, senderThreadId: threadId }
+        : item),
+    }));
+    const projected = projection?.thread;
+    const thread: Thread = {
+      ...(projected ?? {
+        id: threadId,
+        extra: null,
+        sessionId: threadId,
+        forkedFromId: null,
+        parentThreadId: null,
+        preview: summary.preview,
+        ephemeral: flags.ephemeral,
+        section: flags.section,
+        sectionEnteredAt: flags.sectionEnteredAt,
+        projectId: null,
+        historyMode: "paginated",
+        modelProvider: "claude",
+        model: model.modelPickerId,
+        reasoningEffort: summary.reasoningEffort,
+        createdAt: summary.createdAt,
+        updatedAt: summary.updatedAt,
+        recencyAt: summary.updatedAt,
+        status: { type: "notLoaded" },
+        path: null,
+        cwd: summary.cwd,
+        cliVersion: summary.cliVersion ?? "claude-code",
+        source: "vscode",
+        canAcceptDirectInput: true,
+        threadSource: "user",
+        agentNickname: null,
+        agentRole: null,
+        gitInfo: { sha: null, branch: summary.gitBranch, originUrl: null },
+        name: summary.customTitle ?? summary.aiTitle,
+        turns: [],
+      }),
+      id: threadId,
+      sessionId: threadId,
+      ephemeral: flags.ephemeral,
+      section: flags.section,
+      sectionEnteredAt: flags.sectionEnteredAt,
+      model: model.modelPickerId,
+      reasoningEffort: summary.reasoningEffort,
+      name: summary.customTitle ?? summary.aiTitle,
+      preview: summary.preview,
+      cwd: summary.cwd,
+      createdAt: summary.createdAt,
+      updatedAt: summary.updatedAt,
+      recencyAt: summary.updatedAt,
+      turns,
+    };
+    const permissions = nativePermissions(summary.permissionMode, summary.cwd);
+    return {
+      thread,
+      runtimeWorkspaceRoots: [summary.cwd],
+      claudeSessionId: summary.sessionId,
+      modelPickerId: model.modelPickerId,
+      claudeModelValue: model.claudeModelValue,
+      serviceTier: null,
+      ...permissions,
+      baseInstructions: null,
+      developerInstructions: null,
+      personality: null,
+      resolvedModel: model.resolvedModel,
+      lastClaudeMessageUuid: projection?.lastAssistantUuid ?? null,
+      lastCompletedTurnId: turns.findLast((turn) => turn.status === "completed")?.id ?? null,
+      claudeCodeVersion: summary.cliVersion,
+      reasoningEffort: summary.reasoningEffort,
+      reasoningSummary: null,
+      collaborationMode: null,
+      outputSchema: null,
+      tokenUsageTotal: projection?.tokenUsageTotal ?? {
+        totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0,
+        outputTokens: 0, reasoningOutputTokens: 0,
+      },
+      tokenUsageLast: null,
+      modelContextWindow: null,
+      providerCostUsdTotal: 0,
+      settingsGeneration: 0,
+    };
+  }
+
+  private async adoptCatalogThread(threadId: string): Promise<void> {
+    if (this.store.hasThread(threadId)) return;
+    const summary = this.catalogSession(threadId);
+    if (!summary) throw invalidParams(`Native Claude transcript for thread '${threadId}' is unavailable.`);
+    const projection = await this.catalog.projection(summary.sessionId);
+    const record = this.catalogRecord(summary, projection);
+    this.store.adoptTransient(record, record.thread.turns);
+    this.transientThreadIds.add(threadId);
+    this.claim(summary.sessionId);
+  }
+
+  public async prepareReadThread(threadId: string, includeTurns: boolean): Promise<void> {
+    if (includeTurns) await this.adoptCatalogThread(threadId);
+    else {
+      const summary = this.catalogSession(threadId);
+      if (summary) this.claim(summary.sessionId);
+    }
   }
 
   private withCatalogModel(record: ClaudeThreadRecord): ClaudeThreadRecord {
@@ -667,7 +890,7 @@ export class ClaudeService {
   ): ThreadForkResponse {
     const record = this.requireRecord(sourceThreadId, false);
     const response = threadResponse(record, false);
-    const source = this.withNativeMetadata(record);
+    const source = this.effectiveThread(record);
     return {
       ...response,
       thread: {
@@ -693,10 +916,16 @@ export class ClaudeService {
       }
     }
     return [...loaded]
-      .filter((threadId) => this.store.hasThread(threadId)
-        && !this.store.isThreadArchived(threadId)
-        && !this.pendingThreadRemoval(threadId)
-        && !this.hub.isSuppressed(threadId));
+      .filter((threadId) => {
+        if (!this.ownsThread(threadId) || this.pendingThreadRemoval(threadId) || this.hub.isSuppressed(threadId)) return false;
+        const summary = this.catalogSession(threadId);
+        if (summary) {
+          if (this.flags(summary.sessionId).archived) return false;
+          this.claim(summary.sessionId);
+          return true;
+        }
+        return !this.store.isThreadArchived(threadId);
+      });
   }
 
   public async reportError(
@@ -724,6 +953,7 @@ export class ClaudeService {
   public async startThread(params: ThreadStartParams): Promise<ThreadStartResponse> {
     let record = await this.newThreadRecord(params);
     record = await this.sessions.submit(record.thread.id, { type: "createThread", record });
+    if (record.thread.ephemeral) this.setFlags(record.claudeSessionId, { ephemeral: true });
     return threadResponse(record, false);
   }
 
@@ -732,6 +962,7 @@ export class ClaudeService {
     this.sessionOutput.suppress(record.thread.id);
     try {
       record = await this.sessions.submit(record.thread.id, { type: "createThread", record });
+      if (record.thread.ephemeral) this.setFlags(record.claudeSessionId, { ephemeral: true });
       return threadResponse(record, false);
     } catch (error) {
       this.sessionOutput.unsuppress(record.thread.id);
@@ -748,12 +979,13 @@ export class ClaudeService {
     if (this.closing) throw invalidParams("Claude service is closing.");
     const resume = typeof params === "string" ? { threadId: params } : params;
     const { threadId } = resume;
+    await this.adoptCatalogThread(threadId);
     this.assertThreadAvailable(threadId);
     let record = this.store.getThreadRecord(threadId, true);
     if (!record) throw invalidParams(`Unknown Claude thread '${threadId}'.`);
     if (record.thread.parentThreadId) {
       record = this.withCatalogModel(record);
-      record = { ...record, thread: this.withNativeMetadata(record) };
+      record = { ...record, thread: this.effectiveThread(record) };
       return {
         ...threadResponse(record, !resume.excludeTurns),
         ...historyCursors(record.thread.turns),
@@ -776,14 +1008,14 @@ export class ClaudeService {
           : {}),
       });
     }
-    await this.migrateStoredModel(threadId);
+    if (!this.transientThreadIds.has(threadId)) await this.migrateStoredModel(threadId);
     await (await this.sessions.getOrCreate(threadId)).materializeRuntime();
     record = await this.sessions.submit<ClaudeThreadRecord>(
       threadId,
       { type: "readThread", includeTurns: true },
     );
     record = this.withCatalogModel(record);
-    record = { ...record, thread: this.withNativeMetadata(record) };
+    record = { ...record, thread: this.effectiveThread(record) };
     if (this.store.listQueuedSubmissions(threadId).length) this.scheduleQueueDrain(threadId);
     return {
       ...threadResponse(record, !resume.excludeTurns),
@@ -800,6 +1032,7 @@ export class ClaudeService {
   }
 
   public async prepareResume(params: ThreadResumeParams): Promise<PreparedResume> {
+    await this.adoptCatalogThread(params.threadId);
     if (this.requireRecord(params.threadId, false).thread.parentThreadId) {
       return {
         response: await this.resumeThread(params),
@@ -832,9 +1065,12 @@ export class ClaudeService {
 
   public readThread(threadId: string, includeTurns: boolean): ThreadReadResponse {
     this.assertThreadAvailable(threadId);
-    const record = this.store.getThreadRecord(threadId, includeTurns);
+    const summary = this.catalogSession(threadId);
+    const record = this.store.getThreadRecord(threadId, includeTurns)
+      ?? (summary && !includeTurns ? this.catalogRecord(summary) : undefined);
     if (!record) throw invalidParams(`Unknown Claude thread '${threadId}'.`);
-    return { thread: this.withNativeMetadata(record) };
+    if (summary) this.claim(summary.sessionId);
+    return { thread: this.effectiveThread(record) };
   }
 
   public async prepareTurn(
@@ -848,6 +1084,7 @@ export class ClaudeService {
     start: () => void;
     startAndWait: () => Promise<void>;
   }> {
+    await this.adoptCatalogThread(params.threadId);
     this.requireIndependentThread(params.threadId, "start a turn in");
     if (params.toolOutput) throw invalidParams("Claude threads do not support toolOutput.");
     if (params.serviceTierForTurn != null) this.logger.warn("claude.turn.service-tier-for-turn.ignored",
@@ -1231,34 +1468,37 @@ export class ClaudeService {
   }
 
   public listThreads(params: Parameters<HybridStore["listThreads"]>[0]): Thread[] {
-    return this.store.listThreads(params)
-      .map((thread) => {
-        const record = this.store.getThreadRecord(thread.id, false);
-        return record ? this.withNativeMetadata({ ...record, thread }) : thread;
-      })
-      .filter((thread) => !this.pendingThreadRemoval(thread.id) && !this.hub.isSuppressed(thread.id));
-  }
-
-  public refreshNativeMetadata(): Promise<void> {
-    if (Date.now() - this.nativeMetadataReadAt < 30_000) return Promise.resolve();
-    if (this.nativeMetadataRead) return this.nativeMetadataRead;
-    const read = this.nativeSessionCatalog().then((sessions) => {
-      this.nativeMetadata = new Map(sessions.map((session) => [session.sessionId, session]));
-      this.nativeMetadataReadAt = Date.now();
-    }).catch((error: unknown) => {
-      this.logger.warn("claude.catalog.native-metadata-failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }).finally(() => {
-      if (this.nativeMetadataRead === read) this.nativeMetadataRead = undefined;
+    const archived = params.archived === true;
+    const catalogThreads = params.parentThreadId || params.ancestorThreadId ? [] : this.catalog.sessions().flatMap((summary) => {
+      const flags = this.flags(summary.sessionId);
+      if (flags.ephemeral || flags.archived !== archived) return [];
+      const record = this.catalogRecord(summary);
+      return [record.thread];
     });
-    this.nativeMetadataRead = read;
-    return read;
+    const storedThreads = this.store.listThreads(params).filter((thread) => {
+      const record = this.store.getThreadRecord(thread.id, false);
+      return !record || !this.catalog.get(record.claudeSessionId);
+    });
+    const threads = new Map([...catalogThreads, ...storedThreads].map((thread) => [thread.id, thread]));
+    return [...threads.values()].filter((thread) => {
+      if (this.pendingThreadRemoval(thread.id) || this.hub.isSuppressed(thread.id)) return false;
+      const summary = this.catalogSession(thread.id);
+      if (summary) this.claim(summary.sessionId);
+      return true;
+    });
   }
 
   public async setGeneratedThreadName(params: ThreadSetNameParams, userPrompt: string): Promise<void> {
+    const summary = this.catalogSession(params.threadId);
+    if (summary) {
+      if (summary.customTitle || summary.preview.trim() !== userPrompt.trim()) return;
+      await this.threadAdminEffects.rename(summary.sessionId, params.name, summary.cwd);
+      await this.catalog.refresh();
+      this.onCatalogChanged();
+      return;
+    }
     const record = this.requireRecord(params.threadId, false);
-    if (record.thread.parentThreadId || this.nativeMetadata.get(record.claudeSessionId)?.customTitle) return;
+    if (record.thread.parentThreadId) return;
     await this.sessions.submit(params.threadId, {
       type: "threadAdmin",
       command: { kind: "generatedName", name: params.name, userPrompt },
@@ -1266,6 +1506,13 @@ export class ClaudeService {
   }
 
   public async setThreadName(params: ThreadSetNameParams): Promise<Record<string, never>> {
+    const summary = this.catalogSession(params.threadId);
+    if (summary) {
+      await this.threadAdminEffects.rename(summary.sessionId, params.name, summary.cwd);
+      await this.catalog.refresh();
+      this.onCatalogChanged();
+      return {};
+    }
     const record = this.requireRecord(params.threadId, false);
     if (record.thread.parentThreadId) {
       await this.sessions.submit(params.threadId, {
@@ -1283,13 +1530,6 @@ export class ClaudeService {
         );
       }
     }, params.name);
-    const native = this.nativeMetadata.get(record.claudeSessionId);
-    if (native) this.nativeMetadata.set(record.claudeSessionId, {
-      ...native,
-      customTitle: params.name,
-      summary: params.name,
-      lastModified: Date.now(),
-    });
     return {};
   }
 
@@ -1309,6 +1549,14 @@ export class ClaudeService {
 
   /** Section registry stays stock-owned; CCodex records only the membership. */
   public setThreadSection(threadId: string, section: ThreadSection | null): Promise<{ thread: Thread }> {
+    const summary = this.catalogSession(threadId);
+    if (summary) {
+      this.setFlags(summary.sessionId, {
+        section,
+        sectionEnteredAt: section ? nowSeconds() : null,
+      });
+      return Promise.resolve({ thread: this.catalogRecord(summary).thread });
+    }
     this.requireIndependentThread(threadId, "move into a section");
     return this.sessions.submit(threadId, {
       type: "threadAdmin",
@@ -1317,6 +1565,16 @@ export class ClaudeService {
   }
 
   public async archiveThread(threadId: string): Promise<Record<string, never>> {
+    const summary = this.catalogSession(threadId);
+    if (summary) {
+      this.setFlags(summary.sessionId, { archived: true });
+      this.sessionOutput.emit(threadId, "thread/archived", { threadId });
+      if (this.sessions.resolvedSession(threadId)) {
+        await this.failStatusTurnForUnload(threadId, "Claude thread archived during an active turn.");
+        await this.sessions.retire(threadId);
+      }
+      return {};
+    }
     this.requireIndependentThread(threadId, "archive");
     this.terminalAdmins.set(threadId, (this.terminalAdmins.get(threadId) ?? 0) + 1);
     try {
@@ -1338,6 +1596,12 @@ export class ClaudeService {
   }
 
   public unarchiveThread(threadId: string): Promise<{ thread: Thread }> {
+    const summary = this.catalogSession(threadId);
+    if (summary) {
+      this.setFlags(summary.sessionId, { archived: false });
+      this.sessionOutput.emit(threadId, "thread/unarchived", { threadId });
+      return Promise.resolve({ thread: this.catalogRecord(summary).thread });
+    }
     this.requireIndependentThread(threadId, "unarchive");
     return this.sessions.submit(threadId, {
       type: "threadAdmin",
@@ -1346,14 +1610,19 @@ export class ClaudeService {
   }
 
   public async deleteThread(threadId: string): Promise<Record<string, never>> {
+    const sessionId = this.sessionId(threadId);
     const pending = this.pendingThreadRemoval(threadId);
     if (pending) {
       if (pending.rootThreadId !== threadId || pending.kind !== "delete") this.throwPendingRemoval(threadId, pending);
       await this.resumeThreadRemoval(threadId);
+      if (sessionId) this.store.setSessionFlags(defaultFlags(sessionId));
+      this.stickySessions.delete(threadId);
       return {};
     }
     this.requireIndependentThread(threadId, "delete");
     await this.removeThread(threadId, "delete", "Claude thread deleted during an active turn.");
+    if (sessionId) this.store.setSessionFlags(defaultFlags(sessionId));
+    this.stickySessions.delete(threadId);
     return {};
   }
 
@@ -1420,12 +1689,12 @@ export class ClaudeService {
     return searchTurnOccurrences(params.threadId, this.store.listTurns(params.threadId), params);
   }
 
-  /** `thread/search` over durable Claude threads: one result per thread with the first matching snippet. */
+  /** `thread/search` over native title, preview, and cwd fields. */
   public searchThreads(params: ThreadSearchParams): ThreadSearchResult[] {
-    const searchTerm = params.searchTerm.trim();
+    const searchTerm = params.searchTerm.trim().toLocaleLowerCase();
     return this.listThreads({ archived: params.archived ?? false }).flatMap((thread) => {
-      if (thread.ephemeral) return [];
-      const snippet = threadSearchSnippet(this.store.listTurns(thread.id), searchTerm);
+      const snippet = [thread.name, thread.preview, thread.cwd]
+        .find((value): value is string => typeof value === "string" && value.toLocaleLowerCase().includes(searchTerm));
       return snippet === undefined ? [] : [{ thread: { ...thread, turns: [] }, snippet }];
     });
   }
@@ -1575,6 +1844,14 @@ export class ClaudeService {
       await this.transcripts.delete(branch.sessionId, sourceRecord.thread.cwd).catch(() => undefined);
       throw error;
     }
+    this.store.setSessionFlags({
+      sessionId: branch.sessionId,
+      threadId: thread.id,
+      archived: false,
+      ephemeral: thread.ephemeral,
+      section: null,
+      sectionEnteredAt: null,
+    });
     responseRecord = { ...responseRecord, thread: { ...responseRecord.thread, turns: copiedTurns } };
     if (thread.ephemeral) {
       try {
@@ -1874,7 +2151,9 @@ export class ClaudeService {
     for (const timer of this.ephemeralReleaseTimers.values()) clearTimeout(timer);
     this.ephemeralReleaseTimers.clear();
     const releaseResults = await Promise.allSettled(this.ephemeralReleases.values());
-    await this.restartRecovery;
+    await this.catalogReady;
+    this.stopCatalogWatch?.();
+    this.stopCatalogWatch = undefined;
     clearInterval(this.idleTimer);
     await this.idleSweep;
     await Promise.all(this.sessions.activeOwnerIds().map((threadId) =>
@@ -1921,6 +2200,7 @@ export class ClaudeService {
     reason: string,
   ): Promise<void> {
     const session = this.sessions.resolvedSession(threadId) ?? await this.sessions.getOrCreate(threadId);
+    let removedSessionId: string | undefined;
     await session.withRuntimeAdmin(async () => {
       let prepared: PreparedThreadRemoval | undefined;
       let providerAttempted = false;
@@ -1929,6 +2209,7 @@ export class ClaudeService {
           type: "threadAdmin",
           command: { kind: "beginRemoval", removalKind: kind },
         });
+        removedSessionId = prepared.claudeSessionId;
         await this.failStatusTurnForUnload(threadId, reason);
         await this.sessions.submit(threadId, {
           type: "goal",
@@ -1956,6 +2237,8 @@ export class ClaudeService {
         throw error;
       }
     });
+    if (removedSessionId) this.store.setSessionFlags(defaultFlags(removedSessionId));
+    this.stickySessions.delete(threadId);
     if (await session.mayRelease()) await this.sessions.retire(threadId);
   }
 
@@ -2025,6 +2308,7 @@ export class ClaudeService {
 
   private async resumeThreadRemovalOnce(rootThreadId: string): Promise<void> {
     const session = await this.sessions.getOrCreate(rootThreadId);
+    let removedSessionId: string | undefined;
     await session.withRuntimeAdmin(async () => {
       let prepared: PreparedThreadRemoval | undefined;
       try {
@@ -2032,6 +2316,7 @@ export class ClaudeService {
           type: "threadAdmin",
           command: { kind: "recoverRemoval" },
         });
+        removedSessionId = prepared.claudeSessionId;
         await this.deleteProviderSession(prepared.claudeSessionId, prepared.cwd);
         const committed = await this.sessions.submit<string[] | false>(rootThreadId, {
           type: "threadAdmin",
@@ -2054,6 +2339,8 @@ export class ClaudeService {
         throw error;
       }
     });
+    if (removedSessionId) this.store.setSessionFlags(defaultFlags(removedSessionId));
+    this.stickySessions.delete(rootThreadId);
     await this.sessions.retire(rootThreadId).catch((error) => {
       this.logger.warn("claude.thread-removal.session-retire-failed", {
         threadId: rootThreadId,
@@ -2116,35 +2403,37 @@ export class ClaudeService {
     return record;
   }
 
-  private withNativeMetadata(record: ClaudeThreadRecord): Thread {
+  private effectiveThread(record: ClaudeThreadRecord): Thread {
     if (record.thread.ephemeral && record.thread.threadSource === "user"
       && !record.thread.parentThreadId && record.thread.status.type === "notLoaded") {
       record = { ...record, thread: { ...record.thread, status: { type: "idle" } } };
     }
-    const native = this.nativeMetadata.get(record.claudeSessionId);
-    if (!native) return {
+    const summary = this.catalog.get(record.claudeSessionId);
+    if (!summary) return {
       ...record.thread,
       section: record.thread.section ?? null,
       sectionEnteredAt: record.thread.sectionEnteredAt ?? null,
       projectId: record.thread.projectId ?? null,
       canAcceptDirectInput: record.thread.parentThreadId ? false : true,
     };
-    const createdAt = native.createdAt === undefined
-      ? record.thread.createdAt
-      : Math.floor(native.createdAt / 1_000);
-    const updatedAt = Math.floor(native.lastModified / 1_000);
+    const native = this.catalogRecord(summary).thread;
     return {
       ...record.thread,
-      section: record.thread.section ?? null,
-      sectionEnteredAt: record.thread.sectionEnteredAt ?? null,
+      ephemeral: native.ephemeral,
+      section: native.section,
+      sectionEnteredAt: native.sectionEnteredAt,
       projectId: record.thread.projectId ?? null,
       canAcceptDirectInput: record.thread.parentThreadId ? false : true,
-      name: record.thread.name || native.customTitle || native.summary,
-      preview: native.firstPrompt ?? record.thread.preview,
-      cwd: native.cwd ?? record.thread.cwd,
-      createdAt,
-      updatedAt,
-      recencyAt: updatedAt,
+      name: native.name,
+      preview: native.preview,
+      cwd: native.cwd,
+      model: native.model,
+      reasoningEffort: native.reasoningEffort,
+      cliVersion: native.cliVersion,
+      gitInfo: native.gitInfo,
+      createdAt: native.createdAt,
+      updatedAt: native.updatedAt,
+      recencyAt: native.recencyAt,
     };
   }
 
@@ -2215,11 +2504,12 @@ export class ClaudeService {
     const createdAt = nowSeconds();
     const workspace = workspaceSelection(params);
     const { cwd, runtimeWorkspaceRoots } = workspace;
+    const threadId = uuidv7();
     return {
       thread: {
-        id: uuidv7(),
+        id: threadId,
         extra: null,
-        sessionId: uuidv7(),
+        sessionId: threadId,
         forkedFromId: null,
         parentThreadId: null,
         preview: "",
@@ -2246,7 +2536,7 @@ export class ClaudeService {
         turns: [],
       },
       runtimeWorkspaceRoots,
-      claudeSessionId: uuidv7(),
+      claudeSessionId: threadId,
       modelPickerId,
       claudeModelValue,
       serviceTier,

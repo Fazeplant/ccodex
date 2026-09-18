@@ -10,6 +10,7 @@ import { FakeClaudeQuery } from "../fixtures/fakeClaudeQuery.js";
 const config: HybridConfig = {
   realCodex: "/bin/false",
   claudeBinary: "/bin/false",
+  claudeProjectsDir: "/tmp/ccodex-lifecycle-soak/claude-projects",
   dataDir: "/tmp/ccodex-lifecycle-soak",
   publicSocket: "/tmp/ccodex-lifecycle-soak.sock",
   modelPrefix: "claude:",

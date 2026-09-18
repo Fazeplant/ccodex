@@ -11,6 +11,7 @@ export interface HybridConfig {
   /** Optional external Codex used only for ordinary CLI delegation. */
   readonly delegateCodex?: string;
   readonly claudeBinary: string;
+  readonly claudeProjectsDir: string;
   readonly dataDir: string;
   readonly publicSocket: string;
   readonly modelPrefix: string;
@@ -288,6 +289,7 @@ export function loadConfig(): HybridConfig {
     claudeBinary:
       process.env.CCODEX_CLAUDE_BINARY ?? process.env.CODEX_HYBRID_CLAUDE_BINARY ??
         stringValue(file.claude_binary, bundledClaudeExecutable()),
+    claudeProjectsDir: join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "projects"),
     dataDir,
     publicSocket: expandHome(
       environment("CCODEX_SOCKET", "CODEX_HYBRID_SOCKET") ??

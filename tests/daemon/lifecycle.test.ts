@@ -46,6 +46,7 @@ function harness(): { config: HybridConfig; home: string; record: string } {
     config: {
       realCodex,
       claudeBinary: "/fake/claude",
+      claudeProjectsDir: join(root, "claude-projects"),
       dataDir: join(root, "hybrid"),
       publicSocket: socket,
       modelPrefix: "claude:",

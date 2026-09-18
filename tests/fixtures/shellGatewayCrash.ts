@@ -15,6 +15,7 @@ const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const config: HybridConfig = {
   realCodex: "/bin/false",
   claudeBinary: "/bin/false",
+  claudeProjectsDir: join(dataDir, "claude-projects"),
   dataDir,
   publicSocket: join(dataDir, "gateway.sock"),
   modelPrefix: "claude:",

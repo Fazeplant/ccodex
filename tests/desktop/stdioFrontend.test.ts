@@ -15,6 +15,7 @@ const webSockets: WebSocketServer[] = [];
 const config: HybridConfig = {
   realCodex: "/usr/bin/codex",
   claudeBinary: "/usr/bin/claude",
+  claudeProjectsDir: "/tmp/hybrid-claude/projects",
   dataDir: "/tmp/hybrid",
   publicSocket: "/tmp/hybrid.sock",
   modelPrefix: "claude:",

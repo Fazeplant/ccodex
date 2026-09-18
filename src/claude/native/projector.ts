@@ -4,6 +4,7 @@ import type { Thread } from "../../codex/generated/v2/Thread.js";
 import type { ThreadItem } from "../../codex/generated/v2/ThreadItem.js";
 import type { Turn } from "../../codex/generated/v2/Turn.js";
 import type { UserInput } from "../../codex/generated/v2/UserInput.js";
+import type { TokenUsageBreakdown } from "../../codex/generated/v2/TokenUsageBreakdown.js";
 import { normalizeClaudeModelIdentifier } from "../modelSelection.js";
 import {
   projectToolCompletion,
@@ -46,8 +47,39 @@ export interface ProjectTranscriptInput {
 export interface TranscriptProjection {
   readonly thread: Thread;
   readonly turns: readonly Turn[];
+  readonly lastAssistantUuid: string | null;
+  readonly tokenUsageTotal: TokenUsageBreakdown;
   readonly skippedLines: number;
   readonly compactionBoundaries: ReadonlySet<string>;
+}
+
+function projectedUsage(records: readonly TranscriptChainRecord[]): TokenUsageBreakdown {
+  const total = {
+    totalTokens: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+  };
+  const messageIds = new Set<string>();
+  for (const record of records) {
+    if (record.type !== "assistant" || !record.message.usage) continue;
+    const messageId = record.message.id;
+    if (messageId && messageIds.has(messageId)) continue;
+    if (messageId) messageIds.add(messageId);
+    const usage = record.message.usage;
+    const input = Number(usage.input_tokens ?? 0);
+    const cached = Number(usage.cache_read_input_tokens ?? 0);
+    const cacheWrite = Number(usage.cache_creation_input_tokens ?? 0);
+    const output = Number(usage.output_tokens ?? 0);
+    total.inputTokens += input + cached + cacheWrite;
+    total.cachedInputTokens += cached;
+    total.cacheWriteInputTokens += cacheWrite;
+    total.outputTokens += output;
+    total.totalTokens += input + cached + cacheWrite + output;
+  }
+  return total;
 }
 
 interface ToolCompletion {
@@ -405,5 +437,13 @@ export async function projectTranscript(input: ProjectTranscriptInput): Promise<
     name: nickname ?? header.customTitle ?? header.aiTitle,
     turns,
   };
-  return { thread, turns, skippedLines, compactionBoundaries: history.compactionBoundaries };
+  const lastAssistant = selected.findLast((record): record is AssistantRecord => record.type === "assistant");
+  return {
+    thread,
+    turns,
+    lastAssistantUuid: lastAssistant?.uuid ?? null,
+    tokenUsageTotal: projectedUsage(selected),
+    skippedLines,
+    compactionBoundaries: history.compactionBoundaries,
+  };
 }

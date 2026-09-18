@@ -17,6 +17,7 @@ function config(dataDir: string): HybridConfig {
   return {
     realCodex: "/bin/false",
     claudeBinary: "/bin/claude",
+    claudeProjectsDir: join(dataDir, "claude-projects"),
     dataDir,
     publicSocket: join(dataDir, "gateway.sock"),
     modelPrefix: "claude:",

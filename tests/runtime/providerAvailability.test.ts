@@ -75,6 +75,7 @@ describe("provider availability", () => {
     await expect(probeHostCompatibility({
       realCodex: codex,
       claudeBinary: join(tmpdir(), "ccodex-definitely-missing-claude"),
+      claudeProjectsDir: join(tmpdir(), "ccodex-test-claude-projects"),
       dataDir: tmpdir(),
       publicSocket: join(tmpdir(), "ccodex-test.sock"),
       modelPrefix: "claude:",

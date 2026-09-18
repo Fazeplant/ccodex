@@ -13,7 +13,7 @@ const directories: string[] = [];
 
 function config(dataDir: string): HybridConfig {
   return {
-    realCodex: "/bin/false", claudeBinary: "/missing/claude", dataDir,
+    realCodex: "/bin/false", claudeBinary: "/missing/claude", claudeProjectsDir: join(dataDir, "claude-projects"), dataDir,
     publicSocket: join(dataDir, "gateway.sock"), modelPrefix: "claude:",
     idleTimeoutSeconds: 900, modelCacheSeconds: 300, logLevel: "error",
     logPrompts: false, debugCapture: false, debugLogMaxBytes: 1_048_576,

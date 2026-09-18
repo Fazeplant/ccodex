@@ -15,6 +15,23 @@ function thread(id: string, createdAt: number, parentThreadId: string | null = n
 }
 
 describe("merged thread listing", () => {
+  it("includes catalog-only Claude roots on the first merged list", async () => {
+    const native = { ...thread("native-session", 2), name: "Native title", cwd: "/native/project" };
+    const stock = {
+      request: async () => ({ data: [thread("stock-session", 1)], nextCursor: null, backwardsCursor: null }),
+    };
+    const claude = { listThreads: () => [native] };
+    const result = await mergedThreadList(
+      { sortDirection: "desc" },
+      stock as never,
+      claude as never,
+      new CursorCodec(Buffer.alloc(32, 9)),
+    );
+
+    expect(result.data.map((entry) => entry.id)).toEqual(["native-session", "stock-session"]);
+    expect(result.data[0]).toMatchObject({ name: "Native title", cwd: "/native/project" });
+  });
+
   it("applies source and ancestor filters", () => {
     const threads = [thread("root", 1), thread("child", 2, "root"), thread("grandchild", 3, "child")];
     expect(filterSortThreads(threads, { sourceKinds: ["vscode"], ancestorThreadId: "root", sortDirection: "asc" }).map((item) => item.id))

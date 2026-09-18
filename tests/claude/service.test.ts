@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { HybridConfig } from "../../src/config/config.js";
@@ -34,6 +35,8 @@ import {
 } from "../fixtures/protocolSamples.js";
 
 const directories: string[] = [];
+const fixtureProjects = fileURLToPath(new URL("../fixtures/nativeClaudeHome/projects/", import.meta.url));
+const foreignSessionId = "888c9222-8727-4bad-b970-13fdd721db04";
 const originalCommandParser = process.env.CCODEX_COMMAND_PARSER;
 const immediateCompactionBoundary: TranscriptBrancher = {
   forkWithProvenance: async () => { throw new Error("unused transcript fork"); },
@@ -53,6 +56,7 @@ function config(dataDir: string): HybridConfig {
   return {
     realCodex: "/bin/false",
     claudeBinary: "/bin/false",
+    claudeProjectsDir: join(dataDir, "claude-projects"),
     dataDir,
     publicSocket: join(dataDir, "gateway.sock"),
     modelPrefix: "claude:",
@@ -123,101 +127,107 @@ afterEach(() => {
 });
 
 describe("ClaudeService", () => {
-  it.each([undefined, "🌊 Native title"])("projects native metadata consistently through list, read, and resume (%s)", async (customTitle) => {
-    const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-native-metadata-"));
+  it("adopts, resumes, reads, and starts turns for a foreign native session without durable writes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-native-adoption-"));
     directories.push(directory);
-    const store = new SqliteHybridStore(join(directory, "state.sqlite"));
-    let threadId = "";
-    const service = new ClaudeService(
-      config(directory),
-      new SubscriptionHub(),
-      new Logger("error"),
-      store,
-      new FakeClaudeQuery().factory,
-      undefined,
-      new MetricsRegistry(),
-      undefined,
-      { rename: async () => undefined, delete: async () => undefined },
-      undefined,
-      undefined,
-      undefined,
-      async () => [{
-        sessionId: store.getThreadRecord(threadId, false)!.claudeSessionId,
-        summary: "Native summary",
-        ...(customTitle ? { customTitle } : {}),
-        firstPrompt: "native first prompt",
-        cwd: directory,
-        createdAt: 1_700_000_000_000,
-        lastModified: 1_700_000_123_000,
-      }],
+    const projects = join(directory, "projects");
+    cpSync(fixtureProjects, projects, { recursive: true });
+    const transcript = join(
+      projects,
+      "-home-user-project",
+      `${foreignSessionId}.jsonl`,
     );
-    threadId = (await service.startThread({ model: "claude:haiku", cwd: directory })).thread.id;
+    writeFileSync(
+      transcript,
+      readFileSync(transcript, "utf8").replaceAll("/home/user/project", directory),
+    );
+    const cfg = { ...config(directory), claudeProjectsDir: projects };
+    const path = join(directory, "state.sqlite");
+    const store = new SqliteHybridStore(path);
+    const durableWrites = [
+      vi.spyOn(store, "createThread"),
+      vi.spyOn(store, "updateThread"),
+      vi.spyOn(store, "commitThreadState"),
+      vi.spyOn(store, "appendEvent"),
+      vi.spyOn(store, "appendProviderEvent"),
+      vi.spyOn(store, "createPendingRequest"),
+    ];
+    const rename = vi.fn(async () => undefined);
+    const fake = new FakeClaudeQuery();
+    const service = new ClaudeService(
+      cfg, new SubscriptionHub(), new Logger("error"), store, fake.factory,
+      undefined, undefined, undefined, { rename, delete: async () => undefined },
+    );
+    await service.ready();
+    for (const spy of durableWrites) spy.mockClear();
+    const rowCounts = () => {
+      const database = new DatabaseSync(path, { readOnly: true });
+      const tables = (database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+      `).all() as Array<{ name: string }>).map(({ name }) => [
+        name,
+        (database.prepare(`SELECT COUNT(*) AS count FROM ${name}`).get() as { count: number }).count,
+      ]);
+      database.close();
+      return Object.fromEntries(tables);
+    };
+    const before = rowCounts();
 
-    await service.refreshNativeMetadata();
-
-    expect(service.readThread(threadId, false).thread).toMatchObject({
-      name: customTitle ?? "Native summary",
-      preview: "native first prompt",
-      cwd: directory,
-      createdAt: 1_700_000_000,
-      updatedAt: 1_700_000_123,
-      recencyAt: 1_700_000_123,
+    const listed = service.listThreads({}).find((thread) => thread.id === foreignSessionId)!;
+    expect(listed).toMatchObject({
+      id: foreignSessionId,
+      name: expect.any(String),
+      preview: expect.any(String),
+      cwd: expect.any(String),
     });
-    expect(service.listThreads({})).toEqual([
-      expect.objectContaining({ id: threadId, name: customTitle ?? "Native summary" }),
-    ]);
-    const resumed = await service.resumeThread({ threadId, excludeTurns: true });
-    expect(resumed.thread).toEqual(service.readThread(threadId, false).thread);
+    expect(listed.preview.length).toBeGreaterThan(0);
+    await service.prepareReadThread(foreignSessionId, true);
+    expect(service.readThread(foreignSessionId, true).thread.turns.length).toBeGreaterThan(0);
+    expect((await service.resumeThread({ threadId: foreignSessionId, excludeTurns: false })).thread.id)
+      .toBe(foreignSessionId);
+    const prepared = await service.prepareAppTurn({
+      threadId: foreignSessionId,
+      input: [{ type: "text", text: "fixture-safe turn", text_elements: [] }],
+    });
+    await prepared.announce();
+    await prepared.startAndWait();
+
+    expect(durableWrites.every((spy) => spy.mock.calls.length === 0)).toBe(true);
+    expect(rowCounts()).toEqual(before);
+
+    await service.setThreadName({ threadId: foreignSessionId, name: "Native fixture title" });
+    expect(rename).toHaveBeenCalledWith(foreignSessionId, "Native fixture title", listed.cwd);
+    expect(store.getThreadRecord(foreignSessionId)).toBeUndefined();
+    await service.archiveThread(foreignSessionId);
+    expect(store.sessionFlags().get(foreignSessionId)).toMatchObject({ archived: true });
     await service.close();
   });
 
-  it("does not let a later native Claude ai-title overwrite the persisted thread name", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_700_000_000_000);
-    const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-persisted-name-"));
+  it("lists a legacy native session alias once under its public thread id", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-native-alias-"));
     directories.push(directory);
+    const cfg = { ...config(directory), claudeProjectsDir: fixtureProjects };
     const store = new SqliteHybridStore(join(directory, "state.sqlite"));
-    let threadId = "";
-    let nativeTitle = "Initial native title";
-    const service = new ClaudeService(
-      config(directory),
-      new SubscriptionHub(),
-      new Logger("error"),
-      store,
-      new FakeClaudeQuery().factory,
-      undefined,
-      new MetricsRegistry(),
-      undefined,
-      { rename: async () => undefined, delete: async () => undefined },
-      undefined,
-      undefined,
-      undefined,
-      async () => [{
-        sessionId: store.getThreadRecord(threadId, false)!.claudeSessionId,
-        summary: nativeTitle,
-        customTitle: nativeTitle,
-        firstPrompt: "native first prompt",
-        cwd: directory,
-        createdAt: 1_700_000_000_000,
-        lastModified: Date.now(),
-      }],
-    );
-    threadId = (await service.startThread({ model: "claude:haiku", cwd: directory })).thread.id;
-    await service.refreshNativeMetadata();
-    expect(service.readThread(threadId, false).thread.name).toBe(nativeTitle);
+    const seed = new ClaudeService(cfg, new SubscriptionHub(), new Logger("error"), store, new FakeClaudeQuery().factory);
+    await seed.ready();
+    const started = await seed.startThread({ model: "claude:haiku", cwd: directory });
+    const record = store.getThreadRecord(started.thread.id)!;
+    store.updateThread({ ...record, claudeSessionId: foreignSessionId });
+    store.setSessionFlags({
+      sessionId: foreignSessionId,
+      threadId: started.thread.id,
+      archived: false,
+      ephemeral: false,
+      section: null,
+      sectionEnteredAt: null,
+    });
 
-    await service.setThreadName({ threadId, name: "❤️ XRP MM (Fable v3)" });
-    nativeTitle = "Оптимизировать баланс между хеджированием и маркаутами";
-    vi.advanceTimersByTime(30_001);
-    await service.refreshNativeMetadata();
-
-    expect(service.readThread(threadId, false).thread.name).toBe("❤️ XRP MM (Fable v3)");
-    expect(service.listThreads({})).toContainEqual(
-      expect.objectContaining({ id: threadId, name: "❤️ XRP MM (Fable v3)" }),
-    );
-    expect((await service.resumeThread({ threadId, excludeTurns: true })).thread.name)
-      .toBe("❤️ XRP MM (Fable v3)");
-    await service.close();
+    const ids = seed.listThreads({}).map((thread) => thread.id);
+    expect(ids.filter((id) => id === started.thread.id)).toHaveLength(1);
+    expect(ids).not.toContain(foreignSessionId);
+    await seed.close();
   });
 
   it("creates hidden threads under suppression before they become durable", async () => {

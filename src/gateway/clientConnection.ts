@@ -574,6 +574,9 @@ export function attachClientConnection(
       await sides.run(publicThreadId, async (target) => {
         const params = { ...publicParams, threadId: target.backendThreadId };
         if (request.method === "thread/read") {
+          if (target.provider === "claude") {
+            await claude.prepareReadThread(target.backendThreadId, Boolean(publicParams.includeTurns));
+          }
           const result = target.provider === "claude"
             ? claude.readThread(target.backendThreadId, Boolean(publicParams.includeTurns))
             : await optimisticStockRequest("thread/read", params);
@@ -1360,6 +1363,7 @@ export function attachClientConnection(
           if (message.method === "thread/read") {
             const read = (message.params ?? {}) as ThreadReadParams;
             if (read.includeTurns) fullHistoryDeprecated(params.threadId, "omit `includeTurns` or set it to `false`");
+            await claude.prepareReadThread(read.threadId, read.includeTurns ?? false);
             sendResult(message.id, claude.readThread(read.threadId, read.includeTurns ?? false));
             const failedFork = handoffs.claimFailedFork(params.threadId);
             if (failedFork) emitTransientNotice(
