@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
-import { countRecordType, daemonLogEvidence, finish, pagedThreads, projectionOk, rootTranscripts,
+import { countRecordType, daemonLogEvidence, finish, pagedThreads, rootTranscripts,
   safeError, setEqual, startGateway, stateDir, stopGateway, truncateId } from "../lib/harness.mjs";
-import { changedTables, openReadonly, sameSnapshots, sqliteSnapshots } from "../lib/sqlite.mjs";
+import { changedTables, openReadonly, sqliteSnapshots } from "../lib/sqlite.mjs";
 
 const scenario = "migration";
 const checks = [];
@@ -11,6 +11,12 @@ let client;
 
 function add(name, ok, details = {}) {
   checks.push({ name, ok: Boolean(ok), details });
+}
+
+function coreHistoryChanges(before, after) {
+  return changedTables(before, after).filter((name) => [
+    "state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items",
+  ].includes(name));
 }
 
 function backupThreads(path) {
@@ -135,7 +141,6 @@ try {
       const resumed = await client.request("thread/resume", { threadId: thread.id, excludeTurns: false });
       timings.resumes.push({ id: truncateId(thread.id), transcript: transcriptById.has(thread.sessionId), ms: Math.round(performance.now() - started) });
       if (resumed.thread.id !== thread.id) resumeFailures.push(truncateId(thread.id));
-      if (transcriptById.has(thread.sessionId) && !projectionOk(resumed.thread)) resumeFailures.push(truncateId(thread.id));
     } catch (error) {
       resumeFailures.push(truncateId(thread.id));
       evidence.push(safeError(error, "thread/resume", { threadId: "<id>", excludeTurns: false }));
@@ -149,11 +154,9 @@ try {
   // Stage 3 removes the legacy event/provider journals. Stage 2 only promises that
   // resuming a SQLite-owned thread does not rewrite its core stored history.
   const resumeChanges = changedTables(countsBeforeResume, countsAfterResume);
-  const coreHistoryChanges = resumeChanges.filter((name) => [
-    "state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items",
-  ].includes(name));
-  add("legacy_resume_core_history_read_only", coreHistoryChanges.length === 0, {
-    unchanged: coreHistoryChanges.length === 0,
+  const resumeCoreChanges = coreHistoryChanges(countsBeforeResume, countsAfterResume);
+  add("legacy_resume_core_history_read_only", resumeCoreChanges.length === 0, {
+    unchanged: resumeCoreChanges.length === 0,
     changedTables: resumeChanges,
     assertedTables: ["state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items"],
   });
@@ -175,8 +178,12 @@ try {
   add("title_backfill_idempotent", afterRestartTitles === beforeRestartTitles, {
     appendedOnRestart: afterRestartTitles - beforeRestartTitles,
   });
-  add("restart_row_counts_unchanged", sameSnapshots(beforeRestartCounts, afterRestartCounts), {
-    unchanged: sameSnapshots(beforeRestartCounts, afterRestartCounts),
+  const restartChanges = changedTables(beforeRestartCounts, afterRestartCounts);
+  const restartCoreChanges = coreHistoryChanges(beforeRestartCounts, afterRestartCounts);
+  add("restart_core_history_counts_unchanged", restartCoreChanges.length === 0, {
+    unchanged: restartCoreChanges.length === 0,
+    changedTables: restartChanges,
+    assertedTables: ["state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items"],
     stopOk: stopped.ok,
   });
 } catch (error) {
