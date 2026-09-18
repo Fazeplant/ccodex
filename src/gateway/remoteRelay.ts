@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { RemoteControlStatusChangedNotification } from "../codex/generated/v2/RemoteControlStatusChangedNotification.js";
 import type { Logger } from "../observability/logger.js";
+import { RpcError } from "../protocol/errors.js";
 import type { RemoteControlHub } from "./remoteControlHub.js";
 
 const START_TIMEOUT_MS = 10_000;
@@ -18,8 +19,22 @@ const RELAY_PACKAGES: Readonly<Record<string, string>> = {
 
 export interface RemoteRelay {
   readonly child: ChildProcess;
+  /** Runs a pairing request on the relay-owned transport; rejects with an RpcError carrying stock's code. */
+  request(method: string, params: unknown, clientName?: string): Promise<unknown>;
   stop(): Promise<void>;
 }
+
+interface RelayResponse {
+  readonly type: "response";
+  readonly id: number;
+  readonly result?: unknown;
+  readonly error?: { code: number; message: string };
+}
+
+type RelayEvent =
+  | { readonly type: "status"; readonly params: RemoteControlStatusChangedNotification }
+  | { readonly type: "ready" }
+  | RelayResponse;
 
 function platformKey(): string {
   if (process.platform === "darwin") return `darwin-${process.arch}`;
@@ -58,9 +73,15 @@ export async function startRemoteRelay(
   if (!existsSync(binary)) throw new Error(`CCodex remote-control relay binary was not found: ${binary}`);
   const env: NodeJS.ProcessEnv = { RUST_LOG: "warn", ...process.env };
   delete env.CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED;
-  const child = spawn(binary, ["--socket", socketPath], { env, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(binary, ["--socket", socketPath], { env, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "";
   let stopping = false;
+  let nextRequestId = 0;
+  const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  const failPending = (error: Error) => {
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
+  };
   let readyResolve!: () => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => {
@@ -77,9 +98,15 @@ export async function startRemoteRelay(
       const line = stdout.slice(0, newline);
       stdout = stdout.slice(newline + 1);
       try {
-        const event = JSON.parse(line) as { type?: string; params?: RemoteControlStatusChangedNotification };
-        if (event.type === "status" && event.params) hub.update(event.params);
+        const event = JSON.parse(line) as RelayEvent;
+        if (event.type === "status") hub.update(event.params);
         if (event.type === "ready") readyResolve();
+        if (event.type === "response") {
+          const request = pending.get(event.id);
+          pending.delete(event.id);
+          if (event.error) request?.reject(new RpcError(event.error.code, event.error.message));
+          else request?.resolve(event.result);
+        }
       } catch (error) {
         logger.warn("remote-relay.stdout.invalid", { error: error instanceof Error ? error.message : String(error) });
       }
@@ -88,6 +115,7 @@ export async function startRemoteRelay(
   child.stderr?.on("data", (chunk: Buffer) => logger.warn("remote-relay.stderr", { line: chunk.toString("utf8").trimEnd() }));
   child.once("error", (error) => readyReject(error));
   child.once("exit", (code, signal) => {
+    failPending(new Error("Remote-control relay exited."));
     if (!stopping) {
       const error = new Error(`Remote-control relay exited unexpectedly (${signal ?? code ?? "unknown"}).`);
       readyReject(error);
@@ -109,8 +137,20 @@ export async function startRemoteRelay(
 
   return {
     child,
+    request(method, params, clientName) {
+      const id = ++nextRequestId;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        child.stdin?.write(`${JSON.stringify({ id, method, params, clientName })}\n`, (error) => {
+          if (!error) return;
+          pending.delete(id);
+          reject(error);
+        });
+      });
+    },
     async stop(): Promise<void> {
       stopping = true;
+      failPending(new Error("Remote-control relay stopped."));
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGINT");
         await Promise.race([

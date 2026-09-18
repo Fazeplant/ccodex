@@ -10,9 +10,10 @@ const status = {
 
 function harness(initiallyEnabled = false) {
   const stop = vi.fn(async () => undefined);
+  const request = vi.fn(async (method: string, params: unknown, clientName?: string) => ({ method, params, clientName }));
   const start = vi.fn(async (_socket, hub) => {
     hub.update(status);
-    return { child: {} as never, stop };
+    return { child: {} as never, request, stop };
   });
   const persist = vi.fn();
   const controller = new RemoteControlController(
@@ -22,10 +23,27 @@ function harness(initiallyEnabled = false) {
     start,
     persist,
   );
-  return { controller, start, stop, persist };
+  return { controller, start, stop, request, persist };
 }
 
 describe("RemoteControlController", () => {
+  it("serves pairing through the relay only while remote control is enabled", async () => {
+    const { controller, request } = harness();
+    await expect(controller.pairing("remoteControl/pairing/start", null)).rejects.toMatchObject({
+      code: -32600,
+      message: "remote control pairing requires remote control to be enabled",
+    });
+
+    await controller.enable(false);
+    const params = { pairingCode: "1234-5678" };
+    await expect(controller.pairing("remoteControl/pairing/status", params, "codex_app")).resolves.toEqual({
+      method: "remoteControl/pairing/status",
+      params,
+      clientName: "codex_app",
+    });
+    expect(request).toHaveBeenCalledWith("remoteControl/pairing/status", params, "codex_app");
+  });
+
   it("starts the gateway relay once and persists only durable App changes", async () => {
     const { controller, start, stop, persist } = harness();
 

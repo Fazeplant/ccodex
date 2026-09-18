@@ -365,7 +365,7 @@ describe("remote provider-owned thread catalog", () => {
         installationId: "installation",
         environmentId: "environment",
       });
-      return { child: {} as never, stop: relayStop };
+      return { child: {} as never, request: vi.fn(async () => null), stop: relayStop };
     });
     const remoteControl = new RemoteControlController(
       stock.socket,

@@ -6,12 +6,13 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use clap::Subcommand;
 use codex_app_server_protocol::{
-    JSONRPCMessage, ServerNotification, ServerNotificationEnvelope, ServerRequest,
+    JSONRPCMessage, RemoteControlPairingStartParams, RemoteControlPairingStatusParams,
+    ServerNotification, ServerNotificationEnvelope, ServerRequest,
 };
 use codex_app_server_transport::{
     CHANNEL_CAPACITY, ConnectionId, OutgoingError, OutgoingMessage, OutgoingResponse,
-    QueuedOutgoingMessage, RemoteControlPolicy, RemoteControlStartConfig, RemoteControlStartupMode,
-    TransportEvent, start_remote_control,
+    QueuedOutgoingMessage, RemoteControlHandle, RemoteControlPolicy, RemoteControlStartConfig,
+    RemoteControlStartupMode, TransportEvent, start_remote_control,
 };
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
@@ -36,6 +37,83 @@ struct Args {
 enum Command {
     /// Parse a shell script with the exact Codex command-action parser.
     ParseCommand,
+}
+
+/// A gateway command arriving on stdin: `{"id":1,"method":"remoteControl/pairing/start","params":{},"clientName":"codex-desktop"}`.
+#[derive(serde::Deserialize)]
+struct GatewayCommand {
+    id: serde_json::Value,
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+    #[serde(default, rename = "clientName")]
+    client_name: Option<String>,
+}
+
+fn command_response(id: serde_json::Value, result: Result<serde_json::Value, (i64, String)>) -> String {
+    match result {
+        Ok(result) => serde_json::json!({"type":"response","id":id,"result":result}).to_string(),
+        Err((code, message)) => {
+            serde_json::json!({"type":"response","id":id,"error":{"code":code,"message":message}}).to_string()
+        }
+    }
+}
+
+/// Mirrors stock `map_pairing_start_error`: invalid input is an invalid request, anything else internal.
+fn pairing_error(error: std::io::Error) -> (i64, String) {
+    let code = if error.kind() == std::io::ErrorKind::InvalidInput { -32600 } else { -32603 };
+    (code, error.to_string())
+}
+
+fn validate_pairing_status_params(params: &RemoteControlPairingStatusParams) -> Result<(), (i64, String)> {
+    match (&params.pairing_code, &params.manual_pairing_code) {
+        (Some(_), None) | (None, Some(_)) => Ok(()),
+        (Some(_), Some(_)) => Err((
+            -32600,
+            "remoteControl/pairing/status accepts either pairingCode or manualPairingCode, not both".into(),
+        )),
+        (None, None) => Err((
+            -32600,
+            "remoteControl/pairing/status requires pairingCode or manualPairingCode".into(),
+        )),
+    }
+}
+
+fn parse_params<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> Result<T, (i64, String)> {
+    let params = if params.is_null() { serde_json::json!({}) } else { params };
+    serde_json::from_value(params).map_err(|error| (-32602, error.to_string()))
+}
+
+async fn run_gateway_command(handle: &RemoteControlHandle, line: &str) -> String {
+    let command: GatewayCommand = match serde_json::from_str(line) {
+        Ok(command) => command,
+        Err(error) => {
+            return command_response(serde_json::Value::Null, Err((-32700, error.to_string())));
+        }
+    };
+    let result = match command.method.as_str() {
+        "remoteControl/pairing/start" => match parse_params::<RemoteControlPairingStartParams>(command.params) {
+            Ok(params) => handle
+                .start_pairing(params, command.client_name.as_deref())
+                .await
+                .map_err(pairing_error)
+                .and_then(|response| serde_json::to_value(response).map_err(|error| (-32603, error.to_string()))),
+            Err(error) => Err(error),
+        },
+        "remoteControl/pairing/status" => match parse_params::<RemoteControlPairingStatusParams>(command.params) {
+            Ok(params) => match validate_pairing_status_params(&params) {
+                Ok(()) => handle
+                    .pairing_status(params)
+                    .await
+                    .map_err(pairing_error)
+                    .and_then(|response| serde_json::to_value(response).map_err(|error| (-32603, error.to_string()))),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        other => Err((-32601, format!("unsupported relay command '{other}'"))),
+    };
+    command_response(command.id, result)
 }
 
 struct ClientBridge {
@@ -202,6 +280,19 @@ async fn run(args: Args) -> Result<()> {
         }
     });
 
+    // The gateway drives pairing over stdin; responses share stdout with status lines.
+    let command_handle = remote_handle.clone();
+    let command_task = tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            println!("{}", run_gateway_command(&command_handle, &line).await);
+        }
+    });
+
     let socket = args
         .socket
         .context("--socket is required for remote relay mode")?;
@@ -266,6 +357,7 @@ async fn run(args: Args) -> Result<()> {
     }
     remote_task.await.context("join remote-control transport")?;
     status_task.abort();
+    command_task.abort();
     Ok(())
 }
 
@@ -300,6 +392,33 @@ mod tests {
     };
     use tokio::net::UnixListener;
     use tokio_tungstenite::accept_async;
+
+    #[test]
+    fn maps_pairing_commands_like_stock() {
+        assert_eq!(
+            pairing_error(std::io::Error::new(std::io::ErrorKind::InvalidInput, "disabled")),
+            (-32600, "disabled".to_string())
+        );
+        assert_eq!(
+            pairing_error(std::io::Error::other("network")).0,
+            -32603
+        );
+        let both = RemoteControlPairingStatusParams {
+            pairing_code: Some("a".into()),
+            manual_pairing_code: Some("b".into()),
+        };
+        assert_eq!(validate_pairing_status_params(&both).unwrap_err().0, -32600);
+        let neither: RemoteControlPairingStatusParams = parse_params(serde_json::Value::Null).unwrap();
+        assert_eq!(validate_pairing_status_params(&neither).unwrap_err().0, -32600);
+        assert_eq!(
+            command_response(serde_json::json!(3), Err((-32601, "nope".into()))),
+            serde_json::json!({"type":"response","id":3,"error":{"code":-32601,"message":"nope"}}).to_string()
+        );
+        assert_eq!(
+            command_response(serde_json::json!("x"), Ok(serde_json::json!({"claimed":true}))),
+            serde_json::json!({"type":"response","id":"x","result":{"claimed":true}}).to_string()
+        );
+    }
 
     #[test]
     fn converts_response_and_error_without_typed_method_loss() {

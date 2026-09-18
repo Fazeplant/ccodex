@@ -780,6 +780,10 @@ export function attachClientConnection(
           sendResult(message.id, remoteControl.current());
           return;
         }
+        if ((message.method === "remoteControl/pairing/start" || message.method === "remoteControl/pairing/status") && remoteControl) {
+          sendResult(message.id, await remoteControl.pairing(message.method, message.params ?? null, clientName));
+          return;
+        }
         if (message.method === "model/list") {
           // model/list precedes a new composer or a model change. skills/list
           // carries no thread/model id, so the provider is unknown until the

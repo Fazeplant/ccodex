@@ -2519,6 +2519,7 @@ dependencies = [
  "codex-shell-command",
  "futures",
  "openssl",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

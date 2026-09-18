@@ -1,6 +1,7 @@
 import type { RemoteControlStatusChangedNotification } from "../codex/generated/v2/RemoteControlStatusChangedNotification.js";
 import type { Logger } from "../observability/logger.js";
 import { saveDaemonSettings } from "../daemon/settings.js";
+import { invalidRequest } from "../protocol/errors.js";
 import { RemoteControlHub } from "./remoteControlHub.js";
 import { startRemoteRelay, type RemoteRelay } from "./remoteRelay.js";
 
@@ -45,6 +46,13 @@ export class RemoteControlController {
 
   public current(): RemoteControlStatusChangedNotification | undefined {
     return this.hub.current();
+  }
+
+  /** Pairing lives on the relay-owned transport; stock's own remote control stays disabled. */
+  public pairing(method: string, params: unknown, clientName?: string): Promise<unknown> {
+    const relay = this.relay;
+    if (!relay) return Promise.reject(invalidRequest("remote control pairing requires remote control to be enabled"));
+    return relay.request(method, params, clientName);
   }
 
   public intercept(connectionId: string, sink: Sink, fallback: unknown): void {
