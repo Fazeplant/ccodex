@@ -24,7 +24,6 @@ import { ClaudeSessionRegistry } from "../../../src/claude/sessionRegistry.js";
 import { MetricsRegistry } from "../../../src/observability/metrics.js";
 import type { ClaudeHookRun } from "../../../src/claude/hookMapper.js";
 import type { BackgroundOutputReader } from "../../../src/claude/session/backgroundOutput.js";
-import { normalizedNotificationEvents } from "../../fixtures/liveShadow.js";
 
 function record(threadId: string): ClaudeThreadRecord {
   const thread: Thread = {
@@ -1830,8 +1829,6 @@ describe("ClaudeSession Phase 3 slice", () => {
     const { store, hub, registry } = harness();
     await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
     await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-    const beforeLive = await registry.submit<ClaudeLiveSnapshot>("thread-1", { type: "liveSnapshot" });
-    const beforeStored = store.eventHighWatermark("thread-1");
     const stagedUuid = "staged-user-uuid";
     await registry.submit("thread-1", {
       type: "stageRuntimeTurn",
@@ -1897,15 +1894,6 @@ describe("ClaudeSession Phase 3 slice", () => {
     ]);
     expect(methods.filter((method) => method === "item/reasoning/summaryPartAdded")).toHaveLength(1);
     expect(methods.filter((method) => method === "item/completed")).toHaveLength(2);
-    const live = await registry.submit<ClaudeLiveSnapshot>("thread-1", { type: "liveSnapshot" });
-    expect(live.activeTurn).toEqual(store.getTurn("thread-1", prepared.turn.id));
-    const notifications = await registry.submit<ClaudeLiveNotification[]>("thread-1", {
-      type: "notificationsAfter",
-      seq: beforeLive.seq,
-    });
-    expect(normalizedNotificationEvents(notifications)).toEqual(
-      normalizedNotificationEvents(store.listEventsAfter("thread-1", beforeStored)),
-    );
     await registry.close();
   });
 

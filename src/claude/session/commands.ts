@@ -52,6 +52,7 @@ export interface ClaudeLiveSnapshot {
     readonly providerCostUsdTotal: number;
   };
   readonly status: Thread["status"];
+  readonly lastClaudeMessageUuid: string | null;
   readonly seq: number;
 }
 

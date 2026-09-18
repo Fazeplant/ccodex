@@ -118,7 +118,7 @@ describe("persisted CCodex status turn", () => {
     await service.close();
   });
 
-  it("uses the account control call without a model turn and replays after restart", async () => {
+  it("uses the account control call without a model turn and keeps restart replay process-local", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-status-"));
     directories.push(directory);
     const database = join(directory, "state.sqlite");
@@ -166,10 +166,9 @@ describe("persisted CCodex status turn", () => {
       "turn/completed",
     ]);
     const allEvents = service.eventsAfter(started.thread.id, 0);
-    const firstStatusSequence = allEvents.find((event) => event.turnId === turn.id)!.sequence;
     const statusHighWatermark = service.eventHighWatermark(started.thread.id);
     const originalReplay = allEvents.filter((event) =>
-      event.sequence >= firstStatusSequence && event.sequence <= statusHighWatermark,
+      event.sequence <= statusHighWatermark,
     );
     expect(originalReplay.map((event) => event.method)).toEqual(live.map((event) => event.method));
     await service.close();
@@ -180,9 +179,8 @@ describe("persisted CCodex status turn", () => {
     );
     const snapshot = await resumed.resumeThread({ threadId: started.thread.id, excludeTurns: false });
     expect(snapshot.thread.turns).toEqual([turn]);
-    expect(resumed.eventsAfter(started.thread.id, 0).filter((event) =>
-      event.sequence >= firstStatusSequence && event.sequence <= statusHighWatermark,
-    )).toEqual(originalReplay);
+    expect(resumed.eventsAfter(started.thread.id, 0)
+      .filter((event) => event.method !== "thread/status/changed")).toEqual([]);
     expect(resumedFake.prompts).toHaveLength(0);
     await resumed.close();
   });
@@ -363,9 +361,7 @@ describe("persisted CCodex status turn", () => {
     const lifecycle = recovered.eventsAfter(started.thread.id, 0)
       .filter((event) => event.turnId === turn.id)
       .map((event) => event.method);
-    expect(lifecycle).toEqual([
-      "item/started", "item/agentMessage/delta", "item/completed", "turn/completed",
-    ]);
+    expect(lifecycle).toEqual([]);
     await recovered.close();
     const replayed = new ClaudeService(
       config(directory), new SubscriptionHub(), new Logger("error"),

@@ -617,8 +617,7 @@ describe("Claude autonomous continuation lifecycle", () => {
     ]);
     expect(restarted.status).toEqual({ type: "systemError" });
     const completions = service.eventsAfter(threadId, 0).filter((event) => event.method === "turn/completed");
-    expect(completions).toHaveLength(1);
-    expect((completions[0]?.params as { turn: { id: string; status: string } }).turn).toMatchObject({ id: turnId, status: "failed" });
+    expect(completions).toHaveLength(0);
     expect(service.eventsAfter(threadId, 0).filter((event) => event.method === "turn/started")).toHaveLength(0);
     await service.close();
   });

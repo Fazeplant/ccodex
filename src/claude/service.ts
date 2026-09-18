@@ -470,6 +470,8 @@ export class ClaudeService {
   private readonly stickySessions = new Map<string, string>();
   private readonly flagsBySession: Map<string, ClaudeSessionFlags>;
   private readonly transientThreadIds = new Set<string>();
+  private readonly projectedRecords = new Map<string, ClaudeThreadRecord>();
+  private readonly projectionRefreshes = new Map<string, Promise<void>>();
   private readonly sessionOutput: ClaudeOutputAdapter;
   private readonly sessions: ClaudeSessionRegistry<ClaudeSessionCommand, ClaudeSession>;
   private readonly rateLimits: ClaudeRateLimitCoordinator;
@@ -858,23 +860,83 @@ export class ClaudeService {
     };
   }
 
-  private async adoptCatalogThread(threadId: string): Promise<void> {
-    if (this.store.hasThread(threadId)) return;
-    const summary = this.catalogSession(threadId);
-    if (!summary) throw invalidParams(`Native Claude transcript for thread '${threadId}' is unavailable.`);
-    const projection = await this.catalog.projection(summary.sessionId);
-    const record = this.catalogRecord(summary, projection);
-    this.store.adoptTransient(record, record.thread.turns);
-    this.transientThreadIds.add(threadId);
-    this.claim(summary.sessionId);
+  private refreshProjection(threadId: string): Promise<void> {
+    const existing = this.projectionRefreshes.get(threadId);
+    if (existing) return existing;
+    const sessionId = this.sessionId(threadId) ?? threadId;
+    const refresh = this.catalog.refresh(sessionId).then(async () => {
+      const summary = this.catalogSession(threadId);
+      if (!summary) {
+        this.projectedRecords.delete(threadId);
+        return;
+      }
+      const projection = await this.catalog.projection(summary.sessionId);
+      this.projectedRecords.set(threadId, this.catalogRecord(summary, projection));
+      this.claim(summary.sessionId);
+    }).finally(() => {
+      if (this.projectionRefreshes.get(threadId) === refresh) this.projectionRefreshes.delete(threadId);
+    });
+    this.projectionRefreshes.set(threadId, refresh);
+    return refresh;
   }
 
-  public async prepareReadThread(threadId: string, includeTurns: boolean): Promise<void> {
-    if (includeTurns) await this.adoptCatalogThread(threadId);
-    else {
-      const summary = this.catalogSession(threadId);
-      if (summary) this.claim(summary.sessionId);
+  private async adoptCatalogThread(threadId: string): Promise<void> {
+    const stored = this.store.getThreadRecord(threadId, false);
+    if (stored?.thread.parentThreadId) return;
+    if (stored && !this.catalogSession(threadId) && !existsSync(this.config.claudeProjectsDir)) return;
+    await this.refreshProjection(threadId);
+    if (stored) return;
+    const record = this.projectedRecords.get(threadId);
+    if (!record) throw invalidParams(`Native Claude transcript for thread '${threadId}' is unavailable.`);
+    this.store.adoptTransient({ ...record, thread: { ...record.thread, turns: [] } }, []);
+    this.transientThreadIds.add(threadId);
+  }
+
+  public async prepareReadThread(threadId: string, _includeTurns: boolean): Promise<void> {
+    await this.adoptCatalogThread(threadId);
+  }
+
+  public turnHistory(threadId: string): Turn[] {
+    this.assertThreadAvailable(threadId);
+    const stored = this.store.getThreadRecord(threadId, false);
+    const session = this.sessions.resolvedSession(threadId);
+    if (stored?.thread.parentThreadId) {
+      const live = session?.liveSnapshot().childProjections.get(threadId);
+      return [...(live?.turns ?? this.store.listTurns(threadId))];
     }
+    const projected = this.projectedRecords.get(threadId)?.thread.turns;
+    if (!projected) return this.store.listTurns(threadId);
+    const active = session?.liveSnapshot().activeTurn;
+    return active
+      ? [...projected.filter((turn) => turn.id !== active.id), active]
+      : [...projected];
+  }
+
+  private historyRecord(threadId: string, includeTurns: boolean): ClaudeThreadRecord | undefined {
+    const stored = this.store.getThreadRecord(threadId, false);
+    const projected = this.projectedRecords.get(threadId);
+    const base = stored ?? projected;
+    if (!base) return undefined;
+    if (!projected || base.thread.parentThreadId) {
+      return includeTurns ? { ...base, thread: { ...base.thread, turns: this.turnHistory(threadId) } } : base;
+    }
+    const live = this.sessions.resolvedSession(threadId)?.liveSnapshot();
+    const turns = this.turnHistory(threadId);
+    const useLive = live?.status.type === "active" || live?.activeTurn?.status === "inProgress";
+    return {
+      ...base,
+      thread: {
+        ...base.thread,
+        status: live?.status ?? projected.thread.status,
+        turns: includeTurns ? turns : [],
+      },
+      lastCompletedTurnId: turns.findLast((turn) => turn.status === "completed")?.id ?? null,
+      lastClaudeMessageUuid: useLive ? live.lastClaudeMessageUuid : projected.lastClaudeMessageUuid,
+      tokenUsageTotal: useLive ? live.usage.total : projected.tokenUsageTotal,
+      tokenUsageLast: useLive ? live.usage.last : projected.tokenUsageLast,
+      modelContextWindow: useLive ? live.usage.modelContextWindow : projected.modelContextWindow,
+      providerCostUsdTotal: useLive ? live.usage.providerCostUsdTotal : projected.providerCostUsdTotal ?? 0,
+    };
   }
 
   private withCatalogModel(record: ClaudeThreadRecord): ClaudeThreadRecord {
@@ -1019,14 +1081,14 @@ export class ClaudeService {
     const { threadId } = resume;
     await this.adoptCatalogThread(threadId);
     this.assertThreadAvailable(threadId);
-    let record = this.store.getThreadRecord(threadId, true);
+    let record = this.historyRecord(threadId, true);
     if (!record) throw invalidParams(`Unknown Claude thread '${threadId}'.`);
     if (record.thread.parentThreadId) {
       record = this.withCatalogModel(record);
       record = { ...record, thread: this.effectiveThread(record) };
       return {
         ...threadResponse(record, !resume.excludeTurns),
-        ...historyCursors(record.thread.turns),
+        ...historyCursors(this.turnHistory(threadId)),
         initialTurnsPage: resume.initialTurnsPage
           ? this.turnsPage({
             threadId,
@@ -1042,7 +1104,7 @@ export class ClaudeService {
       record = { ...record, thread: { ...this.effectiveThread(record), status: { type: "idle" } } };
       return {
         ...threadResponse(record, !resume.excludeTurns),
-        ...historyCursors(record.thread.turns),
+        ...historyCursors(this.turnHistory(threadId)),
         initialTurnsPage: resume.initialTurnsPage
           ? this.turnsPage({
             threadId,
@@ -1064,16 +1126,17 @@ export class ClaudeService {
     }
     if (!this.transientThreadIds.has(threadId)) await this.migrateStoredModel(threadId);
     await (await this.sessions.getOrCreate(threadId)).materializeRuntime();
-    record = await this.sessions.submit<ClaudeThreadRecord>(
+    await this.sessions.submit<ClaudeThreadRecord>(
       threadId,
       { type: "readThread", includeTurns: true },
     );
+    record = this.historyRecord(threadId, true)!;
     record = this.withCatalogModel(record);
     record = { ...record, thread: this.effectiveThread(record) };
     if (this.store.listQueuedSubmissions(threadId).length) this.scheduleQueueDrain(threadId);
     return {
       ...threadResponse(record, !resume.excludeTurns),
-      ...historyCursors(record.thread.turns),
+      ...historyCursors(this.turnHistory(threadId)),
       initialTurnsPage: resume.initialTurnsPage
         ? this.turnsPage({
           threadId,
@@ -1120,7 +1183,7 @@ export class ClaudeService {
   public readThread(threadId: string, includeTurns: boolean): ThreadReadResponse {
     this.assertThreadAvailable(threadId);
     const summary = this.catalogSession(threadId);
-    const record = this.store.getThreadRecord(threadId, includeTurns)
+    const record = this.historyRecord(threadId, includeTurns)
       ?? (summary && !includeTurns ? this.catalogRecord(summary) : undefined);
     if (!record) throw invalidParams(`Unknown Claude thread '${threadId}'.`);
     if (summary) this.claim(summary.sessionId);
@@ -1253,7 +1316,7 @@ export class ClaudeService {
 
   public stateSnapshot(threadId: string): ThreadStateSnapshot {
     this.assertThreadAvailable(threadId);
-    const record = this.requireRecord(threadId, true);
+    const record = this.historyRecord(threadId, true) ?? this.requireRecord(threadId, true);
     return {
       provider: "claude",
       model: stateModelName("claude", record.modelPickerId),
@@ -1515,8 +1578,7 @@ export class ClaudeService {
   }
 
   public listTurns(threadId: string) {
-    this.assertThreadAvailable(threadId);
-    return this.store.listTurns(threadId);
+    return this.turnHistory(threadId);
   }
 
   public turnsPage(params: ThreadTurnsListParams): ThreadTurnsListResponse {
@@ -1746,13 +1808,11 @@ export class ClaudeService {
   }
 
   public listItems(params: ThreadItemsListParams): ThreadItemsListResponse {
-    this.assertThreadAvailable(params.threadId);
-    return paginateItems(this.store.listTurns(params.threadId), params, ["hyb-item:"]);
+    return paginateItems(this.turnHistory(params.threadId), params, ["hyb-item:"]);
   }
 
   public searchOccurrences(params: ThreadSearchOccurrencesParams): ThreadSearchOccurrencesResponse {
-    this.assertThreadAvailable(params.threadId);
-    return searchTurnOccurrences(params.threadId, this.store.listTurns(params.threadId), params);
+    return searchTurnOccurrences(params.threadId, this.turnHistory(params.threadId), params);
   }
 
   /** `thread/search` over native title, preview, and cwd fields. */
@@ -2121,7 +2181,12 @@ export class ClaudeService {
   }
 
   private onSessionLifecycle(threadId: string, update: SessionLifecycleUpdate): void {
-    if (update.completed && update.completed.turn.status !== "interrupted") this.queueDrainPending.add(threadId);
+    if (update.completed) {
+      if (update.completed.turn.status !== "interrupted") this.queueDrainPending.add(threadId);
+      if (this.projectedRecords.has(threadId)) void this.refreshProjection(threadId).catch((error: unknown) => {
+        this.logger.warn("claude.catalog.turn-refresh-failed", { threadId, error: String(error) });
+      });
+    }
     if (update.quiescent && this.queueDrainPending.delete(threadId)) this.scheduleQueueDrain(threadId);
   }
 
@@ -2175,12 +2240,24 @@ export class ClaudeService {
 
   public eventHighWatermark(threadId: string): number {
     this.assertThreadAvailable(threadId);
-    return this.store.eventHighWatermark(threadId);
+    return this.sessions.resolvedSession(threadId)?.notificationHighWatermark ?? 0;
   }
 
   public eventsAfter(threadId: string, sequence: number) {
     this.assertThreadAvailable(threadId);
-    return this.store.listEventsAfter(threadId, sequence);
+    return this.sessions.resolvedSession(threadId)?.notificationsAfter(sequence)
+      .filter((notification) => notification.threadId === threadId)
+      .map((notification) => {
+        const params = recordValue(notification.params);
+        return {
+          sequence: notification.seq,
+          threadId,
+          turnId: typeof params?.turnId === "string" ? params.turnId : null,
+          method: notification.method,
+          params: notification.params,
+          createdAt: 0,
+        };
+      }) ?? [];
   }
 
   public liveSnapshot(threadId: string): Promise<ClaudeLiveSnapshot> {
@@ -2195,27 +2272,9 @@ export class ClaudeService {
 
   public latestTokenUsage(threadId: string) {
     this.assertThreadAvailable(threadId);
-    const record = this.requireRecord(threadId, false);
-    if (!record.tokenUsageLast) return undefined;
-    const current = {
-      threadId,
-      turnId: record.lastCompletedTurnId,
-      tokenUsage: {
-        total: record.tokenUsageTotal,
-        last: record.tokenUsageLast,
-        modelContextWindow: record.modelContextWindow,
-      },
-    };
-    const latest = this.store.listEventsAfter(threadId, 0)
-      .filter((event) => event.method === "thread/tokenUsage/updated")
-      .at(-1);
-    const latestTurnId = latest?.params && typeof latest.params === "object" && "turnId" in latest.params
-      ? (latest.params as { turnId: unknown }).turnId
-      : undefined;
-    const replay = { ...current, turnId: typeof latestTurnId === "string" ? latestTurnId : current.turnId };
-    return latest && JSON.stringify(latest.params) === JSON.stringify(replay)
-      ? latest
-      : { sequence: 0, threadId, turnId: replay.turnId, method: "thread/tokenUsage/updated", params: replay, createdAt: Date.now() };
+    const latest = this.eventsAfter(threadId, 0)
+      .findLast((notification) => notification.method === "thread/tokenUsage/updated");
+    return latest;
   }
 
   public close(): Promise<void> {

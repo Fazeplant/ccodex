@@ -166,6 +166,7 @@ function fakeClaude() {
     unsubscribeRateLimits: vi.fn((id: string) => listeners.delete(id)),
     ownsModel: (model: string) => model.startsWith("claude:"),
     ownsThread: (threadId: string) => threads.has(threadId),
+    prepareReadThread: vi.fn(async () => undefined),
     readThread: vi.fn((threadId: string) => ({ thread: stockThread(threadId) })),
     listThreads: vi.fn(() => []),
     sectionOrders: () => new Map<string, string[]>(),

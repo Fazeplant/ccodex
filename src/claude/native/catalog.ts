@@ -85,7 +85,7 @@ export class NativeSessionCatalog {
     this.projectsDir = resolve(projectsDir);
   }
 
-  public refresh(): Promise<void> {
+  public refresh(_sessionId?: string): Promise<void> {
     if (this.refreshInFlight) return this.refreshInFlight;
     const refresh = this.scan().finally(() => {
       if (this.refreshInFlight === refresh) this.refreshInFlight = undefined;

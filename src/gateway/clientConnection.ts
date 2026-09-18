@@ -616,6 +616,7 @@ export function attachClientConnection(
           return;
         }
         if (request.method === "thread/turns/list") {
+          if (target.provider === "claude") await claude.prepareReadThread(target.backendThreadId, true);
           const result = target.provider === "claude"
             ? claude.turnsPage(params as unknown as ThreadTurnsListParams)
             : await optimisticStockRequest(request.method, params);
@@ -623,6 +624,7 @@ export function attachClientConnection(
           return;
         }
         if (request.method === "thread/items/list") {
+          if (target.provider === "claude") await claude.prepareReadThread(target.backendThreadId, true);
           const result = target.provider === "claude"
             ? claude.listItems(params as unknown as ThreadItemsListParams)
             : await optimisticStockRequest(request.method, params);
@@ -630,6 +632,7 @@ export function attachClientConnection(
           return;
         }
         if (request.method === "thread/searchOccurrences") {
+          if (target.provider === "claude") await claude.prepareReadThread(target.backendThreadId, true);
           const result = target.provider === "claude"
             ? claude.searchOccurrences(params as unknown as ThreadSearchOccurrencesParams)
             : await optimisticStockRequest(request.method, params);
@@ -1375,17 +1378,20 @@ export function attachClientConnection(
           }
           if (message.method === "thread/turns/list") {
             const list = (message.params ?? {}) as ThreadTurnsListParams;
+            await claude.prepareReadThread(list.threadId, true);
             sendResult(message.id, claude.turnsPage(list));
             return;
           }
           if (message.method === "thread/items/list") {
-            sendResult(message.id, claude.listItems((message.params ?? {}) as ThreadItemsListParams));
+            const list = (message.params ?? {}) as ThreadItemsListParams;
+            await claude.prepareReadThread(list.threadId, true);
+            sendResult(message.id, claude.listItems(list));
             return;
           }
           if (message.method === "thread/searchOccurrences") {
-            sendResult(message.id, claude.searchOccurrences(
-              (message.params ?? {}) as ThreadSearchOccurrencesParams,
-            ));
+            const search = (message.params ?? {}) as ThreadSearchOccurrencesParams;
+            await claude.prepareReadThread(search.threadId, true);
+            sendResult(message.id, claude.searchOccurrences(search));
             return;
           }
           if (message.method === "thread/unsubscribe") {

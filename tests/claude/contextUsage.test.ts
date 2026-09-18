@@ -522,9 +522,7 @@ describe("Claude context usage", () => {
       config(directory), new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(database), secondFake.factory,
     );
     await second.resumeThread(started.thread.id);
-    expect(second.latestTokenUsage(started.thread.id)?.params).toMatchObject({
-      tokenUsage: { total: { totalTokens: 1_467_551 }, last: { totalTokens: 298_078 }, modelContextWindow: 1_000_000 },
-    });
+    expect(second.latestTokenUsage(started.thread.id)).toBeUndefined();
     expect(secondFake.contextUsageCalls).toBe(1);
     await second.close();
   });

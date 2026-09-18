@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import type {
   CanUseTool,
   ElicitationRequest,
@@ -66,9 +68,13 @@ export class FakeClaudeQuery {
   public noQueryAcknowledgementBatchSize = 1;
   public emitDefaultMessageStart = true;
   public scriptedTurnMessages: readonly SDKMessage[] | undefined;
+  public transcriptProjectsDir: string | undefined;
+  public beforeDefaultResponseWait: Promise<void> | undefined;
   private permissionToolSequence = 0;
   private readonly outputs: AsyncQueue<SDKMessage>[] = [];
   private readonly responseIds: Array<string | undefined> = [];
+  private readonly transcriptTails = new Map<string, string>();
+  private readonly transcriptBlockIndices = new Map<string, number>();
 
   public constructor(
     public toolRequest?: { name: string; input: Record<string, unknown> },
@@ -158,10 +164,62 @@ export class FakeClaudeQuery {
           session_id: message.session_id,
         } as unknown as SDKMessage);
       }
-      output.push({ ...message, message: { ...message.message, id: messageId } });
+      const completed = { ...message, message: { ...message.message, id: messageId } };
+      this.appendAssistantRecords(queryIndex, completed);
+      output.push(completed);
       return;
     }
+    if (message.type === "user") this.appendTranscriptRecord(queryIndex, message.uuid!, {
+      type: "user",
+      message: message.message,
+    });
+    if (message.type === "system" && message.subtype === "compact_boundary") {
+      this.appendTranscriptRecord(queryIndex, message.uuid!, {
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: message.compact_metadata,
+      });
+    }
     output.push(message);
+  }
+
+  private appendAssistantRecords(queryIndex: number, message: Extract<SDKMessage, { type: "assistant" }>): void {
+    if (!this.transcriptProjectsDir) return;
+    const messageId = message.message.id!;
+    const key = `${queryIndex}:${messageId}`;
+    let apiBlockIndex = this.transcriptBlockIndices.get(key) ?? 0;
+    const content = Array.isArray(message.message.content) ? message.message.content : [];
+    for (const [offset, block] of content.entries()) {
+      this.appendTranscriptRecord(queryIndex, offset === 0 ? message.uuid! : `${message.uuid}:${offset}`, {
+        type: "assistant",
+        apiBlockIndex,
+        message: {
+          ...message.message,
+          content: [block],
+          stop_reason: message.message.stop_reason ?? "end_turn",
+        },
+      });
+      apiBlockIndex += 1;
+    }
+    this.transcriptBlockIndices.set(key, apiBlockIndex);
+  }
+
+  private appendTranscriptRecord(queryIndex: number, uuid: string, fields: Record<string, unknown>): void {
+    if (!this.transcriptProjectsDir) return;
+    const input = this.inputs[queryIndex]!;
+    const sessionId = input.options.resume ?? input.options.sessionId ?? "session";
+    const project = join(this.transcriptProjectsDir, "-fake-project");
+    mkdirSync(project, { recursive: true });
+    appendFileSync(join(project, `${sessionId}.jsonl`), `${JSON.stringify({
+      ...fields,
+      uuid,
+      parentUuid: this.transcriptTails.get(sessionId) ?? null,
+      timestamp: new Date().toISOString(),
+      sessionId,
+      cwd: input.options.cwd ?? process.cwd(),
+      version: "test",
+    })}\n`);
+    this.transcriptTails.set(sessionId, uuid);
   }
 
   private async consumePrompts(
@@ -173,6 +231,11 @@ export class FakeClaudeQuery {
     for await (const _message of input.prompt) {
       this.prompts.push(_message);
       const sessionId = input.options.resume ?? input.options.sessionId ?? "session";
+      this.appendTranscriptRecord(queryIndex, _message.uuid!, {
+        type: "user",
+        origin: { kind: "human" },
+        message: _message.message,
+      });
       if (_message.shouldQuery === false) {
         pendingNoQueryAcknowledgements += 1;
         if (pendingNoQueryAcknowledgements < this.noQueryAcknowledgementBatchSize) continue;
@@ -354,7 +417,7 @@ export class FakeClaudeQuery {
           this.permissionResults.push(await permission);
         }
         if (this.streamPermissionTool && !deferredPermission) {
-          output.push({
+          this.pushProviderMessage(output, queryIndex, {
             type: "user", message: {
               role: "user", content: [{ type: "tool_result", tool_use_id: permissionToolId, content: "ok" }],
             },
@@ -398,7 +461,7 @@ export class FakeClaudeQuery {
           this.toolExecutionErrors.push(executionError);
         }
         await postHook?.({ ...hookBase, hook_event_name: "PostToolUse", tool_response: "ok" }, toolUseId, { signal: new AbortController().signal });
-        output.push({
+        this.pushProviderMessage(output, queryIndex, {
           type: "user", message: {
             role: "user", content: [{
               type: "tool_result", tool_use_id: toolUseId,
@@ -412,6 +475,7 @@ export class FakeClaudeQuery {
         this.pushProviderMessage(output, queryIndex, message);
         if (this.beforeResultPause?.afterIndex === index) await this.beforeResultPause.wait;
       }
+      if (this.beforeDefaultResponseWait) await this.beforeDefaultResponseWait;
       const existingResponseId = this.responseIds[queryIndex];
       const responseId = existingResponseId ?? `msg_${randomUUID()}`;
       if (!existingResponseId && this.emitDefaultMessageStart) {
@@ -443,13 +507,15 @@ export class FakeClaudeQuery {
         uuid: randomUUID(),
         session_id: sessionId,
       } as unknown as SDKMessage);
-      output.push({
+      const completedAssistant = {
         type: "assistant",
         message: { id: responseId, role: "assistant", content: [{ type: "text", text: "OK" }] },
         parent_tool_use_id: null,
         uuid: randomUUID(),
         session_id: sessionId,
-      } as unknown as SDKMessage);
+      } as unknown as Extract<SDKMessage, { type: "assistant" }>;
+      this.appendAssistantRecords(queryIndex, completedAssistant);
+      output.push(completedAssistant);
       output.push(this.resultMessage ?? {
         type: "result",
         subtype: "success",
@@ -470,7 +536,7 @@ export class FakeClaudeQuery {
       if (deferredPermission) {
         this.permissionResults.push(await deferredPermission);
         if (this.streamPermissionTool) {
-          output.push({
+          this.pushProviderMessage(output, queryIndex, {
             type: "user", message: {
               role: "user", content: [{ type: "tool_result", tool_use_id: deferredPermissionToolId!, content: "ok" }],
             },

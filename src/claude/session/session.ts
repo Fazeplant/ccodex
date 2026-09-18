@@ -8615,7 +8615,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     return record;
   }
 
-  private liveSnapshot(): ClaudeLiveSnapshot {
+  public liveSnapshot(): ClaudeLiveSnapshot {
     const record = this.requireRecord(false);
     return {
       activeTurn: structuredClone(this.activeTurn ?? this.lastCompletedTurn),
@@ -8632,12 +8632,17 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         providerCostUsdTotal: record.providerCostUsdTotal ?? 0,
       }),
       status: structuredClone(record.thread.status),
+      lastClaudeMessageUuid: record.lastClaudeMessageUuid,
       seq: this.notificationSequence,
     };
   }
 
-  private notificationsAfter(sequence: number): ClaudeLiveNotification[] {
+  public notificationsAfter(sequence: number): ClaudeLiveNotification[] {
     return structuredClone(this.notificationRing.filter((notification) => notification.seq > sequence));
+  }
+
+  public get notificationHighWatermark(): number {
+    return this.notificationSequence;
   }
 
   private liveQueue(): QueuedSubmission[] {

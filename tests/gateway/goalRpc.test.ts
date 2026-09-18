@@ -753,7 +753,7 @@ describe("Claude goal gateway RPC", () => {
       await closeServer(gateway.server);
       gateway.handoffs.close();
     };
-    const resumeSnapshot = async (client: RpcClient, threadId: string, postWatermarkMessage: string) => {
+    const resumeSnapshot = async (client: RpcClient, threadId: string, expectedUsageEvents: number) => {
       const offset = client.messages.length;
       const response = await client.request("thread/resume", { threadId, excludeTurns: false });
       await client.waitFor(
@@ -764,34 +764,13 @@ describe("Claude goal gateway RPC", () => {
       const responseIndex = frames.indexOf(response);
       const usageIndexes = frames.flatMap((message, index) =>
         message.method === "thread/tokenUsage/updated" ? [index] : []);
-      const postWatermarkIndex = frames.findIndex((message) =>
-        message.method === "warning"
-        && (message.params as { message?: string } | undefined)?.message === postWatermarkMessage);
       const goalIndex = frames.findIndex((message) => message.method === "thread/goal/updated");
       // Full-history resume of a paginated thread is preceded only by the stock deprecation notice.
       expect(frames.slice(0, responseIndex).map((message) => message.method)).toEqual(["deprecationNotice"]);
-      expect(usageIndexes).toHaveLength(1);
-      expect(usageIndexes[0]).toBeGreaterThan(responseIndex);
-      expect(postWatermarkIndex).toBeGreaterThan(usageIndexes[0]!);
-      expect(goalIndex).toBeGreaterThan(postWatermarkIndex);
-      return frames[usageIndexes[0]!]!.params;
-    };
-    const appendDuringSnapshot = (
-      service: ClaudeService,
-      store: SqliteHybridStore,
-      turnId: string,
-      message: string,
-    ) => {
-      const latest = service.latestTokenUsage.bind(service);
-      let appended = false;
-      vi.spyOn(service, "latestTokenUsage").mockImplementation((threadId) => {
-        const snapshot = latest(threadId);
-        if (!appended) {
-          appended = true;
-          store.appendEvent(threadId, turnId, "warning", { threadId, message });
-        }
-        return snapshot;
-      });
+      expect(usageIndexes).toHaveLength(expectedUsageEvents);
+      if (usageIndexes[0] !== undefined) expect(usageIndexes[0]).toBeGreaterThan(responseIndex);
+      expect(goalIndex).toBeGreaterThan(usageIndexes.at(-1) ?? responseIndex);
+      return usageIndexes[0] === undefined ? undefined : frames[usageIndexes[0]]!.params;
     };
 
     const firstFake = new FakeClaudeQuery();
@@ -815,10 +794,8 @@ describe("Claude goal gateway RPC", () => {
     await (await first.prepareGoalSet({
       threadId: started.thread.id, objective: "hold snapshot ordering", status: "paused",
     })).notify();
-    appendDuringSnapshot(first, firstHarness.store, turn.response.turn.id, "first post-watermark");
-
     const firstClient = await connect(first, firstHarness.subscriptions, "first");
-    const firstSnapshot = await resumeSnapshot(firstClient, started.thread.id, "first post-watermark");
+    const firstSnapshot = await resumeSnapshot(firstClient, started.thread.id, 1);
     await closeGateway(gateways.shift()!);
     await first.close();
 
@@ -827,12 +804,10 @@ describe("Claude goal gateway RPC", () => {
     const secondHarness = makeService(secondFake);
     const second = secondHarness.service;
     await second.ready();
-    appendDuringSnapshot(second, secondHarness.store, turn.response.turn.id, "second post-watermark");
     const secondClient = await connect(second, secondHarness.subscriptions, "second");
-    const secondSnapshot = await resumeSnapshot(secondClient, started.thread.id, "second post-watermark");
+    const secondSnapshot = await resumeSnapshot(secondClient, started.thread.id, 0);
 
-    expect(JSON.stringify(secondSnapshot)).toBe(JSON.stringify(firstSnapshot));
-    expect(secondSnapshot).toMatchObject({
+    expect(firstSnapshot).toMatchObject({
       threadId: started.thread.id,
       turnId: turn.response.turn.id,
       tokenUsage: {
@@ -840,6 +815,7 @@ describe("Claude goal gateway RPC", () => {
         modelContextWindow: 1_000_000,
       },
     });
+    expect(secondSnapshot).toBeUndefined();
 
     await closeGateway(gateways.shift()!);
     await second.close();
