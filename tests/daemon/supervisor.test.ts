@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,12 +9,14 @@ import {
   processStartTime,
   publishDaemonChildRecord,
   reconcileManagedProcess,
+  stopManagedProcess,
   withDaemonLock,
   withGatewayStartupFence,
 } from "../../src/daemon/supervisor.js";
 
 const temporary: string[] = [];
 const originalEnv = { ...process.env };
+const spawned: ChildProcess[] = [];
 const temp = () => {
   const path = mkdtempSync(join(tmpdir(), "hybrid-supervisor-test-"));
   temporary.push(path);
@@ -21,6 +24,9 @@ const temp = () => {
 };
 
 afterEach(() => {
+  for (const child of spawned.splice(0)) {
+    try { child.kill("SIGKILL"); } catch { /* already stopped */ }
+  }
   process.env = { ...originalEnv };
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
 });
@@ -54,6 +60,47 @@ describe("daemon supervisor", () => {
     expect(reconcileManagedProcess(pidFile)).toBeUndefined();
     expect(processMatches({ pid: process.pid, processStartTime: processStartTime(process.pid)! })).toBe(true);
     expect(() => process.kill(process.pid, 0)).not.toThrow();
+  });
+
+  it.runIf(process.platform === "linux")("treats an unreaped zombie-only process group as stopped", async () => {
+    const directory = temp();
+    const pidFile = join(directory, "app-server.pid");
+    const parent = spawn(process.execPath, ["-e", `
+      const { spawn } = require("node:child_process");
+      const child = spawn("/bin/true", [], { detached: true, stdio: "ignore" });
+      process.stdout.write(String(child.pid) + "\\n");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+    `], { stdio: ["ignore", "pipe", "ignore"] });
+    spawned.push(parent);
+    const zombiePid = await new Promise<number>((resolve, reject) => {
+      let output = "";
+      parent.stdout!.setEncoding("utf8");
+      parent.stdout!.on("data", (chunk: string) => {
+        output += chunk;
+        if (output.includes("\n")) resolve(Number(output.trim()));
+      });
+      parent.once("error", reject);
+    });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const stat = readFileSync(`/proc/${zombiePid}/stat`, "utf8");
+      if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const zombieStat = readFileSync(`/proc/${zombiePid}/stat`, "utf8");
+    expect(zombieStat.slice(zombieStat.lastIndexOf(")") + 2)).toMatch(/^Z /u);
+    expect(() => process.kill(-zombiePid, 0)).not.toThrow();
+    const startTime = processStartTime(zombiePid);
+    expect(startTime).toBeDefined();
+    writeFileSync(pidFile, JSON.stringify({
+      pid: zombiePid,
+      processStartTime: startTime,
+    }));
+
+    const startedAt = Date.now();
+    await stopManagedProcess(pidFile);
+
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(existsSync(pidFile)).toBe(false);
   });
 
   it("preserves a corrupt PID artifact and recovers the active path", () => {

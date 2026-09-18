@@ -7,6 +7,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
@@ -113,7 +114,38 @@ function removeRecord(path: string, expected?: PidRecord): void {
   if (!expected || sameRecord(path, expected)) rmSync(path, { force: true });
 }
 
+function linuxGroupHasLiveMember(processGroup: number): boolean | undefined {
+  if (process.platform !== "linux") return undefined;
+  // kill(-pgid, 0) succeeds for zombie-only groups. Minimal container PID 1
+  // processes may never reap detached orphans, so inspect member states.
+  const identity = (pid: string): { readonly state: string; readonly group: number } | undefined => {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+      return { state: fields[0]!, group: Number(fields[2]) };
+    } catch {
+      return undefined;
+    }
+  };
+  try {
+    const leader = identity(String(processGroup));
+    if (leader?.group === processGroup
+      && leader.state !== "Z" && leader.state !== "X" && leader.state !== "x") return true;
+    for (const entry of readdirSync("/proc", { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === String(processGroup) || !/^\d+$/u.test(entry.name)) continue;
+      const member = identity(entry.name);
+      if (member?.group === processGroup
+        && member.state !== "Z" && member.state !== "X" && member.state !== "x") return true;
+    }
+    return false;
+  } catch {
+    return undefined;
+  }
+}
+
 function groupExists(processGroup: number): boolean {
+  const liveLinuxMember = linuxGroupHasLiveMember(processGroup);
+  if (liveLinuxMember !== undefined) return liveLinuxMember;
   try {
     process.kill(-processGroup, 0);
     return true;
