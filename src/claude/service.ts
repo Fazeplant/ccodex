@@ -466,6 +466,7 @@ export class ClaudeService {
   private stopCatalogWatch: (() => void) | undefined;
   private catalogTitles = new Map<string, string | null>();
   private readonly stickySessions = new Map<string, string>();
+  private readonly flagsBySession: Map<string, ClaudeSessionFlags>;
   private readonly transientThreadIds = new Set<string>();
   private readonly sessionOutput: ClaudeOutputAdapter;
   private readonly sessions: ClaudeSessionRegistry<ClaudeSessionCommand, ClaudeSession>;
@@ -494,6 +495,7 @@ export class ClaudeService {
   ) {
     this.store = new LayeredHybridStore(durableStore);
     this.catalog = new NativeSessionCatalog(config.claudeProjectsDir);
+    this.flagsBySession = new Map(durableStore.sessionFlags());
     const sessionRepository = new ClaudeSessionRepository(this.store);
     this.sessionOutput = new ClaudeOutputAdapter(hub);
     this.rateLimits = new ClaudeRateLimitCoordinator(logger);
@@ -580,10 +582,12 @@ export class ClaudeService {
       this.idleSweep = this.idleSweep.then(() => this.unloadIdleRuntimes());
     }, intervalMs);
     this.idleTimer.unref();
-    this.catalogReady = Promise.all([this.restartRecovery, this.catalog.refresh()]).then(() => {
-      this.catalogTitles = this.nativeTitles();
-      this.stopCatalogWatch = this.catalog.watch(() => this.onCatalogChanged());
-    });
+    this.catalogReady = Promise.all([this.restartRecovery, this.catalog.refresh()])
+      .then(() => this.backfillNativeTitles())
+      .then(() => {
+        this.catalogTitles = this.nativeTitles();
+        this.stopCatalogWatch = this.catalog.watch(() => this.onCatalogChanged());
+      });
   }
 
   public ownsThread(threadId: string): boolean {
@@ -597,13 +601,33 @@ export class ClaudeService {
   }
 
   private flags(sessionId: string): ClaudeSessionFlags {
-    return this.store.sessionFlags().get(sessionId) ?? defaultFlags(sessionId);
+    return this.flagsBySession.get(sessionId) ?? defaultFlags(sessionId);
+  }
+
+  private writeFlags(flags: ClaudeSessionFlags): void {
+    this.store.setSessionFlags(flags);
+    if (flags.threadId === flags.sessionId && !flags.archived && !flags.ephemeral && flags.section === null) {
+      this.flagsBySession.delete(flags.sessionId);
+    } else this.flagsBySession.set(flags.sessionId, flags);
   }
 
   private setFlags(sessionId: string, patch: Partial<Omit<ClaudeSessionFlags, "sessionId" | "threadId">>): ClaudeSessionFlags {
     const flags = { ...this.flags(sessionId), ...patch };
-    this.store.setSessionFlags(flags);
+    this.writeFlags(flags);
     return flags;
+  }
+
+  /** Titles that only ccodex stored (generated names were never written natively) become native custom titles once. */
+  private async backfillNativeTitles(): Promise<void> {
+    for (const record of this.store.allThreadRecords()) {
+      const summary = this.catalog.get(record.claudeSessionId);
+      const name = record.thread.name;
+      if (!summary || summary.customTitle || !name || record.thread.parentThreadId || record.thread.ephemeral) continue;
+      await this.threadAdminEffects.rename(summary.sessionId, name, summary.cwd).catch((error: unknown) => {
+        this.logger.warn("claude.catalog.title-backfill-failed", { threadId: record.thread.id, error: String(error) });
+      });
+    }
+    await this.catalog.refresh();
   }
 
   private publicId(sessionId: string): string {
@@ -613,7 +637,7 @@ export class ClaudeService {
   private sessionId(threadId: string): string | undefined {
     const stored = this.store.getThreadRecord(threadId, false)?.claudeSessionId;
     if (stored) return stored;
-    for (const flags of this.store.sessionFlags().values()) {
+    for (const flags of this.flagsBySession.values()) {
       if (flags.threadId === threadId) return flags.sessionId;
     }
     if (this.catalog.get(threadId) && this.publicId(threadId) === threadId) return threadId;
@@ -1615,13 +1639,13 @@ export class ClaudeService {
     if (pending) {
       if (pending.rootThreadId !== threadId || pending.kind !== "delete") this.throwPendingRemoval(threadId, pending);
       await this.resumeThreadRemoval(threadId);
-      if (sessionId) this.store.setSessionFlags(defaultFlags(sessionId));
+      if (sessionId) this.writeFlags(defaultFlags(sessionId));
       this.stickySessions.delete(threadId);
       return {};
     }
     this.requireIndependentThread(threadId, "delete");
     await this.removeThread(threadId, "delete", "Claude thread deleted during an active turn.");
-    if (sessionId) this.store.setSessionFlags(defaultFlags(sessionId));
+    if (sessionId) this.writeFlags(defaultFlags(sessionId));
     this.stickySessions.delete(threadId);
     return {};
   }
@@ -1844,7 +1868,7 @@ export class ClaudeService {
       await this.transcripts.delete(branch.sessionId, sourceRecord.thread.cwd).catch(() => undefined);
       throw error;
     }
-    this.store.setSessionFlags({
+    this.writeFlags({
       sessionId: branch.sessionId,
       threadId: thread.id,
       archived: false,
@@ -2237,7 +2261,7 @@ export class ClaudeService {
         throw error;
       }
     });
-    if (removedSessionId) this.store.setSessionFlags(defaultFlags(removedSessionId));
+    if (removedSessionId) this.writeFlags(defaultFlags(removedSessionId));
     this.stickySessions.delete(threadId);
     if (await session.mayRelease()) await this.sessions.retire(threadId);
   }
@@ -2339,7 +2363,7 @@ export class ClaudeService {
         throw error;
       }
     });
-    if (removedSessionId) this.store.setSessionFlags(defaultFlags(removedSessionId));
+    if (removedSessionId) this.writeFlags(defaultFlags(removedSessionId));
     this.stickySessions.delete(rootThreadId);
     await this.sessions.retire(rootThreadId).catch((error) => {
       this.logger.warn("claude.thread-removal.session-retire-failed", {

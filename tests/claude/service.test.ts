@@ -209,7 +209,8 @@ describe("ClaudeService", () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-native-alias-"));
     directories.push(directory);
     const cfg = { ...config(directory), claudeProjectsDir: fixtureProjects };
-    const store = new SqliteHybridStore(join(directory, "state.sqlite"));
+    const path = join(directory, "state.sqlite");
+    const store = new SqliteHybridStore(path);
     const seed = new ClaudeService(cfg, new SubscriptionHub(), new Logger("error"), store, new FakeClaudeQuery().factory);
     await seed.ready();
     const started = await seed.startThread({ model: "claude:haiku", cwd: directory });
@@ -223,11 +224,41 @@ describe("ClaudeService", () => {
       section: null,
       sectionEnteredAt: null,
     });
+    await seed.close();
 
-    const ids = seed.listThreads({}).map((thread) => thread.id);
+    const service = new ClaudeService(
+      cfg, new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(path), new FakeClaudeQuery().factory,
+    );
+    await service.ready();
+    const ids = service.listThreads({}).map((thread) => thread.id);
     expect(ids.filter((id) => id === started.thread.id)).toHaveLength(1);
     expect(ids).not.toContain(foreignSessionId);
+    await service.close();
+  });
+
+  it("backfills a store-only title into the native transcript once on start", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-native-title-backfill-"));
+    directories.push(directory);
+    const untitledSessionId = "a0cd4fcb-7bd4-43fa-b0d3-7d46e39e912a";
+    const cfg = { ...config(directory), claudeProjectsDir: fixtureProjects };
+    const path = join(directory, "state.sqlite");
+    const store = new SqliteHybridStore(path);
+    const seed = new ClaudeService(cfg, new SubscriptionHub(), new Logger("error"), store, new FakeClaudeQuery().factory);
+    await seed.ready();
+    const started = await seed.startThread({ model: "claude:haiku", cwd: directory });
+    const record = store.getThreadRecord(started.thread.id)!;
+    store.updateThread({ ...record, claudeSessionId: untitledSessionId, thread: { ...record.thread, name: "Stored only" } });
     await seed.close();
+
+    const rename = vi.fn(async () => undefined);
+    const service = new ClaudeService(
+      cfg, new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(path), new FakeClaudeQuery().factory,
+      undefined, new MetricsRegistry(), undefined, { rename, delete: async () => undefined },
+    );
+    await service.ready();
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(rename).toHaveBeenCalledWith(untitledSessionId, "Stored only", expect.any(String));
+    await service.close();
   });
 
   it("creates hidden threads under suppression before they become durable", async () => {
