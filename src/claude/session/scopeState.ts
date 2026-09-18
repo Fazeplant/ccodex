@@ -9,7 +9,7 @@ import type { MainStreamFact, MainStreamProjection } from "./commands.js";
 
 export interface MainStreamState {
   readonly ownerThreadId: string;
-  readonly turnId: string;
+  readonly turn: Turn;
   readonly record: ClaudeThreadRecord;
   readonly blockItems: Map<number, string>;
   readonly reasoningSummaryIndices: Map<number, number>;
@@ -53,13 +53,13 @@ export function taskUsesProvider(task: ScopeTask, providerId: string): boolean {
 
 export function newMainStreamState(
   ownerThreadId: string,
-  turnId: string,
+  turn: Turn,
   record: ClaudeThreadRecord,
   review?: string,
 ): MainStreamState {
   return {
     ownerThreadId,
-    turnId,
+    turn,
     record,
     blockItems: new Map(),
     reasoningSummaryIndices: new Map(),
@@ -68,7 +68,7 @@ export function newMainStreamState(
     completedItems: new Set(),
     pendingAgentItemIds: new Set(),
     tools: new Map(),
-    messageId: turnId,
+    messageId: turn.id,
     reasoningItemId: undefined,
     ...(review ? { review } : {}),
   };

@@ -15,6 +15,7 @@ import type { JsonValue } from "../../codex/generated/serde_json/JsonValue.js";
 import type {
   ClaudeThreadRecord,
   InternalGoal,
+  PendingRequestRecord,
   ProviderEventDisposition,
 } from "../../store/HybridStore.js";
 import type { TurnProviderBoundary } from "../../store/HybridStore.js";
@@ -25,6 +26,33 @@ export interface SessionBranchSnapshot {
   readonly record: ClaudeThreadRecord;
   readonly boundaries: readonly TurnProviderBoundary[];
   readonly revision: string;
+}
+
+export interface ClaudeChildProjection {
+  readonly record: ClaudeThreadRecord;
+  readonly turns: readonly Turn[];
+}
+
+export interface ClaudeLiveNotification {
+  readonly seq: number;
+  readonly threadId: string;
+  readonly method: string;
+  readonly params: unknown;
+}
+
+export interface ClaudeLiveSnapshot {
+  readonly activeTurn: Turn | undefined;
+  readonly childProjections: ReadonlyMap<string, ClaudeChildProjection>;
+  readonly pendingRequests: readonly PendingRequestRecord[];
+  readonly queue: readonly QueuedSubmission[];
+  readonly usage: {
+    readonly total: ClaudeThreadRecord["tokenUsageTotal"];
+    readonly last: ClaudeThreadRecord["tokenUsageLast"];
+    readonly modelContextWindow: number | null;
+    readonly providerCostUsdTotal: number;
+  };
+  readonly status: Thread["status"];
+  readonly seq: number;
 }
 
 export interface DesiredSettingsUpdate {
@@ -384,6 +412,8 @@ export type ClaudeSessionCommand =
     readonly type: "readThread";
     readonly includeTurns: boolean;
   }
+  | { readonly type: "liveSnapshot" }
+  | { readonly type: "notificationsAfter"; readonly seq: number }
   | { readonly type: "recoverAfterRestart"; readonly statusCommandEnabled: boolean }
   | { readonly type: "purgeStartupProjection" }
   | {

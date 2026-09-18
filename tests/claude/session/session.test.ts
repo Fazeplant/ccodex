@@ -13,7 +13,8 @@ import type {
 import { MemoryHybridStore } from "../../../src/store/memoryStore.js";
 import { SubscriptionHub } from "../../../src/gateway/subscriptions.js";
 import type {
-  ClaudeSessionCommand, DesiredSettingsUpdate, GoalEffect, MainStreamFact, MainStreamProjection,
+  ClaudeLiveNotification, ClaudeLiveSnapshot, ClaudeSessionCommand, DesiredSettingsUpdate, GoalEffect,
+  MainStreamFact, MainStreamProjection,
   PreparedGoalMutation, ProviderEventAdmission, RuntimeFactSource, RuntimeInspection, SessionLifecycleUpdate,
 } from "../../../src/claude/session/commands.js";
 import { ClaudeOutputAdapter } from "../../../src/claude/session/outputAdapter.js";
@@ -23,6 +24,7 @@ import { ClaudeSessionRegistry } from "../../../src/claude/sessionRegistry.js";
 import { MetricsRegistry } from "../../../src/observability/metrics.js";
 import type { ClaudeHookRun } from "../../../src/claude/hookMapper.js";
 import type { BackgroundOutputReader } from "../../../src/claude/session/backgroundOutput.js";
+import { normalizedNotificationEvents } from "../../fixtures/liveShadow.js";
 
 function record(threadId: string): ClaudeThreadRecord {
   const thread: Thread = {
@@ -1828,6 +1830,8 @@ describe("ClaudeSession Phase 3 slice", () => {
     const { store, hub, registry } = harness();
     await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
     await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
+    const beforeLive = await registry.submit<ClaudeLiveSnapshot>("thread-1", { type: "liveSnapshot" });
+    const beforeStored = store.eventHighWatermark("thread-1");
     const stagedUuid = "staged-user-uuid";
     await registry.submit("thread-1", {
       type: "stageRuntimeTurn",
@@ -1893,6 +1897,15 @@ describe("ClaudeSession Phase 3 slice", () => {
     ]);
     expect(methods.filter((method) => method === "item/reasoning/summaryPartAdded")).toHaveLength(1);
     expect(methods.filter((method) => method === "item/completed")).toHaveLength(2);
+    const live = await registry.submit<ClaudeLiveSnapshot>("thread-1", { type: "liveSnapshot" });
+    expect(live.activeTurn).toEqual(store.getTurn("thread-1", prepared.turn.id));
+    const notifications = await registry.submit<ClaudeLiveNotification[]>("thread-1", {
+      type: "notificationsAfter",
+      seq: beforeLive.seq,
+    });
+    expect(normalizedNotificationEvents(notifications)).toEqual(
+      normalizedNotificationEvents(store.listEventsAfter("thread-1", beforeStored)),
+    );
     await registry.close();
   });
 
@@ -2073,6 +2086,8 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.submit("thread-1", {
       type: "announceInteraction", runtimeGeneration: 1, requestId: opened.requestId,
     });
+    expect((await registry.submit<ClaudeLiveSnapshot>("thread-1", { type: "liveSnapshot" })).pendingRequests)
+      .toEqual([expect.objectContaining({ requestId: opened.requestId, threadId: child.childThreadId })]);
     const response = registry.submit("thread-1", {
       type: "waitInteraction",
       runtimeGeneration: 1,
@@ -2089,6 +2104,33 @@ describe("ClaudeSession Phase 3 slice", () => {
     expect(store.getThreadRecord(child.childThreadId)?.thread.status).toEqual({
       type: "active", activeFlags: [],
     });
+    expect((await registry.submit<ClaudeLiveSnapshot>("thread-1", { type: "liveSnapshot" })).pendingRequests)
+      .toEqual([]);
+    await registry.close();
+  });
+
+  it("keeps notification ring sequences monotonic", async () => {
+    const { registry } = harness();
+    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
+    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
+    for (let index = 0; index < 5; index += 1) {
+      await registry.submit("thread-1", {
+        type: "runtimeNotification",
+        runtimeGeneration: 1,
+        method: "test/notification",
+        params: { index },
+        source: { providerEventId: null, providerEventType: "test" },
+      });
+    }
+    const snapshot = await registry.submit<ClaudeLiveSnapshot>("thread-1", { type: "liveSnapshot" });
+    const notifications = await registry.submit<ClaudeLiveNotification[]>("thread-1", {
+      type: "notificationsAfter",
+      seq: 0,
+    });
+    expect(snapshot.seq).toBe(5);
+    expect(notifications).toHaveLength(5);
+    expect(notifications[0]).toMatchObject({ seq: 1, threadId: "thread-1", method: "test/notification" });
+    expect(notifications.at(-1)).toMatchObject({ seq: 5, params: { index: 4 } });
     await registry.close();
   });
 
@@ -3169,14 +3211,13 @@ describe("ClaudeSession Phase 3 slice", () => {
     });
     const projectedItemIds = projection.itemIds.filter((id): id is string => Boolean(id));
     expect(projectedItemIds).toHaveLength(1);
-    const active = store.getTurn("thread-1", prepared.turn.id)!;
-    active.items.push({
+    prepared.turn.items.push({
       type: "collabAgentToolCall", id: "retracted-spawn", tool: "spawnAgent", status: "completed",
       senderThreadId: "thread-1", receiverThreadIds: ["retracted-child"], prompt: "temporary child",
       model: null, reasoningEffort: null,
       agentsStates: { "retracted-child": { status: "completed", message: "temporary" } },
     });
-    store.updateTurn("thread-1", active);
+    store.updateTurn("thread-1", prepared.turn);
     const child = record("retracted-child");
     child.thread.parentThreadId = "thread-1";
     store.createThread(child);

@@ -108,7 +108,8 @@ describe("Phase 3 ownership boundary", () => {
     expect(session).toContain('case "openInteraction"');
     expect(session).toContain('case "announceInteraction"');
     expect(session).toContain("this.syncInteractionStatus");
-    expect(session).toContain("this.repository.pendingRequests(this.threadId).length > 0");
+    expect(session).toContain("this.pendingRequestsFor(this.threadId).length > 0");
+    expect(session).not.toContain("this.repository.pendingRequests(this.threadId).length > 0");
     expect(runtimeFactory).not.toContain('activeFlags: ["waitingOnApproval"] } });');
     expect(runtimeFactory).not.toContain('activeFlags: ["waitingOnUserInput"] } });');
   });

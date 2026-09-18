@@ -103,6 +103,8 @@ import {
   resolveClaudeModel,
 } from "./modelSelection.js";
 import type {
+  ClaudeLiveNotification,
+  ClaudeLiveSnapshot,
   ClaudeSessionCommand,
   DesiredSettingsUpdate,
   PreparedGoalMutation,
@@ -2139,6 +2141,16 @@ export class ClaudeService {
   public eventsAfter(threadId: string, sequence: number) {
     this.assertThreadAvailable(threadId);
     return this.store.listEventsAfter(threadId, sequence);
+  }
+
+  public liveSnapshot(threadId: string): Promise<ClaudeLiveSnapshot> {
+    this.assertThreadAvailable(threadId);
+    return this.sessions.submit(threadId, { type: "liveSnapshot" });
+  }
+
+  public notificationsAfter(threadId: string, sequence: number): Promise<ClaudeLiveNotification[]> {
+    this.assertThreadAvailable(threadId);
+    return this.sessions.submit(threadId, { type: "notificationsAfter", seq: sequence });
   }
 
   public latestTokenUsage(threadId: string) {

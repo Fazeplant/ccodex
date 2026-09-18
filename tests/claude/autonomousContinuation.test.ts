@@ -70,9 +70,12 @@ function taskNotification(taskId: string): SDKMessage {
   } as unknown as SDKMessage;
 }
 
+let currentAssistantMessageId = "";
+
 function messageStart(): SDKMessage {
+  currentAssistantMessageId = `msg_${randomUUID()}`;
   return {
-    type: "stream_event", event: { type: "message_start", message: {} },
+    type: "stream_event", event: { type: "message_start", message: { id: currentAssistantMessageId } },
     parent_tool_use_id: null, uuid: randomUUID(), ...base,
   } as unknown as SDKMessage;
 }
@@ -117,7 +120,7 @@ function toolResult(toolUseId: string): SDKMessage {
 function assistant(content: Array<Record<string, unknown>>): SDKMessage {
   return {
     type: "assistant", parent_tool_use_id: null, uuid: randomUUID(), ...base,
-    message: { role: "assistant", content },
+    message: { id: currentAssistantMessageId, role: "assistant", content },
   } as unknown as SDKMessage;
 }
 

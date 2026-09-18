@@ -33,6 +33,7 @@ import {
   fullAccessProjection,
   stopLifecycleSample,
 } from "../fixtures/protocolSamples.js";
+import { normalizedNotificationEvents } from "../fixtures/liveShadow.js";
 
 const directories: string[] = [];
 const fixtureProjects = fileURLToPath(new URL("../fixtures/nativeClaudeHome/projects/", import.meta.url));
@@ -605,10 +606,13 @@ describe("ClaudeService", () => {
     const fake = new FakeClaudeQuery(undefined, undefined, [], false, undefined, undefined, undefined, messages);
     const hub = new SubscriptionHub();
     const database = join(directory, "state.sqlite");
+    const store = new SqliteHybridStore(database);
     const service = new ClaudeService(
-      config(directory), hub, new Logger("error"), new SqliteHybridStore(database), fake.factory,
+      config(directory), hub, new Logger("error"), store, fake.factory,
     );
     const started = await service.startThread({ model: "claude:haiku", cwd: directory });
+    const beforeLive = await service.liveSnapshot(started.thread.id);
+    const beforeStored = service.eventHighWatermark(started.thread.id);
     const events: Array<{ method: string; params: unknown }> = [];
     hub.subscribe(started.thread.id, "test", (method, params) => events.push({ method, params }));
     const prepared = await service.prepareTurn({
@@ -639,6 +643,18 @@ describe("ClaudeService", () => {
       expect.objectContaining({ params: expect.objectContaining({ summaryIndex: 1 }) }),
     ]);
     expect(events.some((event) => event.method === "item/reasoning/textDelta")).toBe(false);
+    const live = await service.liveSnapshot(started.thread.id);
+    const stored = store.getThreadRecord(started.thread.id, false)!;
+    expect(live.activeTurn).toEqual(store.getTurn(started.thread.id, prepared.response.turn.id));
+    expect(live.status).toEqual(stored.thread.status);
+    expect(live.usage).toEqual({
+      total: stored.tokenUsageTotal,
+      last: stored.tokenUsageLast,
+      modelContextWindow: stored.modelContextWindow,
+      providerCostUsdTotal: stored.providerCostUsdTotal ?? 0,
+    });
+    expect(normalizedNotificationEvents(await service.notificationsAfter(started.thread.id, beforeLive.seq)))
+      .toEqual(normalizedNotificationEvents(service.eventsAfter(started.thread.id, beforeStored)));
     await service.close();
   });
 
@@ -3905,9 +3921,10 @@ You are in a side conversation, not the main thread.`,
       },
       { type: "system", subtype: "task_notification", task_id: agentTask, tool_use_id: agentTool, status: "completed", output_file: join(directory, "unused"), summary: "Child completed", uuid: randomUUID(), ...base },
     ] as unknown as SDKMessage[];
+    const store = new SqliteHybridStore(join(directory, "state.sqlite"));
     const service = new ClaudeService(
       config(directory), new SubscriptionHub(), new Logger("error"),
-      new SqliteHybridStore(join(directory, "state.sqlite")),
+      store,
       new FakeClaudeQuery(undefined, undefined, [], false, undefined, undefined, undefined, messages).factory,
     );
     const started = await service.startThread({ model: "claude:haiku", cwd: directory });
@@ -3945,6 +3962,13 @@ You are in a side conversation, not the main thread.`,
     expect(root).not.toContain("Child tool notice");
     expect(root).not.toContain(bashTool);
     expect(root).not.toContain(bashTask);
+    const live = await service.liveSnapshot(started.thread.id);
+    expect(live.childProjections.get(childThreadId)?.turns.at(-1))
+      .toEqual(store.getTurn(childThreadId, childTurn.id));
+    const childNotifications = (await service.notificationsAfter(childThreadId, 0))
+      .filter((notification) => notification.threadId === childThreadId);
+    expect(normalizedNotificationEvents(childNotifications))
+      .toEqual(normalizedNotificationEvents(service.eventsAfter(childThreadId, 0)));
     await expect(service.listBackgroundTerminals({ threadId: started.thread.id }))
       .resolves.toMatchObject({ data: [] });
     expect(service.readThread(started.thread.id, true).thread.status).toEqual({ type: "idle" });
@@ -4113,6 +4137,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(
       () => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed",
       "child image turn completion",
+      4_000,
     );
 
     const parentCall = service.readThread(started.thread.id, true).thread.turns[0]!.items
@@ -4699,6 +4724,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(
       () => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed",
       "resumed child parent completion",
+      4_000,
     );
 
     const parent = service.readThread(started.thread.id, true).thread;
@@ -7932,6 +7958,7 @@ describe("ClaudeService submission queue", () => {
     expect(service.listQueue({ threadId })).toEqual({
       data: [added.response.queuedSubmission], nextCursor: null,
     });
+    expect((await service.liveSnapshot(threadId)).queue).toEqual([added.response.queuedSubmission]);
     expect(events.filter((event) => event.method === "thread/queue/changed")).toHaveLength(1);
     await expect(service.prepareQueueStart({ threadId }))
       .rejects.toThrow("thread already has an active or pending turn");

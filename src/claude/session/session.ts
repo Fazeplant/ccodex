@@ -18,8 +18,10 @@ import type { UserInput } from "../../codex/generated/v2/UserInput.js";
 import type { QueuedSubmission } from "../../codex/generated/v2/QueuedSubmission.js";
 import type {
   ClaudeThreadRecord,
+  PendingRequestRecord,
   ProviderBoundaryCommit,
   ProviderEventDisposition,
+  ProviderItemCorrelation,
   StateEvent,
 } from "../../store/HybridStore.js";
 import type { ClaudeSessionHandle } from "../sessionRegistry.js";
@@ -32,6 +34,9 @@ import {
 } from "../resultClassifier.js";
 import type {
   ClaudeSessionCommand,
+  ClaudeChildProjection,
+  ClaudeLiveNotification,
+  ClaudeLiveSnapshot,
   CompactionProjection,
   CompactionTerminal,
   CompactionTransportAction,
@@ -232,6 +237,7 @@ function childProjectionIds(turns: readonly Turn[]): Set<string> {
 
 /** Stock app-server caps the per-thread submission queue at 100 entries. */
 const MAX_QUEUED_SUBMISSIONS = 100;
+const MAX_LIVE_NOTIFICATIONS = 2_000;
 
 function commandLane(command: SessionMailboxCommand): ClaudeMailboxLane {
   if (command.type === "runtimeLineage"
@@ -568,6 +574,15 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     resolved: boolean;
   }>();
   private record: ClaudeThreadRecord | undefined;
+  private activeTurn: Turn | undefined;
+  private lastCompletedTurn: Turn | undefined;
+  private readonly childProjections = new Map<string, { record: ClaudeThreadRecord; turns: Turn[] }>();
+  private readonly pendingRequests = new Map<string, PendingRequestRecord>();
+  private queuedSubmissions: QueuedSubmission[] | undefined;
+  private readonly providerEventDedupe = new Set<string>();
+  private readonly providerItemCorrelations = new Map<string, ProviderItemCorrelation[]>();
+  private notificationSequence = 0;
+  private readonly notificationRing: ClaudeLiveNotification[] = [];
   private runtimeGeneration: number | undefined;
   private readonly scopes = new Map<string, MainStreamState>();
   private readonly tasks = new Map<string, ScopeTask>();
@@ -4436,6 +4451,10 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       }
       case "readThread":
         return this.requireRecord(command.includeTurns);
+      case "liveSnapshot":
+        return this.liveSnapshot();
+      case "notificationsAfter":
+        return this.notificationsAfter(command.seq);
       case "recoverAfterRestart":
         return this.recoverAfterRestart(command.statusCommandEnabled);
       case "snapshotBranch": {
@@ -4512,8 +4531,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         this.scopes.clear();
         this.tasks.clear();
         for (const childThreadId of removedThreadIds) {
+          this.childProjections.delete(childThreadId);
           this.onChildRemoved(childThreadId);
-          this.output.emit(childThreadId, "thread/deleted", { threadId: childThreadId });
+          this.emitNotification(childThreadId, "thread/deleted", { threadId: childThreadId });
         }
         return { ...record, thread: { ...record.thread, turns: retained } };
       }
@@ -4525,6 +4545,12 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         this.disposeRuntimeOperations();
         this.scopes.clear();
         this.tasks.clear();
+        this.activeTurn = this.lastCompletedTurn = undefined;
+        this.childProjections.clear();
+        this.pendingRequests.clear();
+        this.queuedSubmissions = undefined;
+        this.providerEventDedupe.clear();
+        this.providerItemCorrelations.clear();
         return undefined;
       }
       case "goal":
@@ -4693,7 +4719,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           turnId,
         );
         const { turn } = started;
-        this.scopes.set(this.threadId, newMainStreamState(this.threadId, turn.id, record, command.review));
+        this.scopes.set(this.threadId, newMainStreamState(this.threadId, turn, record, command.review));
         this.rootReadOnly = command.readOnly ?? false;
         this.lifecycle = {
           ...(command.synthetic ? { synthetic: command.synthetic } : {}),
@@ -4705,7 +4731,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         return started;
       }
       case "announceTurn": {
-        const turn = this.repository.readTurn(this.threadId, command.turnId);
+        const turn = this.turnFor(this.threadId, command.turnId);
         if (!turn) throw new Error(`Unknown Claude turn '${command.turnId}'.`);
         this.announceTurn(turn, true);
         return undefined;
@@ -4714,15 +4740,15 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         const active = this.lifecycle;
         const state = this.scopes.get(this.threadId);
         if (!active?.synthetic || !state) return false;
-        if (command.turnId && command.turnId !== state.turnId) {
-          const prior = this.repository.readTurn(this.threadId, command.turnId);
+        if (command.turnId && command.turnId !== state.turn.id) {
+          const prior = this.turnFor(this.threadId, command.turnId);
           if (prior?.status !== "inProgress") return true;
           throw invalidParams(`Turn '${command.turnId}' is not active in Claude thread '${this.threadId}'.`);
         }
         if (command.text) {
           this.projectMainStream(this.threadId, {
             kind: "assistant",
-            messageId: state.turnId,
+            messageId: state.turn.id,
             blocks: [{ index: 0, block: "text", text: command.text }],
             completeAsCommentary: false,
           }, nullSource);
@@ -4944,15 +4970,19 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           payload: command.payload,
           createdAt: Date.now(),
         });
-        if (!journal.inserted && journal.record.disposition !== "pending"
-          && journal.record.disposition !== "failed") {
+        const dedupeKey = command.providerEventId
+          ? `${command.providerEventType}\0${command.providerEventId}`
+          : undefined;
+        if (dedupeKey && this.providerEventDedupe.has(dedupeKey)
+          || (!journal.inserted && journal.record.disposition !== "pending"
+            && journal.record.disposition !== "failed")) {
           this.metrics.eventDeduplicated();
           return {
             sequence: journal.record.sequence,
             source,
             project: false,
             finish: false,
-            activeTurnId: this.scopes.get(this.threadId)?.turnId ?? null,
+            activeTurnId: this.scopes.get(this.threadId)?.turn.id ?? null,
             readOnly: this.rootReadOnly,
           } satisfies ProviderEventAdmission;
         }
@@ -4962,7 +4992,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           project: !this.interruptFence && !this.transportStopFence && !this.dropLateFacts
             || command.providerEventType === "command_lifecycle",
           finish: true,
-          activeTurnId: this.scopes.get(this.threadId)?.turnId ?? null,
+          activeTurnId: this.scopes.get(this.threadId)?.turn.id ?? null,
           readOnly: this.rootReadOnly,
         } satisfies ProviderEventAdmission;
       }
@@ -4977,6 +5007,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         this.metrics.providerEvent(command.source.providerEventType ?? "unknown", command.disposition);
         if (command.disposition !== "failed"
           && command.source.providerEventId && command.source.providerEventType) {
+          this.providerEventDedupe.add(
+            `${command.source.providerEventType}\0${command.source.providerEventId}`,
+          );
           this.repository.markProviderEventProcessed(
             this.threadId,
             command.source.providerEventType,
@@ -5003,9 +5036,15 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           updated = { ...record, lastClaudeMessageUuid: command.providerMessageId };
         }
         const itemIds = [...new Set(command.itemIds ?? [])];
+        this.providerItemCorrelations.set(command.providerMessageId, itemIds.map((itemId) => ({
+          providerMessageId: command.providerMessageId,
+          ownerThreadId,
+          turnId: state.turn.id,
+          itemId,
+        })));
         this.commitState(updated, [], undefined, false, {
           ownerThreadId,
-          turnId: state.turnId,
+          turnId: state.turn.id,
           messageUuid: command.providerMessageId,
           itemIds,
         });
@@ -5021,7 +5060,13 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           itemIds: Set<string>;
           clearBoundary: boolean;
         }>();
-        for (const correlation of this.repository.providerItemCorrelations(this.threadId, providerMessageIds)) {
+        const liveCorrelations = providerMessageIds.flatMap((messageId) =>
+          this.providerItemCorrelations.get(messageId) ?? []);
+        const correlations = [
+          ...this.repository.providerItemCorrelations(this.threadId, providerMessageIds),
+          ...liveCorrelations,
+        ];
+        for (const correlation of correlations) {
           const key = `${correlation.ownerThreadId}\0${correlation.turnId}`;
           const group = groups.get(key) ?? {
             ownerThreadId: correlation.ownerThreadId,
@@ -5058,7 +5103,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         }
         const projectedChildIds = new Set<string>();
         const mutations = [...groups.values()].flatMap((group) => {
-          const turn = this.repository.readTurn(group.ownerThreadId, group.turnId);
+          const turn = this.turnFor(group.ownerThreadId, group.turnId);
           if (!turn) return [];
           const removedItems = turn.items.filter((item) => group.itemIds.has(item.id));
           for (const childThreadId of childProjectionIds([{ ...turn, items: removedItems }])) {
@@ -5103,15 +5148,17 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           mutations.filter((mutation) => !removed.has(mutation.ownerThreadId)),
           removedThreadIds,
         );
+        for (const providerMessageId of providerMessageIds) this.providerItemCorrelations.delete(providerMessageId);
         this.record = updated;
         for (const group of groups.values()) {
           const state = this.scopes.get(group.ownerThreadId);
-          if (state?.turnId === group.turnId) this.evictProjectedItems(state, group.itemIds);
+          if (state?.turn.id === group.turnId) this.evictProjectedItems(state, group.itemIds);
         }
         for (const childThreadId of removedThreadIds) {
           this.scopes.delete(childThreadId);
+          this.childProjections.delete(childThreadId);
           this.onChildRemoved(childThreadId);
-          this.output.emit(childThreadId, "thread/deleted", { threadId: childThreadId });
+          this.emitNotification(childThreadId, "thread/deleted", { threadId: childThreadId });
         }
         for (const [taskId, task] of this.tasks) {
           if (removed.has(task.ownerThreadId)
@@ -5152,13 +5199,13 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         if (state) {
           const params = {
             threadId: this.threadId,
-            turnId: state.turnId,
+            turnId: state.turn.id,
             fromModel: command.fromModel,
             toModel: command.model,
             reason: "highRiskCyberActivity",
           };
           this.commitState(updated, [{
-            turnId: state.turnId,
+            turnId: state.turn.id,
             method: "model/rerouted",
             params,
             providerEventId: command.source.providerEventId,
@@ -5185,7 +5232,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         if (command.runtimeGeneration !== this.runtimeGeneration || this.dropLateFacts) return false;
         const ownerThreadId = command.ownerThreadId ?? this.threadId;
         const state = this.scopes.get(ownerThreadId);
-        if (state) this.publishAt(ownerThreadId, state.turnId, command.method, command.params, command.source);
+        if (state) this.publishAt(ownerThreadId, state.turn.id, command.method, command.params, command.source);
         else this.publish(null, command.method, command.params);
         return true;
       }
@@ -5195,11 +5242,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           return undefined;
         }
         const state = this.scopes.get(this.threadId);
-        if (!state || state.turnId !== command.expectedTurnId) {
+        if (!state || state.turn.id !== command.expectedTurnId) {
           throw invalidParams(`Expected active turn '${command.expectedTurnId}' does not match the Claude thread.`);
         }
-        const turn = this.repository.readTurn(this.threadId, state.turnId);
-        if (!turn || turn.status !== "inProgress") {
+        const turn = state.turn;
+        if (turn.status !== "inProgress") {
           throw invalidParams(`Turn '${command.expectedTurnId}' is not active in Claude thread '${this.threadId}'.`);
         }
         const item: ThreadItem = {
@@ -5234,7 +5281,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           }
           if (this.stagedRuntimeTurns.size) return {
             kind: "busy",
-            activeTurnId: this.scopes.get(this.threadId)?.turnId ?? null,
+            activeTurnId: this.scopes.get(this.threadId)?.turn.id ?? null,
           } satisfies RuntimeTurnStage;
         }
         if (command.runtimeGeneration !== this.runtimeGeneration
@@ -5261,7 +5308,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           || this.lifecycle || this.compaction || record.thread.status.type === "active") {
           return {
             kind: "busy",
-            activeTurnId: this.scopes.get(this.threadId)?.turnId ?? null,
+            activeTurnId: this.scopes.get(this.threadId)?.turn.id ?? null,
           } satisfies RuntimeTurnStage;
         }
         this.stagedRuntimeTurns.add(command.messageUuid);
@@ -5281,12 +5328,12 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         }
         const state = this.scopes.get(this.threadId);
         if (command.kind === "turn") {
-          if (!state || state.turnId !== command.turnId || !this.lifecycle) return undefined;
+          if (!state || state.turn.id !== command.turnId || !this.lifecycle) return undefined;
           this.dropLateFacts = false;
           this.acceptLifecycle({ type: "expectedCommand", id: command.messageUuid }, nullSource);
           this.preparedRuntimeInputs.set(command.messageUuid, command.kind);
           this.emitLifecycle();
-          return { messageUuid: command.messageUuid, turnId: state.turnId } satisfies RuntimeInputAction;
+          return { messageUuid: command.messageUuid, turnId: state.turn.id } satisfies RuntimeInputAction;
         }
         if (this.dropLateFacts) return undefined;
         if (command.kind === "noQuery") {
@@ -5298,14 +5345,14 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           this.acceptLifecycle({ type: "noQuery" }, nullSource);
           this.preparedRuntimeInputs.set(command.messageUuid, command.kind);
           this.emitLifecycle();
-          return { messageUuid: command.messageUuid, turnId: state?.turnId ?? null } satisfies RuntimeInputAction;
+          return { messageUuid: command.messageUuid, turnId: state?.turn.id ?? null } satisfies RuntimeInputAction;
         }
-        if (!state || state.turnId !== command.turnId || !this.lifecycle) return undefined;
+        if (!state || state.turn.id !== command.turnId || !this.lifecycle) return undefined;
         if (command.kind === "hiddenGoal") this.acceptLifecycle({ type: "goalQueued" }, nullSource);
         this.acceptLifecycle({ type: "expectedCommand", id: command.messageUuid }, nullSource);
         this.preparedRuntimeInputs.set(command.messageUuid, command.kind);
         this.emitLifecycle();
-        return { messageUuid: command.messageUuid, turnId: state.turnId } satisfies RuntimeInputAction;
+        return { messageUuid: command.messageUuid, turnId: state.turn.id } satisfies RuntimeInputAction;
       }
       case "completeRuntimeInput": {
         if (command.runtimeGeneration !== this.runtimeGeneration) return false;
@@ -5361,8 +5408,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         if (this.runtimeGeneration === undefined) return false;
         const state = this.scopes.get(this.threadId);
         if (!state) return false;
-        if (command.expectedTurnId && state.turnId !== command.expectedTurnId) {
-          const prior = this.repository.readTurn(this.threadId, command.expectedTurnId);
+        if (command.expectedTurnId && state.turn.id !== command.expectedTurnId) {
+          const prior = this.turnFor(this.threadId, command.expectedTurnId);
           if (prior?.status !== "inProgress") return false;
           throw invalidParams(
             `Turn '${command.expectedTurnId}' is not active in Claude thread '${this.threadId}'.`,
@@ -5489,8 +5536,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           throw new Error(`Cannot open interaction for '${request.threadId}' in session '${this.threadId}'.`);
         }
         const existing = request.claudeRequestId
-          ? this.repository.pendingRequestByClaudeId(request.threadId, request.claudeRequestId)
+          ? [...this.pendingRequests.values()].find((candidate) =>
+              candidate.threadId === request.threadId && candidate.claudeRequestId === request.claudeRequestId)
+            ?? this.repository.pendingRequestByClaudeId(request.threadId, request.claudeRequestId)
           : undefined;
+        if (existing) this.pendingRequests.set(existing.requestId, existing);
         if (existing && existing.status !== "pending") {
           return {
             requestId: existing.requestId,
@@ -5499,11 +5549,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           } satisfies OpenedSessionInteraction;
         }
         const scope = this.scopes.get(request.threadId);
-        const turn = request.turnId ? this.repository.readTurn(request.threadId, request.turnId) : undefined;
+        const turn = request.turnId ? this.turnFor(request.threadId, request.turnId) : undefined;
         const idleRootRequest = request.threadId === this.threadId
           && request.turnId === null
           && !this.lifecycle;
-        if (!idleRootRequest && (!scope || request.turnId !== scope.turnId || turn?.status !== "inProgress")) {
+        if (!idleRootRequest && (!scope || request.turnId !== scope.turn.id || turn?.status !== "inProgress")) {
           return {
             requestId: existing?.requestId ?? "",
             pending: false,
@@ -5522,7 +5572,10 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           createdAt: Date.now(),
           resolvedAt: null,
         };
-        if (!existing) this.repository.createPendingRequest(pending);
+        if (!existing) {
+          this.pendingRequests.set(pending.requestId, pending);
+          this.repository.createPendingRequest(pending);
+        }
         this.metrics.pendingOpened(pending.requestId, pending.createdAt);
         this.syncInteractionStatus(pending.threadId, pending.turnId);
         this.interactionWaiter(pending.requestId);
@@ -5534,7 +5587,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       }
       case "announceInteraction": {
         if (command.runtimeGeneration !== this.runtimeGeneration) return false;
-        const request = this.repository.pendingRequest(command.requestId);
+        const request = this.interactionRequest(command.requestId);
         if (!request || request.threadId !== this.threadId && !this.scopes.has(request.threadId)
           || request.status !== "pending") return false;
         if (this.announcedInteractions.has(request.requestId)) return false;
@@ -5567,15 +5620,15 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         if (command.runtimeGeneration !== this.runtimeGeneration) return false;
         for (const scope of command.ownerThreadId
           ? [command.ownerThreadId]
-          : this.repository.ownedThreadIds(this.threadId)) {
-          for (const request of this.repository.pendingRequests(scope)) {
+          : [this.threadId, ...this.childProjections.keys()]) {
+          for (const request of this.pendingRequestsFor(scope)) {
             this.settleInteraction(request.requestId, "cancelled", { cancelled: true });
           }
         }
         return undefined;
       case "replayInteractions":
-        for (const scope of this.repository.ownedThreadIds(this.threadId)) {
-          for (const request of this.repository.pendingRequests(scope)) {
+        for (const scope of [this.threadId, ...this.childProjections.keys()]) {
+          for (const request of this.pendingRequestsFor(scope)) {
             if (command.connectionId) {
               this.output.request(
                 request.threadId, request.requestId, request.method, request.params, command.connectionId,
@@ -5609,8 +5662,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         if (this.dropLateFacts || this.adminOperation && this.adminOperation.kind !== "rename"
           || this.repository.archived(command.threadId)) return false;
         const state = this.scopes.get(command.threadId);
-        if (!state || command.requestedTurnId && command.requestedTurnId !== state.turnId
-          || this.repository.readTurn(command.threadId, state.turnId)?.status !== "inProgress") return false;
+        if (!state || command.requestedTurnId && command.requestedTurnId !== state.turn.id
+          || state.turn.status !== "inProgress") return false;
         this.projectMainStream(command.threadId, {
           kind: "instantAgent",
           text: systemNoticeText(command.message, "error"),
@@ -5811,18 +5864,15 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private appendShellOutput(operationId: string, delta: string): boolean {
     const shell = this.shell;
     if (!shell || shell.operationId !== operationId || shell.cancelling || !delta) return false;
-    const turn = this.repository.readTurn(this.threadId, shell.turnId);
+    const turn = this.turnFor(this.threadId, shell.turnId);
     const item = turn?.items.find((candidate) => candidate.id === shell.itemId);
     if (!turn || item?.type !== "commandExecution" || turn.status !== "inProgress") return false;
     const updatedItem = {
       ...item,
       aggregatedOutput: `${item.aggregatedOutput ?? ""}${delta}`,
     };
-    const updatedTurn = {
-      ...turn,
-      items: turn.items.map((candidate) => candidate.id === item.id ? updatedItem : candidate),
-    };
-    this.publishTurn(updatedTurn, "item/commandExecution/outputDelta", {
+    turn.items[turn.items.indexOf(item)] = updatedItem;
+    this.publishTurn(turn, "item/commandExecution/outputDelta", {
       threadId: this.threadId,
       turnId: turn.id,
       itemId: item.id,
@@ -5834,7 +5884,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private finishShell(operationId: string, exitCode: number, errorMessage?: string): boolean {
     const shell = this.shell;
     if (!shell || shell.operationId !== operationId || shell.cancelling) return false;
-    const active = this.repository.readTurn(this.threadId, shell.turnId);
+    const active = this.turnFor(this.threadId, shell.turnId);
     const item = active?.items.find((candidate) => candidate.id === shell.itemId);
     if (!active || item?.type !== "commandExecution" || active.status !== "inProgress") {
       this.shell = undefined;
@@ -5876,11 +5926,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private prepareShellCancellation(turnId: string | undefined): ShellCancellation | undefined {
     const shell = this.shell;
     if (!shell) {
-      const turn = turnId ? this.repository.readTurn(this.threadId, turnId) : undefined;
+      const turn = turnId ? this.turnFor(this.threadId, turnId) : undefined;
       return turn && turn.status !== "inProgress" ? { kind: "terminal", turnId: turn.id } : undefined;
     }
     if (turnId && shell.turnId !== turnId) return undefined;
-    const active = this.repository.readTurn(this.threadId, shell.turnId);
+    const active = this.turnFor(this.threadId, shell.turnId);
     const item = active?.items.find((candidate) => candidate.id === shell.itemId);
     if (!active || item?.type !== "commandExecution" || active.status !== "inProgress") {
       this.shell = undefined;
@@ -5918,7 +5968,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private finalizeShellCancellation(operationId: string): boolean {
     const shell = this.shell;
     if (!shell || shell.operationId !== operationId || !shell.cancelling) return false;
-    const active = this.repository.readTurn(this.threadId, shell.turnId);
+    const active = this.turnFor(this.threadId, shell.turnId);
     const item = active?.items.find((candidate) => candidate.id === shell.itemId);
     if (!active || item?.type !== "commandExecution" || active.status !== "inProgress") {
       this.shell = undefined;
@@ -5952,12 +6002,12 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
 
   private startCompaction(input: string, hidden = false): StartedCompaction {
     const record = this.requireRecord(true);
-    const active = record.thread.turns.findLast((turn) => turn.status === "inProgress");
+    const active = this.activeTurn;
     if (this.compaction || active?.items.some((item) => item.type === "contextCompaction")) {
       throw invalidParams("Claude compaction is already in progress.");
     }
     if (record.thread.status.type !== "idle" || active
-      || this.repository.pendingRequests(this.threadId).length > 0) {
+      || this.pendingRequestsFor(this.threadId).length > 0) {
       throw invalidParams("Cannot compact a Claude thread while another lifecycle is active.");
     }
     if (this.runtimeGeneration === undefined) {
@@ -5987,7 +6037,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
 
   private announceCompaction(operationId: string): void {
     if (this.compaction?.operationId !== operationId) return;
-    const turn = this.repository.readTurn(this.threadId, this.compaction.turnId);
+    const turn = this.turnFor(this.threadId, this.compaction.turnId);
     if (!turn) return;
     this.announceTurn(turn, false);
     this.emitLifecycle(undefined, true);
@@ -5995,7 +6045,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
 
   private interruptCompaction(turnId: string | undefined): CompactionProjection | undefined {
     if (turnId && turnId !== this.compaction?.turnId) {
-      const prior = this.repository.readTurn(this.threadId, turnId);
+      const prior = this.turnFor(this.threadId, turnId);
       if (prior?.status !== "inProgress") {
         return this.compaction || prior?.items.some((item) => item.type === "contextCompaction")
           ? { turnId, terminal: true } : undefined;
@@ -6035,7 +6085,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const record = this.requireRecord(true);
     const automatic = this.automaticCompaction;
     const turn = automatic
-      ? this.repository.readTurn(this.threadId, automatic.turnId)
+      ? this.turnFor(this.threadId, automatic.turnId)
       : this.activeNormalTurn(record);
     if (!turn) return undefined;
     const item = automatic
@@ -6108,7 +6158,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const automatic = this.automaticCompaction;
     if (!automatic) return undefined;
     const record = this.requireRecord(false);
-    const turn = this.repository.readTurn(this.threadId, automatic.turnId);
+    const turn = this.turnFor(this.threadId, automatic.turnId);
     const item = turn?.items.find((candidate) => candidate.id === automatic.itemId);
     if (!turn || item?.type !== "contextCompaction") return undefined;
     this.commitState(record, [{
@@ -6131,7 +6181,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   ): CompactionProjection | undefined {
     const operation = this.compaction;
     if (!operation) return undefined;
-    const active = this.repository.readTurn(this.threadId, operation.turnId)!;
+    const active = this.turnFor(this.threadId, operation.turnId)!;
     const placeholder = active.items[0]!;
     const item = status === "completed" && boundary
       ? { type: "contextCompaction" as const, id: boundary }
@@ -6184,6 +6234,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   }
 
   private activeNormalTurn(record = this.requireRecord(true)): Turn | undefined {
+    const active = this.activeTurn;
+    if (active?.items.some((item) => item.type !== "contextCompaction")) return active;
     return record.thread.turns.findLast((turn) =>
       turn.status === "inProgress"
       && turn.items.some((item) => item.type !== "contextCompaction"));
@@ -6201,6 +6253,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       id, items, itemsView: "full", status: "inProgress", error: null,
       startedAt: now, completedAt: null, durationMs: null,
     };
+    this.activeTurn = turn;
+    this.lastCompletedTurn = undefined;
     const updated: ClaudeThreadRecord = {
       ...record,
       thread: {
@@ -6231,6 +6285,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       const active = record.thread.turns.filter((turn) => turn.status === "inProgress");
       const recovered = active.map((turn) => this.recoverTurn(turn, statusCommandEnabled));
       const pendingRequests = this.repository.pendingRequests(ownerThreadId);
+      for (const request of pendingRequests) this.pendingRequests.set(request.requestId, request);
       for (const request of pendingRequests) {
         this.settleInteraction(request.requestId, "cancelled", { cancelled: true }, false);
       }
@@ -6423,6 +6478,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       providerEventType: source.providerEventType,
     });
     this.commitState(updated, events, turn, false, providerBoundary, emitEvents);
+    this.lastCompletedTurn = turn;
+    this.activeTurn = undefined;
     if (automatic) this.automaticCompaction = undefined;
     return { record: updated, turn };
   }
@@ -6430,7 +6487,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private goalContext(): GoalContext {
     return {
       threadId: this.threadId, repository: this.repository,
-      turnId: this.scopes.get(this.threadId)?.turnId, active: Boolean(this.lifecycle),
+      turnId: this.scopes.get(this.threadId)?.turn.id, active: Boolean(this.lifecycle),
       quiescent: this.isQuiescent(), planMode: this.planMode(),
       eligible: (!this.adminOperation || this.adminOperation.kind === "rename")
         && !this.repository.archived(this.threadId),
@@ -6607,8 +6664,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     this.projectMainStream(this.threadId, { kind: "scopeFinish", status: active.result.status,
       ...(active.result.errorMessage ? { message: active.result.errorMessage } : {}) }, source);
     this.projectMainStream(this.threadId, { kind: "finish" }, source);
-    const turn = this.repository.readTurn(this.threadId, state.turnId);
-    if (!turn) return;
+    const turn = state.turn;
     if (active.result.status === "completed"
       && !turn.items.some((item) => item.type === "agentMessage" && item.phase === "final_answer")) {
       const last = turn.items.findLast((item) => item.type === "agentMessage" && item.phase === "commentary");
@@ -6635,7 +6691,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private hasBlockers(): boolean {
     return [...this.tasks.values()].some((task) => !task.terminal)
       || [...this.scopes.values()].some((scope) => scope.openBlocks.size > 0
-        || this.repository.pendingRequests(scope.ownerThreadId).length > 0);
+        || this.pendingRequestsFor(scope.ownerThreadId).length > 0);
   }
 
   private settleForcedScopes(source: RuntimeFactSource): void {
@@ -6647,7 +6703,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       kind: "scopeFinish", status: this.lifecycle.result?.status ?? "failed",
     }, source);
     for (const scope of this.scopes.values()) scope.openBlocks.clear();
-    for (const scope of this.scopes.keys()) for (const request of this.repository.pendingRequests(scope))
+    for (const scope of this.scopes.keys()) for (const request of this.pendingRequestsFor(scope))
       this.settleInteraction(request.requestId, "cancelled", { cancelled: true });
   }
 
@@ -6834,10 +6890,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   }
 
   private handleQueue(command: QueueSessionCommand): unknown {
-    const queue = this.repository.listQueue(this.threadId);
+    const queue = this.liveQueue();
     const changed = (items: readonly QueuedSubmission[]) => {
+      this.queuedSubmissions = [...items];
       this.repository.setQueue(this.threadId, items);
-      this.output.emit(this.threadId, "thread/queue/changed", { threadId: this.threadId });
+      this.emitNotification(this.threadId, "thread/queue/changed", { threadId: this.threadId });
     };
     const find = (id: string) => {
       const index = queue.findIndex((entry) => entry.id === id);
@@ -6908,7 +6965,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       && this.pendingNoQuery === 0 && this.pendingInputs === 0 && !this.hasOutputDrains()
       && this.stagedRuntimeTurns.size === 0 && this.preparedRuntimeInputs.size === 0
       && !this.continuationTimer && !this.hasBlockers()
-      && !this.requireRecord(true).thread.turns.some((turn) => turn.status === "inProgress");
+      && !this.activeTurn;
   }
 
   private scheduleContinuation(reset = false): void {
@@ -6929,8 +6986,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
 
   private settleRootMessages(phase: "commentary" | "final_answer", source: RuntimeFactSource): void {
     const state = this.scopes.get(this.threadId);
-    const turn = state && this.repository.readTurn(this.threadId, state.turnId);
-    if (state && turn) this.settleAgentMessages(turn, state, phase, source);
+    if (state) this.settleAgentMessages(state.turn, state, phase, source);
   }
 
   private appendReviewExit(turn: Turn, source: RuntimeFactSource): void {
@@ -6953,10 +7009,16 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     response: unknown,
     evaluateLifecycle = true,
   ): boolean {
-    const request = this.repository.pendingRequest(requestId);
+    const request = this.interactionRequest(requestId);
     if (!request || !this.repository.ownedThreadIds(this.threadId).includes(request.threadId)
       || request.status !== "pending") return false;
     this.repository.resolvePendingRequest(requestId, status, response);
+    this.pendingRequests.set(requestId, {
+      ...request,
+      status,
+      response,
+      resolvedAt: Date.now(),
+    });
     this.announcedInteractions.delete(requestId);
     this.metrics.pendingClosed(requestId);
     const waiter = this.interactionWaiters.get(requestId);
@@ -6965,7 +7027,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       waiter.resolve(response);
       if (waiter.claimed) this.interactionWaiters.delete(requestId);
     }
-    this.output.emit(request.threadId, "serverRequest/resolved", { threadId: request.threadId, requestId });
+    this.emitNotification(request.threadId, "serverRequest/resolved", { threadId: request.threadId, requestId });
     this.syncInteractionStatus(request.threadId, request.turnId);
     if (evaluateLifecycle) this.maybeFinish(nullSource);
     return true;
@@ -7074,6 +7136,12 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       this.disposeRuntimeOperations();
       this.scopes.clear();
       this.tasks.clear();
+      this.activeTurn = this.lastCompletedTurn = undefined;
+      this.childProjections.clear();
+      this.pendingRequests.clear();
+      this.queuedSubmissions = undefined;
+      this.providerEventDedupe.clear();
+      this.providerItemCorrelations.clear();
       for (const ownedThreadId of ownedThreadIds.slice(1).reverse()) {
         this.onChildRemoved(ownedThreadId);
       }
@@ -7099,8 +7167,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         this.dropLateFacts = true;
         this.disposeRuntimeOperations();
         invalidateGoalEffect(this.goal);
-        for (const scope of this.repository.ownedThreadIds(this.threadId)) {
-          for (const request of this.repository.pendingRequests(scope)) {
+        for (const scope of [this.threadId, ...this.childProjections.keys()]) {
+          for (const request of this.pendingRequestsFor(scope)) {
             this.settleInteraction(request.requestId, "cancelled", { cancelled: true });
           }
         }
@@ -7142,7 +7210,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         const ownedThreadIds = this.repository.ownedThreadIds(this.threadId);
         this.repository.commitArchived(ownedThreadIds, true);
         for (const ownedThreadId of ownedThreadIds) {
-          this.output.emit(ownedThreadId, "thread/archived", { threadId: ownedThreadId });
+          this.emitNotification(ownedThreadId, "thread/archived", { threadId: ownedThreadId });
         }
       }
       this.adminOperation = undefined;
@@ -7186,7 +7254,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const ownedThreadIds = this.repository.ownedThreadIds(this.threadId);
     this.repository.commitArchived(ownedThreadIds, false);
     for (const ownedThreadId of ownedThreadIds) {
-      this.output.emit(ownedThreadId, "thread/unarchived", { threadId: ownedThreadId });
+      this.emitNotification(ownedThreadId, "thread/unarchived", { threadId: ownedThreadId });
     }
     this.dropLateFacts = false;
     this.emitLifecycle(undefined, true);
@@ -7204,7 +7272,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     invalidateGoalEffect(this.goal);
     const ownedThreadIds = this.repository.ownedThreadIds(this.threadId);
     for (const scope of ownedThreadIds) {
-      for (const request of this.repository.pendingRequests(scope)) {
+      for (const request of this.pendingRequestsFor(scope)) {
         this.settleInteraction(request.requestId, "cancelled", { cancelled: true });
       }
     }
@@ -7415,8 +7483,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       );
       if (!run) return false;
       this.hookRuns.set(fact.hookId, run);
-      const params = { threadId: this.threadId, turnId: state?.turnId ?? null, run };
-      if (state) this.publishAt(this.threadId, state.turnId, "hook/started", params, source);
+      const params = { threadId: this.threadId, turnId: state?.turn.id ?? null, run };
+      if (state) this.publishAt(this.threadId, state.turn.id, "hook/started", params, source);
       else this.publish(null, "hook/started", params);
       return true;
     }
@@ -7429,16 +7497,18 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     completeHookRun(run, fact);
     this.hookRuns.delete(fact.hookId);
     const state = this.scopes.get(this.threadId);
-    const params = { threadId: this.threadId, turnId: state?.turnId ?? null, run };
-    if (state) this.publishAt(this.threadId, state.turnId, "hook/completed", params, source);
+    const params = { threadId: this.threadId, turnId: state?.turn.id ?? null, run };
+    if (state) this.publishAt(this.threadId, state.turn.id, "hook/completed", params, source);
     else this.publish(null, "hook/completed", params);
     return true;
   }
 
   private syncInteractionStatus(ownerThreadId: string, turnId: string | null): void {
-    const record = this.repository.read(ownerThreadId, false)!;
+    const record = ownerThreadId === this.threadId
+      ? this.requireRecord(false)
+      : this.childProjections.get(ownerThreadId)?.record ?? this.repository.read(ownerThreadId, false)!;
     if (record.thread.status.type !== "active") return;
-    const pending = this.repository.pendingRequests(ownerThreadId);
+    const pending = this.pendingRequestsFor(ownerThreadId);
     const activeFlags = [
       ...(pending.some((request) => request.method.includes("/requestApproval"))
         ? ["waitingOnApproval" as const]
@@ -7498,8 +7568,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     }
     const ownerState = this.scopes.get(ownerThreadId);
     const targetState = this.scopes.get(targetThreadId);
-    if (command.expectedTurnId && targetState?.turnId !== command.expectedTurnId) {
-      const prior = this.repository.readTurn(targetThreadId, command.expectedTurnId);
+    if (command.expectedTurnId && targetState?.turn.id !== command.expectedTurnId) {
+      const prior = this.turnFor(targetThreadId, command.expectedTurnId);
       if (!prior || prior.status === "inProgress") {
         throw invalidParams(
           `Turn '${command.expectedTurnId}' is not active in Claude thread '${targetThreadId}'.`,
@@ -7511,16 +7581,16 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       .filter((task) => !task.terminal && (allTasks || task.ownerThreadId === ownerThreadId))
       .map((task) => task.taskId);
     return {
-      activeTurnId: this.scopes.get(this.threadId)?.turnId ?? null,
+      activeTurnId: this.scopes.get(this.threadId)?.turn.id ?? null,
       lastCompletedTurnId: this.requireRecord(false).lastCompletedTurnId,
       modelContextWindow: this.requireRecord(false).modelContextWindow,
       interruptible: command.expectedTurnId
-        ? targetState?.turnId === command.expectedTurnId
+        ? targetState?.turn.id === command.expectedTurnId
         : childTask ? !childTask.terminal && Boolean(targetState)
           : providerTask?.childThreadId ? !providerTask.terminal && Boolean(targetState)
             : Boolean(targetState),
       ownerThreadId,
-      ownerTurnId: ownerState?.turnId ?? null,
+      ownerTurnId: ownerState?.turn.id ?? null,
       taskIds,
       childThreadId: command.providerId
         ? [...this.tasks.values()].find((task) =>
@@ -7629,8 +7699,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     ownerThreadId: string, fact: MainStreamFact, source: RuntimeFactSource,
   ): MainStreamProjection {
     const state = this.requireMainStreamState(ownerThreadId);
-    const turn = this.repository.readTurn(ownerThreadId, state.turnId);
-    if (!turn) throw new Error(`Unknown active Claude turn '${state.turnId}'.`);
+    const turn = state.turn;
     let itemIds: readonly (string | null)[] = [];
     switch (fact.kind) {
       case "messageStart":
@@ -8035,7 +8104,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       handled = taskIds.length > 0;
     } else if (task) {
       const ownerState = this.scopes.get(task.ownerThreadId);
-      const ownerTurn = this.repository.readTurn(task.ownerThreadId, task.turnId);
+      const ownerTurn = ownerState?.turn;
       if (!ownerState || !ownerTurn || ownerTurn.status !== "inProgress") {
         if (fact.kind === "taskComplete" && !task.terminal) {
           this.stopBackgroundTailer(task);
@@ -8114,7 +8183,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     } else handled = false;
     const terminals = [...this.tasks.values()].flatMap((candidate) => {
       if (candidate.terminal || candidate.ownerThreadId !== state.ownerThreadId) return [];
-      const item = this.repository.readTurn(candidate.ownerThreadId, candidate.turnId)?.items
+      const item = this.scopes.get(candidate.ownerThreadId)?.turn.items
         .find((value) => value.id === candidate.itemId);
       return item?.type === "commandExecution" ? [{
         itemId: item.id, processId: candidate.taskId, command: item.command, cwd: item.cwd,
@@ -8135,7 +8204,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     if (!("taskId" in fact)) return undefined;
     const task = this.tasks.get(fact.taskId);
     if (!task) return undefined;
-    const turn = this.repository.readTurn(task.ownerThreadId, task.turnId);
+    const turn = this.turnFor(task.ownerThreadId, task.turnId);
     if (!turn) return undefined;
     if (fact.kind === "taskStart") {
       task.outputFile = fact.outputFile ?? task.outputFile;
@@ -8220,7 +8289,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     if (projection.completed.type === "collabAgentToolCall"
       && projection.completed.tool === "spawnAgent" && projection.completed.model) {
       const childThreadId = projection.completed.receiverThreadIds[0];
-      const child = childThreadId ? this.repository.read(childThreadId, false) : undefined;
+      const child = childThreadId ? this.childProjections.get(childThreadId)?.record : undefined;
       if (child) {
         const updated = withResolvedChildModel(
           child,
@@ -8256,7 +8325,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     parentThreadId: string, fact: Extract<MainStreamFact, { kind: "taskStart" }>, source: RuntimeFactSource,
     requestedModel?: string,
   ): ClaudeThreadRecord["thread"] {
-    const parent = this.repository.read(parentThreadId, false)!;
+    const parent = parentThreadId === this.threadId
+      ? this.requireRecord(false)
+      : this.childProjections.get(parentThreadId)!.record;
     const normalized = requestedModel && requestedModel !== "inherit"
       ? normalizeClaudeModelIdentifier(requestedModel) : undefined;
     const model = normalized
@@ -8269,8 +8340,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const { thread } = record;
     const childThreadId = thread.id;
     this.repository.create(record); this.repository.createTurn(childThreadId, turn);
+    this.childProjections.set(childThreadId, { record, turns: [turn] });
     this.onChildCreated(childThreadId);
-    const state = newMainStreamState(childThreadId, turn.id, record);
+    const state = newMainStreamState(childThreadId, turn, record);
     state.completedItems.add(item.id); this.scopes.set(childThreadId, state);
     this.publishAt(childThreadId, turn.id, "thread/started", { thread }, source);
     this.publishAt(childThreadId, turn.id, "turn/started", { threadId: childThreadId, turn: startedTurn(turn) }, source);
@@ -8286,8 +8358,14 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     fact: Extract<MainStreamFact, { kind: "taskStart" }>,
     source: RuntimeFactSource,
   ): ClaudeThreadRecord["thread"] {
-    const record = this.repository.read(childThreadId, false);
-    if (!record) throw new Error(`Unknown Claude child thread '${childThreadId}'.`);
+    const stored = this.repository.read(childThreadId, true);
+    if (!stored) throw new Error(`Unknown Claude child thread '${childThreadId}'.`);
+    let projection = this.childProjections.get(childThreadId);
+    if (!projection) {
+      projection = { record: stored, turns: [...stored.thread.turns] };
+      this.childProjections.set(childThreadId, projection);
+    }
+    const { record } = projection;
     const startedAt = Math.floor(Date.now() / 1_000);
     const text = fact.prompt ?? fact.description;
     const item: ThreadItem = {
@@ -8309,6 +8387,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       },
     };
     const status = { threadId: childThreadId, status: updated.thread.status };
+    projection.record = updated;
+    projection.turns.push(turn);
     this.commitState(updated, [{
       turnId: turn.id,
       method: "thread/status/changed",
@@ -8316,7 +8396,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       providerEventId: source.providerEventId,
       providerEventType: source.providerEventType,
     }], turn, true);
-    const state = newMainStreamState(childThreadId, turn.id, updated);
+    const state = newMainStreamState(childThreadId, turn, updated);
     state.completedItems.add(item.id);
     this.scopes.set(childThreadId, state);
     this.publishAt(childThreadId, turn.id, "turn/started", { threadId: childThreadId, turn: startedTurn(turn) }, source);
@@ -8333,9 +8413,10 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     childThreadId: string, status: "completed" | "failed" | "stopped", summary: string, source: RuntimeFactSource,
   ): void {
     const state = this.scopes.get(childThreadId);
-    const record = this.repository.read(childThreadId, false);
-    const turn = state && this.repository.readTurn(childThreadId, state.turnId);
-    if (!state || !record || !turn) return;
+    const projection = this.childProjections.get(childThreadId);
+    if (!state || !projection) return;
+    const { record } = projection;
+    const { turn } = state;
     if (status === "completed" && !turn.items.some((item) => item.type === "agentMessage")) {
       this.reconcileAssistant(
         turn,
@@ -8503,13 +8584,27 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private requireMainStreamState(ownerThreadId: string): MainStreamState {
     const existing = this.scopes.get(ownerThreadId);
     if (existing) return existing;
-    const record = this.repository.read(ownerThreadId, true);
+    const projection = this.childProjections.get(ownerThreadId);
+    const record = ownerThreadId === this.threadId ? this.requireRecord(false) : projection?.record;
+    const turn = ownerThreadId === this.threadId
+      ? this.activeTurn
+      : projection?.turns.findLast((candidate) => candidate.status === "inProgress");
     if (!record) throw new Error(`Unknown Claude scope '${ownerThreadId}'.`);
-    const turn = record.thread.turns.findLast((candidate) => candidate.status === "inProgress");
     if (!turn) throw new Error(`Claude thread '${ownerThreadId}' has no active turn.`);
-    const state = newMainStreamState(ownerThreadId, turn.id, record);
+    const state = newMainStreamState(ownerThreadId, turn, record);
     this.scopes.set(ownerThreadId, state);
     return state;
+  }
+
+  private turnFor(ownerThreadId: string, turnId: string): Turn | undefined {
+    const state = this.scopes.get(ownerThreadId);
+    if (state?.turn.id === turnId) return state.turn;
+    if (ownerThreadId === this.threadId) {
+      if (this.activeTurn?.id === turnId) return this.activeTurn;
+      if (this.lastCompletedTurn?.id === turnId) return this.lastCompletedTurn;
+    }
+    const child = this.childProjections.get(ownerThreadId)?.turns.find((turn) => turn.id === turnId);
+    return child ?? this.repository.readTurn(ownerThreadId, turnId);
   }
 
   private requireRecord(includeTurns: boolean): ClaudeThreadRecord {
@@ -8518,6 +8613,48 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     this.record = record;
     if (this.lastPublishedUsage === undefined) this.lastPublishedUsage = this.usageKey(record);
     return record;
+  }
+
+  private liveSnapshot(): ClaudeLiveSnapshot {
+    const record = this.requireRecord(false);
+    return {
+      activeTurn: structuredClone(this.activeTurn ?? this.lastCompletedTurn),
+      childProjections: new Map([...this.childProjections].map(([threadId, projection]) => [
+        threadId,
+        structuredClone(projection) satisfies ClaudeChildProjection,
+      ])),
+      pendingRequests: structuredClone([...this.pendingRequests.values()].filter((request) => request.status === "pending")),
+      queue: structuredClone(this.liveQueue()),
+      usage: structuredClone({
+        total: record.tokenUsageTotal,
+        last: record.tokenUsageLast,
+        modelContextWindow: record.modelContextWindow,
+        providerCostUsdTotal: record.providerCostUsdTotal ?? 0,
+      }),
+      status: structuredClone(record.thread.status),
+      seq: this.notificationSequence,
+    };
+  }
+
+  private notificationsAfter(sequence: number): ClaudeLiveNotification[] {
+    return structuredClone(this.notificationRing.filter((notification) => notification.seq > sequence));
+  }
+
+  private liveQueue(): QueuedSubmission[] {
+    return this.queuedSubmissions ??= this.repository.listQueue(this.threadId);
+  }
+
+  private pendingRequestsFor(threadId: string): PendingRequestRecord[] {
+    return [...this.pendingRequests.values()].filter((request) =>
+      request.threadId === threadId && request.status === "pending");
+  }
+
+  private interactionRequest(requestId: string): PendingRequestRecord | undefined {
+    const local = this.pendingRequests.get(requestId);
+    if (local) return local;
+    const stored = this.repository.pendingRequest(requestId);
+    if (stored) this.pendingRequests.set(requestId, stored);
+    return stored;
   }
 
   private usageKey(record: ClaudeThreadRecord): string | undefined {
@@ -8539,21 +8676,33 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     emitEvents = true,
   ): void {
     const sequences = this.repository.commitState(record, events, turn, insertTurn, providerBoundary);
-    if (record.thread.id === this.threadId) this.record = record;
+    if (record.thread.id === this.threadId) {
+      this.record = record;
+    } else {
+      const projection = this.childProjections.get(record.thread.id);
+      if (projection) {
+        projection.record = record;
+        if (turn) {
+          const index = projection.turns.findIndex((candidate) => candidate.id === turn.id);
+          if (index < 0) projection.turns.push(turn);
+          else projection.turns[index] = turn;
+        }
+      }
+    }
     if (!emitEvents) return;
     events.forEach((event, index) => {
-      if (sequences[index] !== 0) this.output.emit(record.thread.id, event.method, event.params);
+      if (sequences[index] !== 0) this.emitNotification(record.thread.id, event.method, event.params);
     });
   }
 
   private publish(turnId: string | null, method: string, params: unknown, dedupKey?: string): void {
     const sequence = this.repository.appendEvent(this.threadId, turnId, method, params, dedupKey);
     if (sequence === 0) return;
-    this.output.emit(this.threadId, method, params);
+    this.emitNotification(this.threadId, method, params);
   }
 
   private publishTurn(turn: Turn, method: string, params: unknown, source: RuntimeFactSource): void {
-    const ownerThreadId = [...this.scopes.values()].find((scope) => scope.turnId === turn.id)?.ownerThreadId
+    const ownerThreadId = [...this.scopes.values()].find((scope) => scope.turn.id === turn.id)?.ownerThreadId
       ?? this.threadId;
     this.publishOwnedTurn(ownerThreadId, turn, method, params, source);
   }
@@ -8562,13 +8711,25 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     ownerThreadId: string, turn: Turn, method: string, params: unknown, source: RuntimeFactSource,
   ): void {
     const sequence = this.repository.appendTurnEvent(ownerThreadId, turn, method, params, source);
-    if (sequence !== 0) this.output.emit(ownerThreadId, method, params);
+    if (sequence !== 0) this.emitNotification(ownerThreadId, method, params);
   }
 
   private publishAt(ownerThreadId: string, turnId: string, method: string, params: unknown, source: RuntimeFactSource): void {
-    const turn = this.repository.readTurn(ownerThreadId, turnId)!;
+    const state = this.scopes.get(ownerThreadId);
+    const turn = state?.turn.id === turnId ? state.turn : this.turnFor(ownerThreadId, turnId)!;
     if (this.repository.appendTurnEvent(ownerThreadId, turn, method, params, source)) {
-      this.output.emit(ownerThreadId, method, params);
+      this.emitNotification(ownerThreadId, method, params);
     }
+  }
+
+  private emitNotification(threadId: string, method: string, params: unknown): void {
+    this.notificationRing.push({
+      seq: ++this.notificationSequence,
+      threadId,
+      method,
+      params: structuredClone(params),
+    });
+    if (this.notificationRing.length > MAX_LIVE_NOTIFICATIONS) this.notificationRing.shift();
+    this.output.emit(threadId, method, params);
   }
 }
