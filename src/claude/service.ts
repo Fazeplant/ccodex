@@ -2234,7 +2234,7 @@ export class ClaudeService {
         path: null,
         cwd,
         cliVersion: "claude-code",
-        source: "appServer",
+        source: "vscode",
         threadSource: params.threadSource ?? null,
         agentNickname: null,
         agentRole: null,

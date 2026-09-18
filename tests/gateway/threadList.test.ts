@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { Thread } from "../../src/codex/generated/v2/Thread.js";
 import { ThreadCatalog, mergedThreadList } from "../../src/gateway/threadList.js";
 import { CursorCodec } from "../../src/protocol/cursor.js";
-import { filterSortThreads } from "../../src/store/threadFilter.js";
+import { filterSortThreads, publicListParams } from "../../src/store/threadFilter.js";
 
 function thread(id: string, createdAt: number, parentThreadId: string | null = null): Thread {
   return {
     id, extra: null, sessionId: id, forkedFromId: null, parentThreadId,
     canAcceptDirectInput: parentThreadId === null, preview: id, ephemeral: false, section: null, sectionEnteredAt: null, projectId: null,
     historyMode: "legacy", modelProvider: "claude", model: null, reasoningEffort: null, createdAt, updatedAt: createdAt, recencyAt: createdAt,
-    status: { type: "idle" }, path: null, cwd: "/repo", cliVersion: "test", source: "appServer",
+    status: { type: "idle" }, path: null, cwd: "/repo", cliVersion: "test", source: "vscode",
     threadSource: null, agentNickname: null, agentRole: null, gitInfo: null, name: id, turns: [],
   };
 }
@@ -17,9 +17,25 @@ function thread(id: string, createdAt: number, parentThreadId: string | null = n
 describe("merged thread listing", () => {
   it("applies source and ancestor filters", () => {
     const threads = [thread("root", 1), thread("child", 2, "root"), thread("grandchild", 3, "child")];
-    expect(filterSortThreads(threads, { sourceKinds: ["appServer"], ancestorThreadId: "root", sortDirection: "asc" }).map((item) => item.id))
+    expect(filterSortThreads(threads, { sourceKinds: ["vscode"], ancestorThreadId: "root", sortDirection: "asc" }).map((item) => item.id))
       .toEqual(["child", "grandchild"]);
     expect(() => filterSortThreads(threads, { parentThreadId: "root", ancestorThreadId: "root" })).toThrow("mutually exclusive");
+  });
+
+  it("lists only interactive sources by default, like stock, unless a relation filter is set", () => {
+    const main = { ...thread("main", 1), source: "vscode" as const };
+    const child = { ...thread("child", 2, "main"), source: { subAgent: { thread_spawn: {
+      parent_thread_id: "main", depth: 1, agent_path: null, agent_nickname: "child", agent_role: null,
+    } } } };
+    const mcp = { ...thread("mcp", 3), source: "appServer" as const };
+    const list = (params: Parameters<typeof publicListParams>[0]) =>
+      filterSortThreads([main, child, mcp], publicListParams(params)).map((item) => item.id);
+    expect(list({})).toEqual(["main"]);
+    expect(list({ sourceKinds: [] })).toEqual(["main"]);
+    expect(list({ parentThreadId: "main" })).toEqual(["child"]);
+    expect(list({ sourceKinds: ["appServer"] })).toEqual(["mcp"]);
+    // Internal store listings keep every source: loaded/search projections need children.
+    expect(filterSortThreads([main, child, mcp], {}).length).toBe(3);
   });
 
   it("treats legacy threads without source as unknown", () => {

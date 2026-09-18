@@ -36,7 +36,7 @@ function thread(id: string): Thread {
     path: null,
     cwd: "/tmp/project",
     cliVersion: "2.1.207",
-    source: "appServer",
+    source: "vscode",
     threadSource: null,
     agentNickname: null,
     agentRole: null,
@@ -152,6 +152,25 @@ describe("SqliteHybridStore", () => {
 
     const migrated = new SqliteHybridStore(path);
     expect(migrated.getThreadRecord("thread-1")?.thread).toMatchObject({ model: "claude:sonnet", reasoningEffort: "high" });
+    migrated.close();
+  });
+
+  it("relabels appServer Claude threads as vscode when migration 12 runs", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ccodex-store-thread-source-"));
+    directories.push(directory);
+    const path = join(directory, "state.sqlite");
+    const store = new SqliteHybridStore(path);
+    store.createThread(record());
+    store.close();
+
+    const legacy = new DatabaseSync(path);
+    legacy.prepare("UPDATE threads SET thread_json = json_set(thread_json, '$.source', 'appServer')").run();
+    legacy.prepare("DELETE FROM schema_migrations WHERE version = 12").run();
+    legacy.close();
+
+    const migrated = new SqliteHybridStore(path);
+    expect(migrated.getThreadRecord("thread-1")?.thread.source).toBe("vscode");
+    expect(migrated.listThreads({}).map((item) => item.id)).toEqual(["thread-1"]);
     migrated.close();
   });
 

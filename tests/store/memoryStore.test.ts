@@ -24,7 +24,7 @@ function record(): ClaudeThreadRecord {
     path: null,
     cwd: "/workspace",
     cliVersion: "claude-code",
-    source: "appServer",
+    source: "vscode",
     threadSource: null,
     agentNickname: null,
     agentRole: null,

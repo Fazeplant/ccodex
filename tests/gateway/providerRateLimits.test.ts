@@ -65,7 +65,7 @@ function stockThread(id: string) {
     preview: "hello", ephemeral: false, historyMode: "paginated", modelProvider: "openai",
     createdAt: 1_700_000_000, updatedAt: 1_700_000_100, recencyAt: 1_700_000_100,
     status: { type: "idle" }, path: null, cwd: "/tmp", cliVersion: "0.144.4",
-    source: "appServer", threadSource: "user", agentNickname: null, agentRole: null,
+    source: "vscode", threadSource: "user", agentNickname: null, agentRole: null,
     gitInfo: null, name: null,
     turns: [{
       id: "stock-turn", itemsView: "full", status: "completed", error: null,

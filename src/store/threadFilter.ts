@@ -14,6 +14,15 @@ export function cwdIdentity(value: string): string {
   }
 }
 
+/** Stock's default thread/list scope: interactive sessions (custom stock sources map to "unknown"). */
+const INTERACTIVE_SOURCE_KINDS: readonly ThreadSourceKind[] = ["cli", "vscode", "unknown"];
+
+/** Stock lists only interactive sources unless sourceKinds is given or a parent/ancestor filter is set. */
+export function publicListParams(params: ThreadListParams): ThreadListParams {
+  if (params.sourceKinds?.length || params.parentThreadId || params.ancestorThreadId) return params;
+  return { ...params, sourceKinds: [...INTERACTIVE_SOURCE_KINDS] };
+}
+
 function sourceKind(thread: Thread): ThreadSourceKind {
   if (typeof thread.source === "string") return thread.source;
   if (thread.source == null) return "unknown";

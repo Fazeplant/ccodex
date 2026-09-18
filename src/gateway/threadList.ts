@@ -12,7 +12,7 @@ import type { StockRpc } from "./stockRpc.js";
 import { CursorCodec, queryFingerprint } from "../protocol/cursor.js";
 import { invalidParams, invalidRequest } from "../protocol/errors.js";
 import type { StockSideThreads } from "./stockSideThreads.js";
-import { cwdIdentity, filterSortThreads } from "../store/threadFilter.js";
+import { cwdIdentity, filterSortThreads, publicListParams } from "../store/threadFilter.js";
 
 export interface ThreadCatalogProjection {
   projectThreadCatalog(stock: Thread[], claude: Thread[], params?: ThreadListParams): Thread[];
@@ -129,7 +129,7 @@ export class ThreadCatalog {
     const projected = this.logical
       ? this.logical.projectThreadCatalog(stockThreads, claudeCatalog, providerParams)
       : [...stockThreads, ...claudeCatalog];
-    return filterSortThreads(projected, params);
+    return filterSortThreads(projected, publicListParams(params));
   }
 
   public async list(params: ThreadListParams): Promise<ThreadListResponse> {

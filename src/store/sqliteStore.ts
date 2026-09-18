@@ -1136,6 +1136,17 @@ export class SqliteHybridStore implements HybridStore {
         `);
         this.database.exec("INSERT INTO schema_migrations(version) VALUES (11)");
       }
+      const interactiveSource = this.database.prepare("SELECT 1 FROM schema_migrations WHERE version = 12").get();
+      if (!interactiveSource) {
+        // Claude threads are listed like stock's own app-server threads (vscode), which
+        // stock's default thread/list source filter keeps; appServer it drops.
+        if (threadColumns.has("thread_json")) this.database.exec(`
+          UPDATE threads
+          SET thread_json = json_set(thread_json, '$.source', 'vscode')
+          WHERE json_extract(thread_json, '$.source') = 'appServer';
+        `);
+        this.database.exec("INSERT INTO schema_migrations(version) VALUES (12)");
+      }
       this.database.exec("DROP TABLE IF EXISTS items");
     });
   }

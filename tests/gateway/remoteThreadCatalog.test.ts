@@ -35,7 +35,7 @@ function thread(id: string, name: string, modelProvider = "openai"): Thread {
     path: null,
     cwd: "/workspace",
     cliVersion: "0.149.1",
-    source: "appServer",
+    source: "vscode",
     threadSource: "user",
     agentNickname: null,
     agentRole: null,
