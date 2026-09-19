@@ -132,7 +132,7 @@ import {
   stateModelName,
   type ThreadStateSnapshot,
 } from "../state/stateCommand.js";
-import { syncedCollaborationMode, threadSettings } from "./threadSettings.js";
+import { nativePermissions, syncedCollaborationMode, threadSettings } from "./threadSettings.js";
 import { claudeDeveloperInstructions } from "./developerInstructions.js";
 import { NativeSessionCatalog, type SessionSummary } from "./native/catalog.js";
 import type { TranscriptProjection } from "./native/projector.js";
@@ -299,23 +299,6 @@ function inheritedSandboxPolicy(
 
 function approvalsReviewer(value: ApprovalsReviewer | null | undefined, fallback: ApprovalsReviewer = "user"): ApprovalsReviewer {
   return value ?? fallback;
-}
-
-function nativePermissions(permissionMode: string | null, cwd: string): Pick<
-  ClaudeThreadRecord,
-  "approvalPolicy" | "approvalsReviewer" | "sandboxPolicy"
-> {
-  if (permissionMode === "bypassPermissions") {
-    return { approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: { type: "dangerFullAccess" } };
-  }
-  const workspace = sandboxPolicy("workspace-write", cwd);
-  if (permissionMode === "dontAsk") {
-    return { approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: workspace };
-  }
-  if (permissionMode === "auto") {
-    return { approvalPolicy: "on-request", approvalsReviewer: "auto_review", sandboxPolicy: workspace };
-  }
-  return { approvalPolicy: "on-request", approvalsReviewer: "user", sandboxPolicy: workspace };
 }
 
 function defaultFlags(sessionId: string, threadId = sessionId): ClaudeSessionFlags {

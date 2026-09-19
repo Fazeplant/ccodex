@@ -11,6 +11,7 @@ export interface TranscriptHeader {
   readonly aiTitle: string | null;
   readonly model: string | null;
   readonly reasoningEffort: string | null;
+  readonly serviceTier: string | null;
   readonly permissionMode: string | null;
   readonly cliVersion: string | null;
 }
@@ -18,8 +19,6 @@ export interface TranscriptHeader {
 export interface TranscriptSummaryState extends TranscriptHeader {
   readonly hasCreatedAt: boolean;
   readonly hasFirstPrompt: boolean;
-  readonly userPermissionMode: string | null;
-  readonly statePermissionMode: string | null;
 }
 
 export function timestampSeconds(timestamp: string | undefined): number | null {
@@ -59,13 +58,18 @@ const EMPTY_STATE: TranscriptSummaryState = {
   aiTitle: null,
   model: null,
   reasoningEffort: null,
+  serviceTier: null,
   permissionMode: null,
   cliVersion: null,
   hasCreatedAt: false,
   hasFirstPrompt: false,
-  userPermissionMode: null,
-  statePermissionMode: null,
 };
+
+function serviceTier(record: TranscriptRecord): string | null {
+  if (record.type !== "assistant" || record.message.stop_reason === null
+    || record.message.stop_reason === undefined) return null;
+  return record.message.usage?.service_tier === "priority" ? "fast" : null;
+}
 
 type MutableSummaryState = { -readonly [Key in keyof TranscriptSummaryState]: TranscriptSummaryState[Key] };
 
@@ -97,19 +101,20 @@ export class TranscriptSummarizer {
         this.state.preview = userText(record).trim();
         this.state.hasFirstPrompt = true;
       }
-      if (record.permissionMode !== undefined) this.state.userPermissionMode = record.permissionMode;
+      if (record.permissionMode !== undefined) this.state.permissionMode = record.permissionMode;
     } else if (record.type === "assistant") {
       if (record.message.model !== undefined) this.state.model = record.message.model;
       if (record.effort !== undefined) this.state.reasoningEffort = record.effort;
+      if (record.message.stop_reason !== null && record.message.stop_reason !== undefined) {
+        this.state.serviceTier = serviceTier(record);
+      }
     } else if (record.type === "custom-title") {
       this.state.customTitle = record.customTitle ?? null;
     } else if (record.type === "ai-title") {
       this.state.aiTitle = record.aiTitle ?? null;
     } else if (record.type === "permission-mode" && typeof record.permissionMode === "string") {
-      // Real Claude transcripts persist this state as `permissionMode`; it overrides user.permissionMode.
-      this.state.statePermissionMode = record.permissionMode;
+      this.state.permissionMode = record.permissionMode;
     }
-    this.state.permissionMode = this.state.statePermissionMode ?? this.state.userPermissionMode;
   }
 
   public snapshot(): TranscriptSummaryState {
@@ -127,6 +132,7 @@ export class TranscriptSummarizer {
       aiTitle: this.state.aiTitle,
       model: this.state.model,
       reasoningEffort: this.state.reasoningEffort,
+      serviceTier: this.state.serviceTier,
       permissionMode: this.state.permissionMode,
       cliVersion: this.state.cliVersion,
     };
