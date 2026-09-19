@@ -5,7 +5,6 @@ import type { ThreadItem } from "../../codex/generated/v2/ThreadItem.js";
 import type { Turn } from "../../codex/generated/v2/Turn.js";
 import type { UserInput } from "../../codex/generated/v2/UserInput.js";
 import type { TokenUsageBreakdown } from "../../codex/generated/v2/TokenUsageBreakdown.js";
-import type { TurnProviderBoundary } from "../../store/HybridStore.js";
 import { normalizeClaudeModelIdentifier } from "../modelSelection.js";
 import {
   projectToolCompletion,
@@ -45,6 +44,12 @@ export interface ProjectTranscriptInput {
     readonly nickname: string;
     readonly depth: number;
   };
+}
+
+/** Last chain record of a projected turn; the native rollback anchor. */
+export interface TurnProviderBoundary {
+  readonly turnId: string;
+  readonly messageUuid: string;
 }
 
 export interface TranscriptProjection {

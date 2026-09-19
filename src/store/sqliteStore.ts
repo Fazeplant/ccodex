@@ -846,19 +846,6 @@ export class SqliteHybridStore implements HybridStore {
           DROP TABLE IF EXISTS pending_requests;
           DROP TABLE IF EXISTS thread_queues;
           DROP INDEX IF EXISTS turns_last_claude_message_uuid;
-          CREATE TABLE turns_v14 (
-            id TEXT NOT NULL,
-            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-            ordinal INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            turn_json TEXT NOT NULL,
-            PRIMARY KEY(thread_id, id),
-            UNIQUE(thread_id, ordinal)
-          );
-          INSERT INTO turns_v14 (id, thread_id, ordinal, status, turn_json)
-          SELECT id, thread_id, ordinal, status, turn_json FROM turns;
-          DROP TABLE turns;
-          ALTER TABLE turns_v14 RENAME TO turns;
           INSERT INTO schema_migrations(version) VALUES (14);
         `);
       }

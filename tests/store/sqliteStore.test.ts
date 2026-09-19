@@ -87,8 +87,6 @@ describe("SqliteHybridStore retained contracts", () => {
       .map((row) => row.name);
     for (const removed of ["events", "provider_events", "processed_provider_events",
       "provider_item_correlations", "pending_requests", "thread_queues"]) expect(names).not.toContain(removed);
-    const columns = (database.prepare("PRAGMA table_info(turns)").all() as Array<{ name: string }>).map((row) => row.name);
-    expect(columns).not.toContain("last_claude_message_uuid");
     database.close();
     const reopened = new SqliteHybridStore(path);
     expect(reopened.listTurns("thread-1")).toEqual([turn]);

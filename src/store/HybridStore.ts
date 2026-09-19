@@ -5,6 +5,9 @@ import type { ThreadGoal } from "../codex/generated/v2/ThreadGoal.js";
 import type { TokenUsageBreakdown } from "../codex/generated/v2/TokenUsageBreakdown.js";
 import type { ApprovalsReviewer } from "../codex/generated/v2/ApprovalsReviewer.js";
 import type { ThreadSection } from "../codex/generated/v2/ThreadSection.js";
+import type { TurnProviderBoundary } from "../claude/native/projector.js";
+
+export type { TurnProviderBoundary };
 
 export interface InternalGoal extends ThreadGoal {
   readonly goalId: string;
@@ -119,11 +122,6 @@ export interface StateEvent {
   readonly params: unknown;
   readonly providerEventType?: string | null;
   readonly providerEventId?: string | null;
-}
-
-export interface TurnProviderBoundary {
-  readonly turnId: string;
-  readonly messageUuid: string;
 }
 
 export interface PendingThreadRemoval {
