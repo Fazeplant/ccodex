@@ -578,6 +578,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private notificationSequence = 0;
   private readonly notificationRing: ClaudeLiveNotification[] = [];
   private runtimeGeneration: number | undefined;
+  private rollbackResume: { readonly anchorUuid: string; readonly dropsTurnUuid: string } | undefined;
   private readonly scopes = new Map<string, MainStreamState>();
   private readonly tasks = new Map<string, ScopeTask>();
   private readonly codexMcpTailers = new Map<string, CodexMcpTailer>();
@@ -596,7 +597,6 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   }) | undefined;
   private automaticCompaction: {
     readonly turnId: string;
-    readonly itemId: string;
     readonly runtimeGeneration: number;
   } | undefined;
   private readonly compactionActions: CompactionTransportAction[] = [];
@@ -1085,6 +1085,10 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       runtimeGeneration: generation,
       providerSessionId: record.claudeSessionId,
       resume: resumeOverride ?? record.lastClaudeMessageUuid !== null,
+      ...(this.rollbackResume ? {
+        resumeSessionAt: this.rollbackResume.anchorUuid,
+        resumeDropsTurn: this.rollbackResume.dropsTurnUuid,
+      } : {}),
       cwd: record.thread.cwd,
       runtimeWorkspaceRoots: runtimeWorkspaceRoots(record),
       ephemeral: record.thread.ephemeral,
@@ -4475,19 +4479,13 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         this.lastPublishedUsage = this.usageKey(record);
         return record;
       }
-      case "commitRollback": {
+      case "applyRollback": {
         const current = this.requireRecord(false);
         const retained = [...command.retainedTurns];
-        const boundaries = remapBoundaries(
-          command.sourceBoundaries,
-          command.uuidMap,
-          new Set(retained.map((turn) => turn.id)),
-        );
         const now = Math.floor(Date.now() / 1_000);
         const record = {
           ...current,
-          claudeSessionId: command.replacementSessionId,
-          lastClaudeMessageUuid: boundaries.at(-1)?.messageUuid ?? null,
+          lastClaudeMessageUuid: command.anchorUuid ?? null,
           lastCompletedTurnId: retained.at(-1)?.id ?? null,
           thread: {
             ...current.thread,
@@ -4500,8 +4498,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         const retainedChildIds = childProjectionIds(retained);
         const removed = new Set([...this.childProjections.keys()].filter((id) => !retainedChildIds.has(id)));
         const removedThreadIds = [...removed].reverse();
-        this.repository.commitRollback(record, removedThreadIds);
         this.record = record;
+        this.activeTurn = this.lastCompletedTurn = undefined;
+        this.rollbackResume = command.anchorUuid && command.resumeDropsTurn
+          ? { anchorUuid: command.anchorUuid, dropsTurnUuid: command.resumeDropsTurn }
+          : undefined;
         this.runtimeGeneration = undefined;
         this.disposeRuntimeOperations();
         this.scopes.clear();
@@ -4513,6 +4514,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         }
         return { ...record, thread: { ...record.thread, turns: retained } };
       }
+      case "clearRollbackResume":
+        if (this.rollbackResume?.anchorUuid === command.anchorUuid) this.rollbackResume = undefined;
+        return undefined;
       case "deleteBranchTarget":
       case "purgeStartupProjection": {
         this.repository.delete(this.threadId);
@@ -5591,7 +5595,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         };
       case "autoCompactStarted":
         if (command.runtimeGeneration !== this.runtimeGeneration) return undefined;
-        return this.startAutomaticCompaction(command.runtimeGeneration, command.source);
+        return this.startAutomaticCompaction(command.runtimeGeneration);
       case "compactBoundary":
         if (command.runtimeGeneration !== this.runtimeGeneration) return undefined;
         if (command.trigger === "auto") return this.projectAutomaticCompaction(command.boundary, command.source);
@@ -5613,7 +5617,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       }
       case "compactFailed":
         if (command.runtimeGeneration !== this.runtimeGeneration) return undefined;
-        if (!this.compaction) return this.completeAutomaticCompaction(command.source);
+        if (!this.compaction) return this.completeAutomaticCompaction();
         if (this.compaction.cancellation) return this.compactionProjection();
         return this.completeCompaction("failed", command.message, command.codexErrorInfo, command.source);
       case "compactWatchdogFired": {
@@ -5892,11 +5896,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     }
     invalidateGoalEffect(this.goal);
     this.suppressNextPostCompactHook = hidden;
-    const item: Extract<ThreadItem, { type: "contextCompaction" }> = {
-      type: "contextCompaction", id: uuidv7(),
-    };
     const messageUuid = uuidv7();
-    const { turn } = this.startTurn([item], {}, messageUuid, !hidden);
+    const { turn } = this.startTurn([], {}, messageUuid, !hidden);
     const operationId = uuidv7();
     const runtimeGeneration = this.runtimeGeneration;
     const watchdog = setTimeout(() => {
@@ -5965,28 +5966,20 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       ? this.turnFor(this.threadId, automatic.turnId)
       : this.activeNormalTurn(record);
     if (!turn) return undefined;
-    const item = automatic
-      ? turn.items.find((candidate) => candidate.id === automatic.itemId)
-      : undefined;
     const completedItem: Extract<ThreadItem, { type: "contextCompaction" }> = {
       type: "contextCompaction",
       id: boundary,
     };
-    const projectedTurn: Turn = {
-      ...turn,
-      items: item
-        ? turn.items.map((candidate) => candidate.id === item.id ? completedItem : candidate)
-        : [...turn.items, completedItem],
-    };
+    turn.items.push(completedItem);
     const updated = { ...record, lastClaudeMessageUuid: boundary };
     this.commitState(updated, [
-      ...(!item ? [{
+      {
         turnId: turn.id,
         method: "item/started",
         params: { item: completedItem, threadId: this.threadId, turnId: turn.id, startedAtMs: Date.now() },
         providerEventId: source.providerEventId,
         providerEventType: source.providerEventType,
-      }] : []),
+      },
       {
         turnId: turn.id,
         method: "item/completed",
@@ -6001,13 +5994,13 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         providerEventId: source.providerEventId,
         providerEventType: source.providerEventType,
       },
-    ], projectedTurn);
+    ], turn);
     if (automatic) this.automaticCompaction = undefined;
     return { turnId: turn.id, terminal: false };
   }
 
   private startAutomaticCompaction(
-    runtimeGeneration: number, source: RuntimeFactSource,
+    runtimeGeneration: number,
   ): CompactionProjection | undefined {
     if (this.compaction) return this.compactionProjection();
     const turn = this.activeNormalTurn();
@@ -6015,34 +6008,15 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     if (this.automaticCompaction?.turnId === turn.id) {
       return { turnId: turn.id, terminal: false };
     }
-    const item: Extract<ThreadItem, { type: "contextCompaction" }> = {
-      type: "contextCompaction",
-      id: uuidv7(),
-    };
-    turn.items.push(item);
-    this.publishTurn(turn, "item/started", {
-      item, threadId: this.threadId, turnId: turn.id, startedAtMs: Date.now(),
-    }, source);
-    this.automaticCompaction = { turnId: turn.id, itemId: item.id, runtimeGeneration };
+    this.automaticCompaction = { turnId: turn.id, runtimeGeneration };
     return { turnId: turn.id, terminal: false };
   }
 
-  private completeAutomaticCompaction(source: RuntimeFactSource): CompactionProjection | undefined {
+  private completeAutomaticCompaction(): CompactionProjection | undefined {
     const automatic = this.automaticCompaction;
     if (!automatic) return undefined;
-    const record = this.requireRecord(false);
-    const turn = this.turnFor(this.threadId, automatic.turnId);
-    const item = turn?.items.find((candidate) => candidate.id === automatic.itemId);
-    if (!turn || item?.type !== "contextCompaction") return undefined;
-    this.commitState(record, [{
-      turnId: turn.id,
-      method: "item/completed",
-      params: { item, threadId: this.threadId, turnId: turn.id, completedAtMs: Date.now() },
-      providerEventId: source.providerEventId,
-      providerEventType: source.providerEventType,
-    }], turn);
     this.automaticCompaction = undefined;
-    return { turnId: turn.id, terminal: false };
+    return { turnId: automatic.turnId, terminal: false };
   }
 
   private completeCompaction(
@@ -6055,20 +6029,21 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const operation = this.compaction;
     if (!operation) return undefined;
     const active = this.turnFor(this.threadId, operation.turnId)!;
-    const placeholder = active.items[0]!;
     const item = status === "completed" && boundary
       ? { type: "contextCompaction" as const, id: boundary }
-      : placeholder;
-    const projected = item.id === placeholder.id
-      ? active
-      : { ...active, items: active.items.map((candidate) => candidate.id === placeholder.id ? item : candidate) };
+      : undefined;
+    const projected = item ? { ...active, items: [...active.items, item] } : active;
     const turn = this.terminalTurn(projected, status, errorMessage, codexErrorInfo);
     const completed = this.finishTurn(turn, source, true, [
-      {
+      ...(item ? [{
+        turnId: turn.id,
+        method: "item/started",
+        params: { item, threadId: this.threadId, turnId: turn.id, startedAtMs: Date.now() },
+      }, {
         turnId: turn.id,
         method: "item/completed",
         params: { item, threadId: this.threadId, turnId: turn.id, completedAtMs: Date.now() },
-      },
+      }] : []),
       ...(status === "completed" ? [{
         turnId: turn.id,
         method: "thread/compacted",
@@ -6186,20 +6161,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         updatedAt: turn.completedAt!, recencyAt: turn.completedAt,
       },
     };
-    const automatic = this.automaticCompaction?.turnId === turn.id
-      ? this.automaticCompaction
-      : undefined;
-    const automaticItem = automatic
-      ? turn.items.find((item) => item.id === automatic.itemId)
-      : undefined;
     const events: StateEvent[] = [
-      ...(automaticItem?.type === "contextCompaction" ? [{
-        turnId: turn.id,
-        method: "item/completed",
-        params: { item: automaticItem, threadId: this.threadId, turnId: turn.id, completedAtMs: Date.now() },
-        providerEventId: source.providerEventId,
-        providerEventType: source.providerEventType,
-      }] : []),
       ...terminalEvents.map((event) => ({
         ...event,
         providerEventId: event.providerEventId ?? source.providerEventId,
@@ -6230,7 +6192,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     this.lastCompletedTurn = turn;
     this.activeTurn = undefined;
     this.commitState(updated, events, turn, emitEvents);
-    if (automatic) this.automaticCompaction = undefined;
+    if (this.automaticCompaction?.turnId === turn.id) this.automaticCompaction = undefined;
     return { record: updated, turn };
   }
 

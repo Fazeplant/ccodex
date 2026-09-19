@@ -110,7 +110,7 @@ describe("ClaudeService", () => {
     const durableWrites = [
       "createThread", "updateThread", "setSessionFlags", "setSectionOrder",
       "setThreadArchived", "commitThreadsArchived", "beginThreadRemoval", "cancelThreadRemoval",
-      "commitThreadRemoval", "deleteThread", "commitForkedThread", "commitThreadRollback",
+      "commitThreadRemoval", "deleteThread", "commitForkedThread",
       "setGoal", "clearGoal", "accountGoalUsage",
     ].map((method) => vi.spyOn(store, method as keyof SqliteHybridStore));
     const rename = vi.fn(async () => undefined);
@@ -5046,9 +5046,9 @@ You are in a side conversation, not the main thread.`,
     vi.useFakeTimers({ toFake: ["setTimeout"] });
     await service.compactThread(started.thread.id);
     const inProgress = service.readThread(started.thread.id, true).thread.turns[0]!;
-    expect(inProgress).toMatchObject({ status: "inProgress", items: [{ type: "contextCompaction" }] });
+    expect(inProgress).toMatchObject({ status: "inProgress", items: [] });
     expect(events.map((event) => event.method)).toEqual([
-      "thread/status/changed", "turn/started", "item/started",
+      "thread/status/changed", "turn/started",
     ]);
 
     await vi.advanceTimersByTimeAsync(143_000);
@@ -5065,7 +5065,6 @@ You are in a side conversation, not the main thread.`,
         type: "contextCompaction",
       }],
     });
-    expect(completed.items[0]!.id).not.toBe(inProgress.items[0]!.id);
     expect(events.find((event) => event.method === "thread/tokenUsage/updated")?.params).toMatchObject({
       tokenUsage: { total: { totalTokens: 0 }, last: { totalTokens: 24 }, modelContextWindow: 200_000 },
     });
@@ -5245,10 +5244,9 @@ You are in a side conversation, not the main thread.`,
         type: "text",
         text: mode === "manual" ? "/compact" : "/compact retain the durable seed",
       }]);
-      expect(events.slice(0, 3).map((event) => event.method)).toEqual([
+      expect(events.slice(0, 2).map((event) => event.method)).toEqual([
         "thread/status/changed",
         "turn/started",
-        "item/started",
       ]);
       expect(events.some((event) => event.method === "error")).toBe(false);
 
@@ -5282,7 +5280,7 @@ You are in a side conversation, not the main thread.`,
     const prepared = await service.preparePromptedCompact(started.thread.id, command);
     expect(prepared.response.turn).toMatchObject({
       status: "inProgress",
-      items: [{ type: "contextCompaction" }],
+      items: [],
     });
     expect(events.map((event) => event.method)).toEqual(["thread/status/changed"]);
     expect(fake.prompts).toHaveLength(0);
@@ -5291,7 +5289,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(() => fake.prompts.length === 1, "prompted compact provider command");
     expect(fake.prompts[0]?.message.content).toEqual([{ type: "text", text: command }]);
     expect(events.map((event) => event.method)).toEqual([
-      "thread/status/changed", "turn/started", "item/started",
+      "thread/status/changed", "turn/started",
     ]);
     await expect(service.steerTurn({
       threadId: started.thread.id,
@@ -5339,7 +5337,7 @@ You are in a side conversation, not the main thread.`,
     await service.interruptTurn({ threadId: started.thread.id, turnId });
     await service.interruptTurn({ threadId: started.thread.id, turnId });
     expect(service.readThread(started.thread.id, true).thread.turns).toEqual([
-      expect.objectContaining({ id: turnId, status: "interrupted", items: [expect.objectContaining({ type: "contextCompaction" })] }),
+      expect.objectContaining({ id: turnId, status: "interrupted", items: [] }),
     ]);
     expect(events.filter((event) => event.method === "turn/completed")).toHaveLength(1);
     expect(events.some((event) => event.method === "thread/compacted" || event.method === "error")).toBe(false);
@@ -5373,7 +5371,7 @@ You are in a side conversation, not the main thread.`,
       "provider-declared compaction failure",
     );
     expect(service.readThread(started.thread.id, true).thread.turns[0]).toMatchObject({
-      status: "failed", error: { message: "Provider refused compaction." }, items: [{ type: "contextCompaction" }],
+      status: "failed", error: { message: "Provider refused compaction." }, items: [],
     });
     expect(events.filter((event) => event.method === "error")).toHaveLength(1);
     expect(events.filter((event) => event.method === "thread/compacted")).toHaveLength(0);
@@ -5458,7 +5456,7 @@ You are in a side conversation, not the main thread.`,
     const inProgress = service.readThread(started.thread.id, true).thread.turns[0]!;
     const resumed = await service.resumeThread({ threadId: started.thread.id, excludeTurns: false });
     expect(resumed.thread.turns).toEqual([expect.objectContaining({
-      id: inProgress.id, status: "inProgress", items: [expect.objectContaining({ id: inProgress.items[0]!.id })],
+      id: inProgress.id, status: "inProgress", items: [],
     })]);
     hub.subscribe(started.thread.id, "second", (method) => second.push(method));
 
@@ -6131,6 +6129,7 @@ You are in a side conversation, not the main thread.`,
     const service = new ClaudeService(
       config(directory), hub, new Logger("error"),
       new SqliteHybridStore(join(directory, "state.sqlite")), fake.factory,
+      undefined, undefined, immediateCompactionBoundary,
     );
     const started = await service.startThread({
       model: "claude:claude-fable-5", cwd: directory, approvalPolicy: "never", sandbox: "danger-full-access",
@@ -6181,6 +6180,10 @@ You are in a side conversation, not the main thread.`,
       model: "claude-opus-4-8", effort: "high", settings: { fastMode: true },
     });
     await service.compactThread(started.thread.id);
+    await waitFor(
+      () => service.readThread(started.thread.id, true).thread.turns.at(-1)?.status === "completed",
+      "captured mobile compact completion",
+    );
     expect(service.readThread(started.thread.id, true).thread.turns.at(-1)?.items)
       .toContainEqual(expect.objectContaining({ type: "contextCompaction" }));
     await service.close();

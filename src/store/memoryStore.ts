@@ -150,14 +150,6 @@ export class MemoryHybridStore implements HybridStore {
     this.createThread(record);
     if (inheritedGoal) this.goals.set(record.thread.id, copy(inheritedGoal));
   }
-  public commitThreadRollback(
-    record: ClaudeThreadRecord,
-    removedThreadIds: readonly string[] = [],
-  ): void {
-    for (const threadId of removedThreadIds) this.deleteThread(threadId);
-    this.updateThread(record);
-  }
-
   public sectionOrders(): Map<string, string[]> {
     return new Map([...this.sectionOrderBySection].map(([sectionId, ids]) => [sectionId, [...ids]]));
   }
@@ -288,12 +280,6 @@ export class LayeredHybridStore implements HybridStore {
   ): void {
     (this.persistent(record) ? this.durable : this.ephemeral)
       .commitForkedThread(record, inheritedGoal);
-  }
-  public commitThreadRollback(
-    record: ClaudeThreadRecord,
-    removedThreadIds: readonly string[] = [],
-  ): void {
-    this.owner(record.thread.id).commitThreadRollback(record, removedThreadIds);
   }
   public sectionOrders(): Map<string, string[]> { return this.durable.sectionOrders(); }
   public setSectionOrder(sectionId: string, threadIds: readonly string[]): void { this.durable.setSectionOrder(sectionId, threadIds); }

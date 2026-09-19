@@ -445,6 +445,8 @@ export class ClaudeService {
   private readonly transientThreadIds = new Set<string>();
   private readonly projectedRecords = new Map<string, ClaudeThreadRecord>();
   private readonly projectedBoundaries = new Map<string, readonly TurnProviderBoundary[]>();
+  private readonly rollbackAnchors = new Map<string, string>();
+  private readonly resetSessions = new Set<string>();
   private readonly projectionRefreshes = new Map<string, Promise<void>>();
   private readonly sessionOutput: ClaudeOutputAdapter;
   private readonly sessions: ClaudeSessionRegistry<ClaudeSessionCommand, ClaudeSession>;
@@ -627,6 +629,7 @@ export class ClaudeService {
 
   private missingNativeTranscript(threadId: string): boolean {
     return existsSync(this.config.claudeProjectsDir)
+      && !this.resetSessions.has(threadId)
       && !this.catalogSession(threadId)
       && this.store.listTurns(threadId).length > 0;
   }
@@ -827,9 +830,9 @@ export class ClaudeService {
     };
   }
 
-  private refreshProjection(threadId: string): Promise<void> {
+  private refreshProjection(threadId: string, completedTurnId?: string): Promise<void> {
     const existing = this.projectionRefreshes.get(threadId);
-    if (existing) return existing.then(() => this.refreshProjection(threadId));
+    if (existing) return existing.then(() => this.refreshProjection(threadId, completedTurnId));
     const sessionId = this.sessionId(threadId) ?? threadId;
     const refresh = this.catalog.refresh(sessionId).then(async () => {
       const summary = this.catalogSession(threadId);
@@ -838,7 +841,21 @@ export class ClaudeService {
         this.projectedBoundaries.delete(threadId);
         return;
       }
-      const projection = await this.catalog.projection(summary.sessionId);
+      const natural = await this.catalog.projection(summary.sessionId);
+      const anchorUuid = this.rollbackAnchors.get(threadId);
+      const advanced = Boolean(anchorUuid && completedTurnId
+        && natural.turns.some((turn) => turn.id === completedTurnId)
+        && natural.selectedRecordUuids.has(anchorUuid));
+      if (advanced) {
+        this.rollbackAnchors.delete(threadId);
+        await this.sessions.resolvedSession(threadId)?.submit({ type: "clearRollbackResume", anchorUuid: anchorUuid! });
+      }
+      if (completedTurnId && natural.turns.some((turn) => turn.id === completedTurnId)) {
+        this.resetSessions.delete(threadId);
+      }
+      const projection = anchorUuid && !advanced
+        ? await this.catalog.projection(summary.sessionId, anchorUuid)
+        : natural;
       this.projectedRecords.set(threadId, this.catalogRecord(summary, projection));
       this.projectedBoundaries.set(threadId, projection.turnBoundaries);
       this.claim(summary.sessionId);
@@ -883,7 +900,9 @@ export class ClaudeService {
     if (child || stored?.thread.parentThreadId) {
       return [...(child?.turns ?? this.store.listTurns(threadId))];
     }
-    const projected = this.projectedRecords.get(threadId)?.thread.turns;
+    const projected = this.resetSessions.has(threadId)
+      ? []
+      : this.projectedRecords.get(threadId)?.thread.turns;
     const active = session?.liveSnapshot().activeTurn;
     if (!projected) {
       const storedTurns = this.store.listTurns(threadId);
@@ -1772,6 +1791,8 @@ export class ClaudeService {
     if (sessionId) this.writeFlags(defaultFlags(sessionId));
     this.stickySessions.delete(threadId);
     this.transientThreadIds.delete(threadId);
+    this.rollbackAnchors.delete(threadId);
+    this.resetSessions.delete(threadId);
     await this.catalog.refresh();
     if (notifyDeleted) this.sessionOutput.threadDeleted(threadId);
     return {};
@@ -2024,7 +2045,6 @@ export class ClaudeService {
 
   public async rollbackThread(params: ThreadRollbackParams): Promise<ThreadRollbackResponse> {
     const source = await this.truncationSource(params.threadId, "roll back");
-    if (source.record.thread.historyMode === "paginated") throw invalidRequest("paginated threads do not support thread/rollback");
     if (!Number.isInteger(params.numTurns) || params.numTurns < 1) throw invalidParams("numTurns must be at least 1.");
     if (params.numTurns > source.record.thread.turns.length)
       throw invalidParams("Cannot remove more turns than the Claude thread contains.");
@@ -2054,40 +2074,38 @@ export class ClaudeService {
     return { ...snapshot, session };
   }
 
-  /** Keeps the first `keepCount` turns by forking the transcript at the last retained provider boundary. */
+  /** Keeps the first `keepCount` turns and resumes the same native session at their final chain record. */
   private async truncateThread(source: TruncationSource, keepCount: number): Promise<ClaudeThreadRecord> {
     const sourceRecord = source.record;
     const threadId = sourceRecord.thread.id;
-    const retainedIds = new Set(sourceRecord.thread.turns.slice(0, keepCount).map((turn) => turn.id));
+    const retainedTurns = sourceRecord.thread.turns.slice(0, keepCount);
+    const retainedIds = new Set(retainedTurns.map((turn) => turn.id));
     const sourceBoundaries = source.boundaries.filter((entry) => retainedIds.has(entry.turnId));
-    const boundary = sourceBoundaries.at(-1)?.messageUuid;
-    const branch = boundary
-      ? await this.transcripts.forkWithProvenance(sourceRecord.claudeSessionId, boundary, sourceRecord.thread.cwd,
-        sourceBoundaries.map((entry) => entry.messageUuid),
-        new Map())
-      : { sessionId: uuidv7(), uuidMap: new Map<string, string>() };
+    const anchorUuid = sourceBoundaries.at(-1)?.messageUuid;
+    const resumeDropsTurn = sourceRecord.thread.turns[keepCount]!.id;
     const current = await this.branchSnapshot(threadId);
     if (current.revision !== source.revision) {
-      await this.transcripts.delete(branch.sessionId, sourceRecord.thread.cwd).catch(() => undefined);
       throw invalidParams("Claude thread changed while rollback was being prepared; retry the rollback.");
     }
-    let committed: ClaudeThreadRecord;
-    try {
-      committed = await this.sessions.submit(threadId, {
-        type: "commitRollback", replacementSessionId: branch.sessionId,
-        retainedTurns: sourceRecord.thread.turns.slice(0, keepCount), sourceBoundaries, uuidMap: [...branch.uuidMap],
+    let committed!: ClaudeThreadRecord;
+    await source.session.withRuntimeAdmin(async () => {
+      await source.session.retireRuntimeSilently();
+      if (anchorUuid) {
+        this.rollbackAnchors.set(threadId, anchorUuid);
+        this.resetSessions.delete(threadId);
+      } else {
+        await this.deleteProviderSession(sourceRecord.claudeSessionId, sourceRecord.thread.cwd);
+        this.rollbackAnchors.delete(threadId);
+        this.resetSessions.add(threadId);
+      }
+      committed = await this.sessions.submit<ClaudeThreadRecord>(threadId, {
+        type: "applyRollback",
+        retainedTurns,
+        ...(anchorUuid ? { anchorUuid, resumeDropsTurn } : {}),
       });
-    } catch (error) {
-      await this.transcripts.delete(branch.sessionId, sourceRecord.thread.cwd).catch(() => undefined);
-      throw error;
-    }
-    if (source.session.isLoaded) {
-      await source.session.retireRuntimeSilently().catch((error) => {
-        this.logger.warn("claude.rollback.old-runtime-retire-failed", { threadId, error: String(error) });
-      });
-    }
-    await this.transcripts.delete(sourceRecord.claudeSessionId, sourceRecord.thread.cwd).catch((error) =>
-      this.logger.warn("claude.rollback.old-session-delete-failed", { threadId, error: String(error) }));
+      await this.refreshProjection(threadId);
+      if (anchorUuid) await source.session.materializeRuntime();
+    });
     return committed;
   }
 
@@ -2211,7 +2229,7 @@ export class ClaudeService {
   private onSessionLifecycle(threadId: string, update: SessionLifecycleUpdate): void {
     if (update.completed) {
       if (update.completed.turn.status !== "interrupted") this.queueDrainPending.add(threadId);
-      void this.refreshProjection(threadId).catch((error: unknown) => {
+      void this.refreshProjection(threadId, update.completed.turn.id).catch((error: unknown) => {
         this.logger.warn("claude.catalog.turn-refresh-failed", { threadId, error: String(error) });
       });
     }
@@ -2402,6 +2420,8 @@ export class ClaudeService {
     this.transientThreadIds.delete(threadId);
     this.projectedRecords.delete(threadId);
     this.projectedBoundaries.delete(threadId);
+    this.rollbackAnchors.delete(threadId);
+    this.resetSessions.delete(threadId);
     if (await session.mayRelease()) await this.sessions.retire(threadId);
   }
 
@@ -2507,6 +2527,8 @@ export class ClaudeService {
     this.transientThreadIds.delete(rootThreadId);
     this.projectedRecords.delete(rootThreadId);
     this.projectedBoundaries.delete(rootThreadId);
+    this.rollbackAnchors.delete(rootThreadId);
+    this.resetSessions.delete(rootThreadId);
     await this.sessions.retire(rootThreadId).catch((error) => {
       this.logger.warn("claude.thread-removal.session-retire-failed", {
         threadId: rootThreadId,

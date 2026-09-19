@@ -35,6 +35,7 @@ import {
 export interface ProjectTranscriptInput {
   readonly sessionId: string;
   readonly path: string;
+  readonly leafUuid?: string;
   readonly records?: readonly TranscriptRecord[];
   readonly history?: SelectedHistory;
   readonly header?: TranscriptHeader;
@@ -54,6 +55,8 @@ export interface TranscriptProjection {
   readonly skippedLines: number;
   readonly compactionBoundaries: ReadonlySet<string>;
   readonly turnBoundaries: readonly TurnProviderBoundary[];
+  readonly selectedLeafUuid: string | null;
+  readonly selectedRecordUuids: ReadonlySet<string>;
 }
 
 function projectedUsage(records: readonly TranscriptChainRecord[]): TokenUsageBreakdown {
@@ -345,7 +348,8 @@ function turnStatus(records: readonly TranscriptChainRecord[], hasFollowingTurn:
   if (failed) return "failed";
   const lastAssistant = records.findLast((record): record is AssistantRecord => record.type === "assistant");
   const stopReason = lastAssistant?.message.stop_reason;
-  const terminal = stopReason !== null && stopReason !== undefined && !NON_TERMINAL_STOPS.has(stopReason);
+  const terminal = isCompactBoundary(records.at(-1)!)
+    || stopReason !== null && stopReason !== undefined && !NON_TERMINAL_STOPS.has(stopReason);
   return terminal || hasFollowingTurn ? "completed" : "inProgress";
 }
 
@@ -370,7 +374,12 @@ function projectTurns(
     const end = starts[turnIndex + 1] ?? records.length;
     const prompt = records[start] as UserRecord;
     const turnRecords = records.slice(start, end);
-    const items: ThreadItem[] = [{ type: "userMessage", id: prompt.uuid, clientId: null, content: userInputs(prompt) }];
+    const input = userInputs(prompt);
+    const manualCompaction = input.length === 1 && input[0]?.type === "text"
+      && /^\/compact(?:\s|$)/u.test(input[0].text);
+    const items: ThreadItem[] = manualCompaction
+      ? []
+      : [{ type: "userMessage", id: prompt.uuid, clientId: null, content: input }];
     const responses = new Map<string, AssistantRecord[]>();
     for (const record of turnRecords) {
       if (record.type !== "assistant") continue;
@@ -415,9 +424,8 @@ function projectTurnBoundaries(
     record.type === "user" && startsTurn(record, subagentPromptUuid) ? [index] : []);
   return starts.flatMap((start, turnIndex) => {
     const prompt = records[start] as UserRecord;
-    const assistant = records.slice(start, starts[turnIndex + 1] ?? records.length)
-      .findLast((record): record is AssistantRecord => record.type === "assistant");
-    return assistant ? [{ turnId: prompt.uuid, messageUuid: assistant.uuid }] : [];
+    const boundary = records.slice(start + 1, starts[turnIndex + 1] ?? records.length).at(-1);
+    return boundary ? [{ turnId: prompt.uuid, messageUuid: boundary.uuid }] : [];
   });
 }
 
@@ -433,7 +441,7 @@ export async function projectTranscript(input: ProjectTranscriptInput): Promise<
     skippedLines = reader.skippedLines;
     rawRecords = loaded;
   }
-  const history = input.history ?? selectHistory(rawRecords);
+  const history = input.history ?? selectHistory(rawRecords, input.leafUuid);
   const selected = history.records;
   const header = input.header ?? summarizeTranscript(rawRecords, input.subagent?.promptRecordUuid);
   const turns = projectTurns(selected, header.cwd, input.sessionId, input.subagent?.promptRecordUuid);
@@ -485,5 +493,7 @@ export async function projectTranscript(input: ProjectTranscriptInput): Promise<
     skippedLines,
     compactionBoundaries: history.compactionBoundaries,
     turnBoundaries: projectTurnBoundaries(selected, input.subagent?.promptRecordUuid),
+    selectedLeafUuid: history.leafUuid,
+    selectedRecordUuids: new Set(selected.map((record) => record.uuid)),
   };
 }

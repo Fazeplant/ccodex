@@ -101,6 +101,8 @@ export class FakeClaudeQuery {
   public readonly factory: ClaudeQueryFactory = (input) => {
     this.inputs.push(input);
     const sessionId = input.options.resume ?? input.options.sessionId ?? "session";
+    if (input.options.resumeSessionAt) this.transcriptTails.set(sessionId, input.options.resumeSessionAt);
+    else if (input.options.sessionId) this.transcriptTails.delete(sessionId);
     const output = new AsyncQueue<SDKMessage>();
     const queryIndex = this.outputs.length;
     this.outputs.push(output);

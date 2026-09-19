@@ -102,11 +102,4 @@ export class ClaudeSessionRepository {
     this.store.commitForkedThread(record, inheritedGoal);
   }
 
-  public commitRollback(
-    record: ClaudeThreadRecord,
-    removedThreadIds: readonly string[],
-  ): void {
-    this.store.commitThreadRollback(record, removedThreadIds);
-  }
-
 }

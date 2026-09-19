@@ -146,13 +146,12 @@ describe("ClaudeSession manual compaction", () => {
 
     expect(turn).toMatchObject({
       status: "inProgress",
-      items: [{ type: "contextCompaction" }],
+      items: [],
     });
     expect(state.registry.resolvedSession(state.threadId)?.liveSnapshot().status.type).toBe("active");
     expect(state.events).toEqual([
       "thread/status/changed",
       "turn/started",
-      "item/started",
     ]);
     expect(notifications(state)).toEqual(state.events);
     expect(lifecycle.at(-1)?.quiescent).toBe(false);
@@ -202,7 +201,7 @@ describe("ClaudeSession manual compaction", () => {
     expect(started.turn).toMatchObject({
       id: started.turnId,
       status: "inProgress",
-      items: [{ type: "contextCompaction" }],
+      items: [],
     });
     expect(state.events).toEqual(["thread/status/changed"]);
     expect(lifecycle.flatMap((update) => update.compactionActions ?? [])).toEqual([]);
@@ -222,7 +221,6 @@ describe("ClaudeSession manual compaction", () => {
     expect(state.events).toEqual([
       "thread/status/changed",
       "turn/started",
-      "item/started",
     ]);
     expect(lifecycle.flatMap((update) => update.compactionActions ?? [])).toEqual([
       expect.objectContaining({
@@ -409,9 +407,9 @@ describe("ClaudeSession manual compaction", () => {
       source: { providerEventId: "compact-status-duplicate", providerEventType: "system/status" },
     });
 
-    expect(liveTurn(state)?.items)
+    expect(liveTurn(state)?.items).not
       .toContainEqual(expect.objectContaining({ type: "contextCompaction" }));
-    expect(state.events.filter((event) => event === "item/started")).toHaveLength(1);
+    expect(state.events.filter((event) => event === "item/started")).toHaveLength(0);
 
     await expect(state.registry.submit<CompactionProjection | undefined>(state.threadId, {
       type: "compactBoundary",
@@ -427,6 +425,7 @@ describe("ClaudeSession manual compaction", () => {
       .toBe("auto-boundary");
     expect(liveTurn(state)?.items)
       .toContainEqual(expect.objectContaining({ type: "contextCompaction" }));
+    expect(state.events.filter((event) => event === "item/started")).toHaveLength(1);
     expect(state.events.filter((event) => event === "item/completed")).toHaveLength(1);
     expect(state.events.filter((event) => event === "thread/compacted")).toHaveLength(1);
     await state.registry.submit(state.threadId, {
@@ -468,9 +467,8 @@ describe("ClaudeSession manual compaction", () => {
     });
 
     const methods = notifications(state);
-    expect(methods.filter((method) => method === "item/started")).toHaveLength(1);
-    expect(methods.filter((method) => method === "item/completed")).toHaveLength(1);
-    expect(methods.indexOf("item/completed")).toBeLessThan(methods.indexOf("turn/completed"));
+    expect(methods.filter((method) => method === "item/started")).toHaveLength(0);
+    expect(methods.filter((method) => method === "item/completed")).toHaveLength(0);
     expect(methods).not.toContain("thread/compacted");
     await state.registry.close();
   });
@@ -500,7 +498,7 @@ describe("ClaudeSession manual compaction", () => {
     });
 
     expect(liveTurn(state)?.status).toBe("inProgress");
-    expect(state.events.filter((method) => method === "item/completed")).toHaveLength(1);
+    expect(state.events.filter((method) => method === "item/completed")).toHaveLength(0);
     expect(state.events).not.toContain("thread/compacted");
     await state.registry.close();
   });

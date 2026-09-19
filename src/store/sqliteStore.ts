@@ -417,16 +417,6 @@ export class SqliteHybridStore implements HybridStore {
     });
   }
 
-  public commitThreadRollback(
-    record: ClaudeThreadRecord,
-    removedThreadIds: readonly string[] = [],
-  ): void {
-    this.transaction(() => {
-      for (const threadId of removedThreadIds) this.deleteThreadRows(threadId);
-      this.updateThread(record);
-    });
-  }
-
   public getGoal(threadId: string): InternalGoal | undefined {
     const row = this.database.prepare("SELECT goal_json FROM goals WHERE thread_id = ?").get(threadId) as unknown as { goal_json: string } | undefined;
     if (!row) return undefined;

@@ -102,18 +102,23 @@ export class NativeSessionCatalog {
     return this.bySessionId.get(sessionId);
   }
 
-  public projection(sessionId: string): Promise<TranscriptProjection> {
+  public projection(sessionId: string, leafUuid?: string): Promise<TranscriptProjection> {
     const entry = this.entriesBySessionId.get(sessionId);
     if (!entry) return Promise.reject(new Error(`Unknown native Claude session: ${sessionId}`));
     const summary = entry.summary;
-    const key = `${summary.path}\0${entry.mtimeMs}\0${summary.sizeBytes}`;
+    const key = `${summary.path}\0${entry.mtimeMs}\0${summary.sizeBytes}\0${leafUuid ?? ""}`;
     const cached = this.projections.get(key);
     if (cached) {
       this.projections.delete(key);
       this.projections.set(key, cached);
       return cached;
     }
-    const projection = projectTranscript({ sessionId, path: summary.path, header: summary });
+    const projection = projectTranscript({
+      sessionId,
+      path: summary.path,
+      header: summary,
+      ...(leafUuid ? { leafUuid } : {}),
+    });
     this.projections.set(key, projection);
     while (this.projections.size > PROJECTION_CACHE_SIZE) {
       this.projections.delete(this.projections.keys().next().value!);

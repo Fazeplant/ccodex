@@ -176,10 +176,6 @@ export interface HybridStore {
     record: ClaudeThreadRecord,
     inheritedGoal?: InternalGoal,
   ): void;
-  commitThreadRollback(
-    record: ClaudeThreadRecord,
-    removedThreadIds?: readonly string[],
-  ): void;
   getGoal(threadId: string): InternalGoal | undefined;
   setGoal(threadId: string, patch: GoalPatch): InternalGoal;
   clearGoal(threadId: string): boolean;

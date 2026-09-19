@@ -11,6 +11,7 @@ import {
 export interface SelectedHistory {
   readonly records: readonly TranscriptChainRecord[];
   readonly compactionBoundaries: ReadonlySet<string>;
+  readonly leafUuid: string | null;
 }
 
 function apiMessageId(record: TranscriptChainRecord): string | undefined {
@@ -121,7 +122,7 @@ function visible(record: TranscriptChainRecord): boolean {
   return record.isMeta !== true && record.isSidechain !== true && !record.teamName;
 }
 
-export function selectHistory(input: readonly TranscriptRecord[]): SelectedHistory {
+export function selectHistory(input: readonly TranscriptRecord[], leafUuid?: string): SelectedHistory {
   const chain = input.filter(isChainRecord);
   const lastWins = new Map<string, TranscriptChainRecord>();
   for (const record of chain) lastWins.set(record.uuid, record);
@@ -137,30 +138,38 @@ export function selectHistory(input: readonly TranscriptRecord[]): SelectedHisto
   const before = (uuid: string, limit: number): TranscriptChainRecord | undefined =>
     occurrences.get(uuid)?.findLast((value) => value.index < limit)?.record;
 
-  const parentUuids = new Set<string>();
-  for (const record of records.values()) if (record.parentUuid) parentUuids.add(record.parentUuid);
-  const conversationalLeaves: TranscriptChainRecord[] = [];
-  for (const leaf of [...records.values()].filter((record) => !parentUuids.has(record.uuid))) {
-    let cursor: TranscriptChainRecord | undefined = leaf;
-    const seen = new Set<string>();
-    while (cursor) {
-      if (seen.has(cursor.uuid)) break;
-      seen.add(cursor.uuid);
-      if (cursor.type === "user" || cursor.type === "assistant") {
-        conversationalLeaves.push(cursor);
-        break;
+  let leaf: TranscriptChainRecord;
+  if (leafUuid) {
+    leaf = records.get(leafUuid)!;
+  } else {
+    const parentUuids = new Set<string>();
+    for (const record of records.values()) if (record.parentUuid) parentUuids.add(record.parentUuid);
+    const conversationalLeaves: Array<{
+      readonly leaf: TranscriptChainRecord;
+      readonly conversational: TranscriptChainRecord;
+    }> = [];
+    for (const candidate of [...records.values()].filter((record) => !parentUuids.has(record.uuid))) {
+      let cursor: TranscriptChainRecord | undefined = candidate;
+      const seen = new Set<string>();
+      while (cursor) {
+        if (seen.has(cursor.uuid)) break;
+        seen.add(cursor.uuid);
+        if (cursor.type === "user" || cursor.type === "assistant") {
+          conversationalLeaves.push({ leaf: candidate, conversational: cursor });
+          break;
+        }
+        cursor = cursor.parentUuid ? records.get(cursor.parentUuid) : undefined;
       }
-      cursor = cursor.parentUuid ? records.get(cursor.parentUuid) : undefined;
     }
+    if (conversationalLeaves.length === 0) {
+      return { records: [], compactionBoundaries: new Set(), leafUuid: null };
+    }
+    const preferred = conversationalLeaves.filter(({ conversational }) =>
+      conversational.isSidechain !== true && !conversational.teamName && conversational.isMeta !== true);
+    const candidates = preferred.length > 0 ? preferred : conversationalLeaves;
+    leaf = candidates.reduce((latest, candidate) =>
+      (positions.get(candidate.leaf.uuid) ?? -1) > (positions.get(latest.leaf.uuid) ?? -1) ? candidate : latest).leaf;
   }
-  if (conversationalLeaves.length === 0) {
-    return { records: [], compactionBoundaries: new Set() };
-  }
-  const preferred = conversationalLeaves.filter((record) =>
-    record.isSidechain !== true && !record.teamName && record.isMeta !== true);
-  const candidates = preferred.length > 0 ? preferred : conversationalLeaves;
-  const leaf = candidates.reduce((latest, candidate) =>
-    (positions.get(candidate.uuid) ?? -1) > (positions.get(latest.uuid) ?? -1) ? candidate : latest);
 
   const reversed: TranscriptChainRecord[] = [];
   const selectedUuids = new Set<string>();
@@ -192,5 +201,6 @@ export function selectHistory(input: readonly TranscriptRecord[]): SelectedHisto
   return {
     records: selected,
     compactionBoundaries: new Set(selected.filter(isCompactBoundary).map((record) => record.uuid)),
+    leafUuid: leaf.uuid,
   };
 }

@@ -123,6 +123,8 @@ export interface RuntimeStartup {
   readonly runtimeGeneration: number;
   readonly providerSessionId: string;
   readonly resume: boolean;
+  readonly resumeSessionAt?: string;
+  readonly resumeDropsTurn?: string;
   readonly cwd: string;
   readonly runtimeWorkspaceRoots: readonly string[];
   readonly ephemeral: boolean;
@@ -177,6 +179,8 @@ export function createProviderRuntime(
           : {}),
         model: normalizeClaudeModelIdentifier(startup.model),
         ...(startup.resume ? { resume: startup.providerSessionId } : { sessionId: startup.providerSessionId }),
+        ...(startup.resumeSessionAt ? { resumeSessionAt: startup.resumeSessionAt } : {}),
+        ...(startup.resumeDropsTurn ? { resumeDropsTurn: startup.resumeDropsTurn } : {}),
         pathToClaudeCodeExecutable: startup.claudeBinary,
         persistSession: startup.persistSession,
         includePartialMessages: true,

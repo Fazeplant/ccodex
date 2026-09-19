@@ -421,12 +421,12 @@ export type ClaudeSessionCommand =
     readonly inheritedGoal?: InternalGoal;
   }
   | {
-    readonly type: "commitRollback";
-    readonly replacementSessionId: string;
+    readonly type: "applyRollback";
     readonly retainedTurns: readonly Turn[];
-    readonly sourceBoundaries: readonly TurnProviderBoundary[];
-    readonly uuidMap: readonly (readonly [string, string])[];
+    readonly anchorUuid?: string;
+    readonly resumeDropsTurn?: string;
   }
+  | { readonly type: "clearRollbackResume"; readonly anchorUuid: string }
   | { readonly type: "deleteBranchTarget" }
   | { readonly type: "goal"; readonly command: GoalSessionCommand }
   | { readonly type: "queue"; readonly command: QueueSessionCommand }
