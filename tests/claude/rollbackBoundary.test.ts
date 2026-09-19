@@ -105,6 +105,10 @@ describe("Claude native rollback", () => {
     expect(rolledBack.thread.turns.map((turn) => turn.id)).toEqual(originalIds.slice(0, 2));
     expect(service.readThread(started.thread.id, true).thread.turns.map((turn) => turn.id))
       .toEqual(originalIds.slice(0, 2));
+    expect(fake.inputs.at(-1)?.options.resumeSessionAt).toBeUndefined();
+    expect(fake.inputs).toHaveLength(1);
+
+    const replacementId = await runTurn(service, started.thread.id, "replacement");
     expect(fake.inputs.at(-1)?.options).toMatchObject({
       resume: started.thread.id,
       resumeSessionAt: anchorUuid,
@@ -114,7 +118,6 @@ describe("Claude native rollback", () => {
     expect(fork).not.toHaveBeenCalled();
     expect(removeNative).not.toHaveBeenCalled();
 
-    const replacementId = await runTurn(service, started.thread.id, "replacement");
     await service.prepareReadThread(started.thread.id, true);
     const turns = service.readThread(started.thread.id, true).thread.turns;
     expect(turns.map((turn) => turn.id)).toEqual([...originalIds.slice(0, 2), replacementId]);

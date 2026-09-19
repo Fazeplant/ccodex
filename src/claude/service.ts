@@ -2104,7 +2104,6 @@ export class ClaudeService {
         ...(anchorUuid ? { anchorUuid, resumeDropsTurn } : {}),
       });
       await this.refreshProjection(threadId);
-      if (anchorUuid) await source.session.materializeRuntime();
     });
     return committed;
   }
