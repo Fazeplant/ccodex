@@ -132,7 +132,13 @@ import {
   stateModelName,
   type ThreadStateSnapshot,
 } from "../state/stateCommand.js";
-import { nativePermissions, syncedCollaborationMode, threadSettings } from "./threadSettings.js";
+import {
+  type ClaudeSettingsOverlay,
+  nativePermissions,
+  syncedCollaborationMode,
+  threadSettings,
+} from "./threadSettings.js";
+import { providerPermissionMode } from "./session/providerRuntimeFactory.js";
 import { claudeDeveloperInstructions } from "./developerInstructions.js";
 import { NativeSessionCatalog, type SessionSummary } from "./native/catalog.js";
 import type { TranscriptProjection } from "./native/projector.js";
@@ -210,6 +216,46 @@ type WorkspaceParams = {
   }[] | null;
 };
 type ClaudeSettingsParams = ThreadSettingsUpdateParams & WorkspaceParams;
+
+function settingsOverlay(record: ClaudeThreadRecord): ClaudeSettingsOverlay {
+  return {
+    modelPickerId: record.modelPickerId,
+    reasoningEffort: record.reasoningEffort,
+    serviceTier: record.serviceTier,
+    permissionMode: providerPermissionMode(record),
+    reasoningSummary: record.reasoningSummary,
+    personality: record.personality,
+    collaborationMode: record.collaborationMode,
+    outputSchema: record.outputSchema,
+    runtimeWorkspaceRoots: storedWorkspaceRoots(record),
+    baseInstructions: record.baseInstructions,
+    developerInstructions: record.developerInstructions,
+  };
+}
+
+function settingsOverlayPatch(
+  params: ClaudeSettingsParams,
+  candidate: ClaudeThreadRecord,
+  outputSchema: unknown | undefined,
+): ClaudeSettingsOverlay {
+  const permissionsChanged = params.approvalPolicy != null
+    || params.approvalsReviewer != null
+    || params.permissions != null
+    || params.sandboxPolicy != null;
+  return {
+    ...(params.model != null ? { modelPickerId: candidate.modelPickerId } : {}),
+    ...(params.effort !== undefined ? { reasoningEffort: candidate.reasoningEffort } : {}),
+    ...(params.serviceTier !== undefined ? { serviceTier: candidate.serviceTier } : {}),
+    ...(permissionsChanged ? { permissionMode: providerPermissionMode(candidate) } : {}),
+    ...(params.summary !== undefined ? { reasoningSummary: candidate.reasoningSummary } : {}),
+    ...(params.personality !== undefined ? { personality: candidate.personality } : {}),
+    ...(params.collaborationMode !== undefined ? { collaborationMode: candidate.collaborationMode } : {}),
+    ...(outputSchema !== undefined ? { outputSchema: candidate.outputSchema } : {}),
+    ...(params.cwd != null || params.runtimeWorkspaceRoots != null
+      ? { runtimeWorkspaceRoots: storedWorkspaceRoots(candidate) }
+      : {}),
+  };
+}
 
 function workspaceRoots(value: readonly string[]): string[] {
   const roots: string[] = [];
@@ -1065,7 +1111,11 @@ export class ClaudeService {
 
   public async startThread(params: ThreadStartParams): Promise<ThreadStartResponse> {
     let record = await this.newThreadRecord(params);
-    record = await this.sessions.submit(record.thread.id, { type: "createThread", record });
+    record = await this.sessions.submit(record.thread.id, {
+      type: "createThread",
+      record,
+      settingsOverlay: settingsOverlay(record),
+    });
     if (record.thread.ephemeral) this.setFlags(record.claudeSessionId, { ephemeral: true });
     return threadResponse(record, false);
   }
@@ -1074,7 +1124,11 @@ export class ClaudeService {
     let record = await this.newThreadRecord(params);
     this.sessionOutput.suppress(record.thread.id);
     try {
-      record = await this.sessions.submit(record.thread.id, { type: "createThread", record });
+      record = await this.sessions.submit(record.thread.id, {
+        type: "createThread",
+        record,
+        settingsOverlay: settingsOverlay(record),
+      });
       if (record.thread.ephemeral) this.setFlags(record.claudeSessionId, { ephemeral: true });
       return threadResponse(record, false);
     } catch (error) {
@@ -2816,11 +2870,17 @@ export class ClaudeService {
           expectedGeneration: settingsGeneration(before),
           candidate,
           threadSettings: threadSettings(candidate),
+          settingsOverlay: settingsOverlayPatch(params, candidate, outputSchema),
+          restartRuntime: workspaceChanged
+            || params.personality !== undefined
+            || params.collaborationMode !== undefined
+            || outputSchema !== undefined,
         },
       );
       if (!update.conflict) break;
       await update.retryAfter;
     }
+    if (update.applyRuntime) await session.applyDesiredRuntimeSettings();
     if (!update.changed) {
       if (syncCanonicalSettings) {
         await this.sessions.submit(params.threadId, {

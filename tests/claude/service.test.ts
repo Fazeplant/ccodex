@@ -2112,7 +2112,7 @@ Keep this summary.
   });
 
 
-  it("balances pending no-query operations before replaying an ephemeral prelude after settings replacement", async () => {
+  it("applies settings after pending no-query operations drain without replaying the ephemeral prelude", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-prelude-restart-"));
     directories.push(directory);
     let release!: () => void;
@@ -2144,9 +2144,12 @@ Keep this summary.
     expect(fake.prompts).toHaveLength(1);
     release();
     await injecting;
-    await waitFor(() => fake.prompts.length === 2, "replayed prelude send");
     await updating;
     const prepared = await preparing;
+    expect(fake.prompts.filter((message) => message.shouldQuery === false)).toHaveLength(1);
+    expect(fake.controls).toContainEqual({
+      method: "applyFlagSettings", value: { effortLevel: "high", fastMode: false },
+    });
     prepared.announce();
     prepared.start();
     await waitFor(
@@ -2507,14 +2510,11 @@ You are in a side conversation, not the main thread.`,
       threadId: source.thread.id,
       input: [{ type: "text", text: "use deferred Flow A settings", text_elements: [] }],
     });
-    const applied = [...parent.inputs, ...initialSide.inputs, ...side.inputs]
-      .find((input) => input.options.model === "claude-opus-4-8");
-    expect(applied?.options).toMatchObject({
-      model: "claude-opus-4-8",
-      effort: "low",
-      settings: { fastMode: true },
-      permissionMode: "bypassPermissions",
-    });
+    expect(parent.controls).toEqual(expect.arrayContaining([
+      { method: "setModel", value: "claude-opus-4-8" },
+      { method: "applyFlagSettings", value: { effortLevel: "low", fastMode: true } },
+      { method: "setPermissionMode", value: "bypassPermissions" },
+    ]));
     next.announce();
     next.start();
     await waitFor(
@@ -5654,7 +5654,11 @@ You are in a side conversation, not the main thread.`,
     await service.close();
   });
 
-  it("switches model, effort, and speed between ephemeral turns without replacing provider context", async () => {
+  // switches model, effort, and speed between ephemeral turns without replacing provider context
+  it.each([
+    { kind: "durable", ephemeral: false },
+    { kind: "ephemeral", ephemeral: true },
+  ])("switches model, effort, and speed between $kind thread turns without replacing provider context", async ({ ephemeral }) => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-ephemeral-controls-"));
     directories.push(directory);
     const fake = new FakeClaudeQuery();
@@ -5663,7 +5667,7 @@ You are in a side conversation, not the main thread.`,
       new SqliteHybridStore(join(directory, "state.sqlite")), fake.factory,
     );
     const started = await service.startThread({
-      model: "claude:sonnet", cwd: directory, ephemeral: true,
+      model: "claude:sonnet", cwd: directory, ephemeral,
     });
     const first = await service.prepareTurn({
       threadId: started.thread.id,
@@ -5683,6 +5687,14 @@ You are in a side conversation, not the main thread.`,
       effort: "high",
       serviceTier: "fast",
       summary: "detailed",
+    });
+    await expect(service.liveSnapshot(started.thread.id)).resolves.toMatchObject({
+      settingsOverlay: {
+        modelPickerId: "claude:claude-opus-4-8",
+        reasoningEffort: "high",
+        serviceTier: "fast",
+        reasoningSummary: "detailed",
+      },
     });
     const second = await service.prepareTurn({
       threadId: started.thread.id,
@@ -5754,7 +5766,12 @@ You are in a side conversation, not the main thread.`,
       () => service.readThread(started.thread.id, true).thread.status.type === "idle",
       "ephemeral lifecycle drain",
     );
-    expect(fake.controls).toEqual([]);
+    expect(fake.controls).toEqual([
+      { method: "setModel", value: "sonnet" },
+      { method: "applyFlagSettings", value: { effortLevel: "medium", fastMode: true } },
+      { method: "setMaxThinkingTokens", value: { tokens: null, display: null } },
+      { method: "setPermissionMode", value: "default" },
+    ]);
     const second = await service.prepareTurn({
       threadId: started.thread.id,
       input: [{ type: "text", text: "latest settings", text_elements: [] }],
@@ -5794,17 +5811,16 @@ You are in a side conversation, not the main thread.`,
       () => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed",
       "ephemeral context turn",
     );
-    await service.updateThreadSettings({
-      threadId: started.thread.id, model: "claude:claude-opus-4-8", effort: "high",
-    });
     fake.failControlOnce = "applyFlagSettings";
-    await expect(service.prepareTurn({
-      threadId: started.thread.id,
-      input: [{ type: "text", text: "must not send", text_elements: [] }],
+    await expect(service.updateThreadSettings({
+      threadId: started.thread.id, model: "claude:claude-opus-4-8", effort: "high",
     })).rejects.toThrow("fake applyFlagSettings failure");
     expect(fake.prompts).toHaveLength(1);
     expect(service.readThread(started.thread.id, true).thread.turns).toHaveLength(1);
 
+    await service.updateThreadSettings({
+      threadId: started.thread.id, model: "claude:claude-opus-4-8", effort: "high",
+    });
     const retry = await service.prepareTurn({
       threadId: started.thread.id,
       input: [{ type: "text", text: "retry safely", text_elements: [] }],
@@ -5846,7 +5862,9 @@ You are in a side conversation, not the main thread.`,
     await service.updateThreadSettings({
       threadId: started.thread.id, effort: "max",
     });
-    expect(fake.controls).toEqual([]);
+    expect(fake.controls).toContainEqual({
+      method: "applyFlagSettings", value: { effortLevel: "max", fastMode: false },
+    });
     const second = await service.prepareTurn({
       threadId: started.thread.id,
       input: [{ type: "text", text: "use max effort", text_elements: [] }],
@@ -6237,6 +6255,7 @@ You are in a side conversation, not the main thread.`,
     const updateStarted = performance.now();
     await service.updateThreadSettings({
       ...deferredSettingsUpdate,
+      personality: "friendly",
       threadId: started.thread.id,
     });
     await service.updateThreadSettings({
@@ -6351,16 +6370,14 @@ You are in a side conversation, not the main thread.`,
       poll();
     });
     expect(current.permissionResults[0]).toMatchObject({ behavior: "allow" });
-    await new Promise<void>((resolve) => {
-      const poll = () => current.returnCalls === 1 ? resolve() : setTimeout(poll, 5);
-      poll();
-    });
+    await waitFor(() => current.controls.some((control) =>
+      control.method === "setPermissionMode" && control.value === "bypassPermissions"), "deferred permission control");
 
     await service.prepareTurn({
       threadId: started.thread.id,
       input: [{ type: "text", text: "next policy", text_elements: [] }],
     });
-    expect(next.inputs[0]?.options.permissionMode).toBe("bypassPermissions");
+    expect(next.inputs).toHaveLength(0);
     await service.close();
   });
 
@@ -6397,7 +6414,7 @@ You are in a side conversation, not the main thread.`,
       input: [{ type: "text", text: "reserved generation", text_elements: [] }],
     });
     await staged;
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     expect(current.returnCalls).toBe(0);
     releaseStaging();
     const turn = await preparing;
@@ -6499,7 +6516,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(() => service.readThread(started.thread.id, true).thread.turns[0]?.items
       .some((item) => item.type === "commandExecution" && item.status === "inProgress") ?? false, "background command start");
 
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     expect(current.returnCalls).toBe(0);
     expect(events.filter((method) => method === "turn/completed")).toHaveLength(0);
     releaseBackground();
@@ -6578,7 +6595,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(() => service.readThread(started.thread.id, true).thread.turns[0]?.items
       .some((item) => item.type === "collabAgentToolCall" && item.status === "inProgress") ?? false, "subagent start");
 
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     expect(current.returnCalls).toBe(0);
     releaseChild();
     await waitFor(

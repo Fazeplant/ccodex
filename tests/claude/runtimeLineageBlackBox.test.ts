@@ -344,7 +344,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     await service.resumeThread(started.thread.id);
     await waitFor(() => first.inputs.length === 1, "initializing Query");
 
-    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     await waitFor(() => first.returnCalls === 1, "startup retirement");
     rejectInitialization(new Error("delayed startup rejection"));
     const preparedPromise = service.prepareTurn({
@@ -393,7 +393,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     await service.resumeThread(started.thread.id);
     await waitFor(() => first.inputs.length === 1, "initializing operation-fence Query");
 
-    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     await waitFor(() => first.returnCalls === 1, "retiring-startup close barrier");
     rejectInitialization(new Error("delayed operation-fence initialization rejection"));
     let renameSettled = false;
@@ -468,7 +468,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     };
 
     await runTurn("approve once");
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     await waitFor(() => fake.returnCalls === 1, "approved Query retirement");
     await runTurn("reuse after replacement");
 
@@ -506,7 +506,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     });
     const oldOptions = first.inputs[0]!.options;
     const oldCreateGoal = goalTool(first, "create_goal");
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
 
     await expect(oldOptions.canUseTool!("Bash", { command: "pwd" }, {
       signal: new AbortController().signal,
@@ -572,7 +572,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     const started = await service.startThread({ model: "claude:sonnet", cwd: directory });
     await service.resumeThread(started.thread.id);
     const oldCreateGoal = goalTool(first, "create_goal");
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
 
     const turn = await service.prepareTurn({
       threadId: started.thread.id,
@@ -841,7 +841,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     });
     expect(first.prompts).toHaveLength(1);
 
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     await waitFor(() => replacement.prompts.length === 1, "pre-ready prelude replay");
     expect(JSON.stringify(replacement.prompts[0])).toContain("pre-ready ephemeral prelude");
     expect(factoryCalls).toBe(2);
@@ -874,7 +874,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     const staleRead = service.readRateLimits(started.thread.id);
     await waitFor(() => first.experimentalUsageCalls === 1, "old usage probe");
 
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     await waitFor(() => first.returnCalls === 1, "old runtime retirement");
     const turn = await service.prepareTurn({
       threadId: started.thread.id,
@@ -937,7 +937,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
       items: [{ type: "message", role: "user", content: [{ type: "input_text", text: "prelude" }] }],
     });
 
-    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     await waitFor(() => replacement.prompts.length === 1, "replacement prelude replay");
     let prepared = false;
     const preparing = service.prepareTurn({
@@ -997,7 +997,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     ).then(() => { injectionSettled = true; });
     await waitFor(() => fake.prompts.length === 1, "durable injection send");
 
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     expect(injectionSettled).toBe(false);
     expect(service.currentThreadSettings(started.thread.id).effort).toBe("high");
 
@@ -1048,6 +1048,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     const updating = service.updateThreadSettings({
       threadId: started.thread.id,
       effort: "high",
+      personality: "friendly",
     }).then(() => { settingsSettled = true; });
     await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -1087,7 +1088,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
       threadId: started.thread.id,
       items: [{ type: "message", role: "user", content: [{ type: "input_text", text: "prelude" }] }],
     });
-    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     // Attach the handler before close(): the rejection may land a macrotask
     // earlier than close() resolves, which Node would report as unhandled.
     const updatingRejected = expect(updating).rejects.toThrow();
@@ -1136,7 +1137,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
     const concurrent = [{ type: "message", role: "user", content: [{ type: "input_text", text: "concurrent" }] }];
     await service.injectItems({ threadId: started.thread.id, items: initial });
 
-    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     await waitFor(() => replacement.prompts.length === 1, "reserved replay snapshot");
     let injected = false;
     const injecting = service.injectItems({
@@ -1180,7 +1181,7 @@ describe("Claude runtime lineage through public service and Query contracts", ()
       threadId: started.thread.id,
       items: [{ type: "message", role: "user", content: [{ type: "input_text", text: "prelude" }] }],
     });
-    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    const updating = service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     await waitFor(() => first.returnCalls === 1, "retirement return barrier");
     first.emit({
       type: "assistant",

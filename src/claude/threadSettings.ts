@@ -31,6 +31,20 @@ export interface NativeThreadSettings {
   readonly developerInstructions: null;
 }
 
+export interface ClaudeSettingsOverlay {
+  readonly modelPickerId?: string;
+  readonly reasoningEffort?: string | null;
+  readonly serviceTier?: string | null;
+  readonly permissionMode?: string;
+  readonly reasoningSummary?: string | null;
+  readonly personality?: string | null;
+  readonly collaborationMode?: unknown | null;
+  readonly outputSchema?: unknown | null;
+  readonly runtimeWorkspaceRoots?: readonly string[];
+  readonly baseInstructions?: string | null;
+  readonly developerInstructions?: string | null;
+}
+
 function activePermissionProfile(policy: SandboxPolicy): ActivePermissionProfile | null {
   if (policy.type === "readOnly") return { id: ":read-only", extends: null };
   if (policy.type === "workspaceWrite") return { id: ":workspace", extends: null };
