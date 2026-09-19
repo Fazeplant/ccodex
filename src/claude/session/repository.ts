@@ -1,22 +1,13 @@
 import type { Turn } from "../../codex/generated/v2/Turn.js";
-import type { QueuedSubmission } from "../../codex/generated/v2/QueuedSubmission.js";
 import type {
   ClaudeThreadRecord,
   GoalPatch,
   GoalUsageInput,
   HybridStore,
   InternalGoal,
-  PendingRequestRecord,
-  ProviderEventDisposition,
-  ProviderEventRecord,
-  ProviderBoundaryCommit,
-  ProviderItemCorrelation,
-  ProviderRetractionMutation,
   PendingThreadRemoval,
-  StateEvent,
   TurnProviderBoundary,
 } from "../../store/HybridStore.js";
-import type { RuntimeFactSource, SessionBranchSnapshot } from "./commands.js";
 
 export function branchRevision(
   record: ClaudeThreadRecord,
@@ -58,33 +49,8 @@ export class ClaudeSessionRepository {
     return this.store.getThreadRecord(threadId, includeTurns);
   }
 
-  public branchSnapshot(threadId: string): SessionBranchSnapshot | undefined {
-    const record = this.store.getThreadRecord(threadId, true);
-    if (!record) return undefined;
-    const boundaries = record.thread.turns.flatMap((turn) => {
-      const messageUuid = this.store.getTurnClaudeMessageUuid(threadId, turn.id);
-      return messageUuid ? [{ turnId: turn.id, messageUuid }] : [];
-    });
-    return { record, boundaries, revision: branchRevision(record, boundaries) };
-  }
-
   public update(record: ClaudeThreadRecord): void {
     this.store.updateThread(record);
-  }
-
-  public commitState(
-    record: ClaudeThreadRecord,
-    events: readonly StateEvent[],
-    turn?: Turn,
-    insertTurn = false,
-    providerBoundary?: ProviderBoundaryCommit,
-  ): number[] {
-    return this.store.commitThreadState({
-      record,
-      events,
-      ...(turn ? { turn, insertTurn } : {}),
-      ...(providerBoundary ? { providerBoundary } : {}),
-    });
   }
 
   public delete(threadId: string): void {
@@ -95,8 +61,6 @@ export class ClaudeSessionRepository {
   public setGoal(threadId: string, patch: GoalPatch): InternalGoal { return this.store.setGoal(threadId, patch); }
   public clearGoal(threadId: string): boolean { return this.store.clearGoal(threadId); }
   public accountGoalUsage(input: GoalUsageInput): InternalGoal | undefined { return this.store.accountGoalUsage(input); }
-  public listQueue(threadId: string): QueuedSubmission[] { return this.store.listQueuedSubmissions(threadId); }
-  public setQueue(threadId: string, items: readonly QueuedSubmission[]): void { this.store.setQueuedSubmissions(threadId, items); }
   public archived(threadId: string): boolean { return this.store.isThreadArchived(threadId); }
   public commitArchived(threadIds: readonly string[], archived: boolean): void {
     this.store.commitThreadsArchived(threadIds, archived);
@@ -133,149 +97,16 @@ export class ClaudeSessionRepository {
 
   public commitFork(
     record: ClaudeThreadRecord,
-    turns: readonly Turn[],
-    boundaries: readonly TurnProviderBoundary[],
     inheritedGoal?: InternalGoal,
   ): void {
-    this.store.commitForkedThread(record, turns, boundaries, inheritedGoal);
+    this.store.commitForkedThread(record, inheritedGoal);
   }
 
   public commitRollback(
     record: ClaudeThreadRecord,
-    keepCount: number,
-    boundaries: readonly TurnProviderBoundary[],
     removedThreadIds: readonly string[],
   ): void {
-    this.store.commitThreadRollback(record, keepCount, boundaries, removedThreadIds);
+    this.store.commitThreadRollback(record, removedThreadIds);
   }
 
-  public createTurn(threadId: string, turn: Turn): void {
-    this.store.createTurn(threadId, turn);
-  }
-
-  public readTurn(threadId: string, turnId: string): Turn | undefined {
-    return this.store.getTurn(threadId, turnId);
-  }
-
-  public updateTurn(threadId: string, turn: Turn): void {
-    this.store.updateTurn(threadId, turn);
-  }
-
-  public appendProviderEvent(event: {
-    readonly threadId: string;
-    readonly processEpoch: string;
-    readonly providerSequence: number;
-    readonly providerEventType: string;
-    readonly providerEventId: string | null;
-    readonly payload: unknown;
-    readonly createdAt: number;
-  }): { record: ProviderEventRecord; inserted: boolean } {
-    return this.store.appendProviderEvent(event);
-  }
-
-  public finishProviderEvent(
-    threadId: string,
-    sequence: number,
-    disposition: Exclude<ProviderEventDisposition, "pending">,
-    error?: string,
-  ): void {
-    this.store.completeProviderEvent(threadId, sequence, disposition, error);
-  }
-
-  public abandonPendingProviderEvents(threadId: string, error: string): string[] {
-    const pending = this.store.listProviderEvents(threadId, "pending");
-    for (const event of pending) {
-      this.store.completeProviderEvent(threadId, event.sequence, "abandoned", error);
-    }
-    return pending.map((event) => event.providerEventType);
-  }
-
-  public markProviderEventProcessed(
-    threadId: string,
-    providerEventType: string,
-    providerEventId: string,
-  ): void {
-    this.store.markProviderEventProcessed(threadId, providerEventType, providerEventId);
-  }
-
-  public pruneProviderEvents(threadId: string, maxEvents: number, maxBytes: number): number {
-    return this.store.pruneProviderEvents(threadId, maxEvents, maxBytes);
-  }
-
-  public providerItemCorrelations(
-    threadId: string,
-    providerMessageIds: readonly string[],
-  ): ProviderItemCorrelation[] {
-    return this.store.listProviderItemCorrelations(threadId, providerMessageIds);
-  }
-
-  public deleteProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): void {
-    this.store.deleteProviderItemCorrelations(threadId, providerMessageIds);
-  }
-
-  public commitProviderRetraction(
-    record: ClaudeThreadRecord,
-    providerMessageIds: readonly string[],
-    mutations: readonly ProviderRetractionMutation[],
-    removedThreadIds: readonly string[],
-  ): void {
-    this.store.commitProviderRetraction(record, providerMessageIds, mutations, removedThreadIds);
-  }
-
-  public appendEvent(
-    threadId: string,
-    turnId: string | null,
-    method: string,
-    params: unknown,
-    dedupKey?: string,
-  ): number {
-    return this.store.appendEvent(
-      threadId,
-      turnId,
-      method,
-      params,
-      dedupKey === undefined ? undefined : { dedupKey },
-    );
-  }
-
-  public appendTurnEvent(
-    threadId: string,
-    turn: Turn,
-    method: string,
-    params: unknown,
-    source: RuntimeFactSource,
-  ): number {
-    return this.store.appendEvent(threadId, turn.id, method, params, {
-      turn,
-      providerEventId: source.providerEventId,
-      providerEventType: source.providerEventType,
-    });
-  }
-
-  public pendingRequest(requestId: string): PendingRequestRecord | undefined {
-    return this.store.getPendingRequest(requestId);
-  }
-
-  public pendingRequestByClaudeId(
-    threadId: string,
-    claudeRequestId: string,
-  ): PendingRequestRecord | undefined {
-    return this.store.findPendingRequestByClaudeId(threadId, claudeRequestId);
-  }
-
-  public createPendingRequest(request: PendingRequestRecord): void {
-    this.store.createPendingRequest(request);
-  }
-
-  public pendingRequests(threadId: string): PendingRequestRecord[] {
-    return this.store.listPendingRequests(threadId);
-  }
-
-  public resolvePendingRequest(
-    requestId: string,
-    status: "resolved" | "cancelled",
-    response: unknown,
-  ): void {
-    this.store.resolvePendingRequest(requestId, status, response);
-  }
 }

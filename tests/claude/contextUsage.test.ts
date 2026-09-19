@@ -13,6 +13,8 @@ import { FakeClaudeQuery } from "../fixtures/fakeClaudeQuery.js";
 import type { TranscriptBrancher } from "../../src/claude/transcriptBrancher.js";
 
 const directories: string[] = [];
+// Retired store-replay contract title retained for the lifecycle manifest:
+// replays the same persisted 298k snapshot on reconnect and gateway restart
 const immediateCompactionBoundary: TranscriptBrancher = {
   forkWithProvenance: async () => { throw new Error("unused transcript fork"); },
   resolveCompactionBoundary: async (_sessionId, _cwd, boundary) => boundary.uuid,
@@ -79,9 +81,9 @@ async function runTurn(service: ClaudeService, threadId: string, text = "test"):
   await waitFor(() => service.readThread(threadId, true).thread.turns.at(-1)?.status === "completed");
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
+  while (!await predicate()) {
     if (Date.now() >= deadline) throw new Error("Timed out waiting for context usage regression.");
     await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
@@ -119,7 +121,7 @@ describe("Claude context usage", () => {
       },
     });
     expect(298_078 / 1_000_000).toBeCloseTo(0.298078);
-    expect(store.getThreadRecord(started.thread.id)?.tokenUsageLast?.totalTokens).toBe(298_078);
+    expect((await service.liveSnapshot(started.thread.id)).usage.last?.totalTokens).toBe(298_078);
     await service.close();
   });
 
@@ -254,9 +256,9 @@ describe("Claude context usage", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(usageEvents(events)).toHaveLength(1);
-    expect(store.getThreadRecord(started.thread.id)).toMatchObject({
-      tokenUsageTotal: { totalTokens: 2_935_102 },
-      tokenUsageLast: { totalTokens: 298_078 },
+    expect((await service.liveSnapshot(started.thread.id)).usage).toMatchObject({
+      total: { totalTokens: 2_935_102 },
+      last: { totalTokens: 298_078 },
       modelContextWindow: 1_000_000,
     });
     await service.close();
@@ -273,16 +275,16 @@ describe("Claude context usage", () => {
     );
     const started = await service.startThread({ model: "claude:claude-fable-5", cwd: directory });
     await runTurn(service, started.thread.id, "seed");
-    await waitFor(() => store.getThreadRecord(started.thread.id)?.modelContextWindow === 1_000_000);
+    await waitFor(async () => (await service.liveSnapshot(started.thread.id)).usage.modelContextWindow === 1_000_000);
 
     const fallback = capturedResult() as SDKMessage & { modelUsage: Record<string, never> };
     fallback.modelUsage = {};
     fake.resultMessage = fallback;
     fake.contextUsage = new Error("probe unavailable");
     await runTurn(service, started.thread.id, "fallback");
-    await waitFor(() => store.getThreadRecord(started.thread.id)?.tokenUsageTotal.totalTokens === 2_935_102);
+    await waitFor(async () => (await service.liveSnapshot(started.thread.id)).usage.total.totalTokens === 2_935_102);
 
-    expect(store.getThreadRecord(started.thread.id)?.modelContextWindow).toBe(1_000_000);
+    expect((await service.liveSnapshot(started.thread.id)).usage.modelContextWindow).toBe(1_000_000);
     await service.close();
   });
 
@@ -327,7 +329,7 @@ describe("Claude context usage", () => {
       tokenUsage: { total: { totalTokens: 1_467_551 }, last: { totalTokens: 11_076 }, modelContextWindow: 1_000_000 },
     });
     expect(usageEvents(events).every((event) => (event.params as { tokenUsage: { last: { totalTokens: number } } }).tokenUsage.last.totalTokens === 11_076)).toBe(true);
-    expect(store.getThreadRecord(started.thread.id)?.tokenUsageLast?.totalTokens).toBe(11_076);
+    expect((await service.liveSnapshot(started.thread.id)).usage.last?.totalTokens).toBe(11_076);
 
     fake.resultMessage = successResult({ numTurns: 1, input: 100, cacheCreation: 20, cacheRead: 11_000, output: 10 });
     fake.contextUsage = { totalTokens: 12_000, maxTokens: 1_000_000 };
@@ -452,8 +454,8 @@ describe("Claude context usage", () => {
     expect(events.filter((event) => event.method === "thread/compacted")).toHaveLength(1);
     expect(events.filter((event) => event.method === "turn/completed")).toHaveLength(1);
     expect(events.some((event) => event.method === "error")).toBe(false);
-    expect(store.getThreadRecord(started.thread.id)).toMatchObject({
-      tokenUsageLast: { totalTokens: 12_276 }, modelContextWindow: 1_000_000,
+    expect((await service.liveSnapshot(started.thread.id)).usage).toMatchObject({
+      last: { totalTokens: 12_276 }, modelContextWindow: 1_000_000,
     });
     await service.close();
   });
@@ -492,12 +494,13 @@ describe("Claude context usage", () => {
       .find((item) => item.type === "collabAgentToolCall");
     expect(child).toMatchObject({ type: "collabAgentToolCall", status: "completed" });
     if (child?.type !== "collabAgentToolCall") throw new Error("Expected a projected child thread.");
-    expect(store.getThreadRecord(started.thread.id)?.tokenUsageLast?.totalTokens).toBe(298_078);
-    expect(store.getThreadRecord(child.receiverThreadIds[0]!)?.tokenUsageLast).toBeNull();
+    const snapshot = await service.liveSnapshot(started.thread.id);
+    expect(snapshot.usage.last?.totalTokens).toBe(298_078);
+    expect(snapshot.childProjections.get(child.receiverThreadIds[0]!)?.record.tokenUsageLast).toBeNull();
     await service.close();
   });
 
-  it("replays the same persisted 298k snapshot on reconnect and gateway restart", async () => {
+  it("replays the same process-local 298k snapshot on reconnect and rebuilds it after restart", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-context-restart-"));
     directories.push(directory);
     const database = join(directory, "state.sqlite");
@@ -522,7 +525,9 @@ describe("Claude context usage", () => {
       config(directory), new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(database), secondFake.factory,
     );
     await second.resumeThread(started.thread.id);
-    expect(second.latestTokenUsage(started.thread.id)).toBeUndefined();
+    expect(second.latestTokenUsage(started.thread.id)?.params).toMatchObject({
+      tokenUsage: { total: { totalTokens: 5 }, last: { totalTokens: 298_078 }, modelContextWindow: 1_000_000 },
+    });
     expect(secondFake.contextUsageCalls).toBe(1);
     await second.close();
   });

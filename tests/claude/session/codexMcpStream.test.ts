@@ -97,7 +97,7 @@ describe("codex MCP call streaming", () => {
       providerId: "codex-1", input: { prompt: "build it" },
     })).resolves.toBe(true);
 
-    const items = () => store.getThreadRecord("thread-1", true)?.thread.turns.at(-1)?.items ?? [];
+    const items = () => registry.resolvedSession("thread-1")?.liveSnapshot().activeTurn?.items ?? [];
     await vi.waitFor(() => {
       expect(items().some((item) => item.type === "agentMessage" && item.text.includes("done, see diff"))).toBe(true);
     });

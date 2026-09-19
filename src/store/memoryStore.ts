@@ -1,11 +1,9 @@
 import type { Thread } from "../codex/generated/v2/Thread.js";
 import type { ThreadListParams } from "../codex/generated/v2/ThreadListParams.js";
 import type { Turn } from "../codex/generated/v2/Turn.js";
-import type { QueuedSubmission } from "../codex/generated/v2/QueuedSubmission.js";
 import type {
-  AppendProviderEvent, ClaudeSessionFlags, ClaudeThreadRecord, EventPersistence, GoalPatch, GoalUsageInput, HybridStore, InternalGoal, PendingRequestRecord,
-  PendingThreadRemoval, ProviderEventDisposition, ProviderEventRecord, ProviderItemCorrelation, ProviderRetractionMutation,
-  StoredEvent, ThreadStateCommit, TurnProviderBoundary,
+  ClaudeSessionFlags, ClaudeThreadRecord, GoalPatch, GoalUsageInput, HybridStore, InternalGoal,
+  PendingThreadRemoval,
 } from "./HybridStore.js";
 import { settingsGeneration, withSettingsFrom } from "./HybridStore.js";
 import { filterSortThreads } from "./threadFilter.js";
@@ -36,21 +34,12 @@ function defaultSessionFlags(flags: ClaudeSessionFlags): boolean {
 export class MemoryHybridStore implements HybridStore {
   private readonly records = new Map<string, ClaudeThreadRecord>();
   private readonly turns = new Map<string, Turn[]>();
-  private readonly pending = new Map<string, PendingRequestRecord>();
   private readonly archived = new Set<string>();
   private readonly pendingRemovals = new Map<string, PendingThreadRemoval>();
   private readonly goals = new Map<string, InternalGoal>();
   private readonly sectionOrderBySection = new Map<string, string[]>();
   private readonly flagsBySession = new Map<string, ClaudeSessionFlags>();
-  private readonly queues = new Map<string, QueuedSubmission[]>();
   private readonly goalCheckpoints = new Set<string>();
-  private readonly turnMessages = new Map<string, string>();
-  private readonly eventDedup = new Set<string>();
-  private readonly providerEvents = new Set<string>();
-  private readonly providerJournal: ProviderEventRecord[] = [];
-  private readonly providerItemCorrelations: Array<ProviderItemCorrelation & { threadId: string }> = [];
-  private readonly events: StoredEvent[] = [];
-  private eventSequence = 0;
 
   public createThread(record: ClaudeThreadRecord): void {
     this.records.set(record.thread.id, copy({ ...record, thread: { ...record.thread, turns: [] } }));
@@ -85,9 +74,8 @@ export class MemoryHybridStore implements HybridStore {
     else this.flagsBySession.set(flags.sessionId, copy(flags));
   }
 
-  public adoptTransient(record: ClaudeThreadRecord, turns: readonly Turn[]): void {
+  public adoptTransient(record: ClaudeThreadRecord): void {
     this.createThread(record);
-    for (const turn of turns) this.createTurn(record.thread.id, turn);
   }
 
   public updateThread(record: ClaudeThreadRecord): void {
@@ -106,19 +94,7 @@ export class MemoryHybridStore implements HybridStore {
   }
 
   public commitThreadsArchived(threadIds: readonly string[], archived: boolean): void {
-    const method = archived ? "thread/archived" : "thread/unarchived";
-    const createdAt = Date.now();
-    const events = threadIds.map((threadId, index) => ({
-      sequence: this.eventSequence + index + 1,
-      threadId,
-      turnId: null,
-      method,
-      params: { threadId },
-      createdAt,
-    }));
     for (const threadId of threadIds) this.setThreadArchived(threadId, archived);
-    this.eventSequence += events.length;
-    this.events.push(...events);
   }
 
   public beginThreadRemoval(removal: PendingThreadRemoval): void {
@@ -134,36 +110,20 @@ export class MemoryHybridStore implements HybridStore {
     const snapshot = copy({
       records: this.records,
       turns: this.turns,
-      pending: this.pending,
       archived: this.archived,
       pendingRemovals: this.pendingRemovals,
       goals: this.goals,
-      queues: this.queues,
       goalCheckpoints: this.goalCheckpoints,
-      turnMessages: this.turnMessages,
-      events: this.events,
-      providerJournal: this.providerJournal,
-      providerItemCorrelations: this.providerItemCorrelations,
     });
     try {
       for (const threadId of [...threadIds].reverse()) this.deleteThread(threadId);
     } catch (error) {
       restoreMap(this.records, snapshot.records);
       restoreMap(this.turns, snapshot.turns);
-      restoreMap(this.pending, snapshot.pending);
       restoreSet(this.archived, snapshot.archived);
       restoreMap(this.pendingRemovals, snapshot.pendingRemovals);
       restoreMap(this.goals, snapshot.goals);
-      restoreMap(this.queues, snapshot.queues);
       restoreSet(this.goalCheckpoints, snapshot.goalCheckpoints);
-      restoreMap(this.turnMessages, snapshot.turnMessages);
-      this.events.splice(0, this.events.length, ...snapshot.events);
-      this.providerJournal.splice(0, this.providerJournal.length, ...snapshot.providerJournal);
-      this.providerItemCorrelations.splice(
-        0,
-        this.providerItemCorrelations.length,
-        ...snapshot.providerItemCorrelations,
-      );
       throw error;
     }
     this.pendingRemovals.delete(rootThreadId);
@@ -171,31 +131,10 @@ export class MemoryHybridStore implements HybridStore {
 
   public deleteThread(threadId: string): void {
     this.records.delete(threadId);
-    for (const turn of this.turns.get(threadId) ?? []) this.turnMessages.delete(`${threadId}:${turn.id}`);
     this.turns.delete(threadId);
     this.archived.delete(threadId);
     this.goals.delete(threadId);
-    this.queues.delete(threadId);
     for (const checkpoint of this.goalCheckpoints) if (checkpoint.startsWith(`${threadId}:`)) this.goalCheckpoints.delete(checkpoint);
-    for (let index = this.events.length - 1; index >= 0; index -= 1) {
-      if (this.events[index]!.threadId === threadId) this.events.splice(index, 1);
-    }
-    for (let index = this.providerJournal.length - 1; index >= 0; index -= 1) {
-      if (this.providerJournal[index]!.threadId === threadId) this.providerJournal.splice(index, 1);
-    }
-    for (let index = this.providerItemCorrelations.length - 1; index >= 0; index -= 1) {
-      const link = this.providerItemCorrelations[index]!;
-      if (link.threadId === threadId || link.ownerThreadId === threadId) this.providerItemCorrelations.splice(index, 1);
-    }
-    for (const [requestId, request] of this.pending) if (request.threadId === threadId) this.pending.delete(requestId);
-  }
-
-  public createTurn(threadId: string, turn: Turn): void { this.turns.get(threadId)?.push(copy(turn)); }
-
-  public updateTurn(threadId: string, turn: Turn): void {
-    const turns = this.turns.get(threadId);
-    const index = turns?.findIndex((candidate) => candidate.id === turn.id) ?? -1;
-    if (turns && index >= 0) turns[index] = copy(turn);
   }
 
   public getTurn(threadId: string, turnId: string): Turn | undefined {
@@ -204,192 +143,21 @@ export class MemoryHybridStore implements HybridStore {
   }
 
   public listTurns(threadId: string): Turn[] { return copy(this.turns.get(threadId) ?? []); }
-  public setTurnClaudeMessageUuid(threadId: string, turnId: string, messageUuid: string): void {
-    this.turnMessages.set(`${threadId}:${turnId}`, messageUuid);
-  }
-  public getTurnClaudeMessageUuid(threadId: string, turnId: string): string | undefined {
-    return this.turnMessages.get(`${threadId}:${turnId}`);
-  }
-  public truncateTurns(threadId: string, keepCount: number): void {
-    const turns = this.turns.get(threadId) ?? [];
-    for (const turn of turns.slice(keepCount)) this.turnMessages.delete(`${threadId}:${turn.id}`);
-    this.turns.set(threadId, turns.slice(0, keepCount));
-  }
   public commitForkedThread(
     record: ClaudeThreadRecord,
-    turns: readonly Turn[],
-    boundaries: readonly TurnProviderBoundary[],
     inheritedGoal?: InternalGoal,
   ): void {
     this.createThread(record);
-    for (const turn of turns) this.createTurn(record.thread.id, turn);
-    for (const boundary of boundaries) this.setTurnClaudeMessageUuid(record.thread.id, boundary.turnId, boundary.messageUuid);
     if (inheritedGoal) this.goals.set(record.thread.id, copy(inheritedGoal));
   }
   public commitThreadRollback(
     record: ClaudeThreadRecord,
-    keepCount: number,
-    boundaries: readonly TurnProviderBoundary[],
     removedThreadIds: readonly string[] = [],
   ): void {
     for (const threadId of removedThreadIds) this.deleteThread(threadId);
-    this.truncateTurns(record.thread.id, keepCount);
-    for (const boundary of boundaries) this.setTurnClaudeMessageUuid(record.thread.id, boundary.turnId, boundary.messageUuid);
     this.updateThread(record);
   }
 
-  public commitThreadState(commit: ThreadStateCommit): number[] {
-    const threadId = commit.record.thread.id;
-    const createdAt = Date.now();
-    const events = commit.events.map((event, index) => ({
-      sequence: this.eventSequence + index + 1,
-      threadId,
-      turnId: event.turnId,
-      method: event.method,
-      params: copy(event.params),
-      createdAt,
-    }));
-    this.updateThread(commit.record);
-    if (commit.turn) {
-      if (commit.insertTurn) this.createTurn(threadId, commit.turn);
-      else this.updateTurn(threadId, commit.turn);
-    }
-    if (commit.providerBoundary) {
-      const boundary = commit.providerBoundary;
-      this.setTurnClaudeMessageUuid(boundary.ownerThreadId, boundary.turnId, boundary.messageUuid);
-      this.linkProviderItems(
-        threadId,
-        boundary.messageUuid,
-        boundary.ownerThreadId,
-        boundary.turnId,
-        boundary.itemIds ?? [],
-      );
-    }
-    this.eventSequence += events.length;
-    this.events.push(...events);
-    return events.map((event) => event.sequence);
-  }
-
-  public appendEvent(threadId: string, turnId: string | null, method: string, params: unknown, persistence?: EventPersistence): number {
-    if (persistence?.dedupKey && this.eventDedup.has(`${threadId}:${persistence.dedupKey}`)) return 0;
-    if (persistence?.turn) this.updateTurn(threadId, persistence.turn);
-    if (persistence?.dedupKey) this.eventDedup.add(`${threadId}:${persistence.dedupKey}`);
-    const sequence = ++this.eventSequence;
-    this.events.push({ sequence, threadId, turnId, method, params: copy(params), createdAt: Date.now() });
-    return sequence;
-  }
-  public eventHighWatermark(threadId: string): number {
-    return this.events.findLast((event) => event.threadId === threadId)?.sequence ?? 0;
-  }
-  public listEventsAfter(threadId: string, sequence: number): StoredEvent[] {
-    return this.events.filter((event) => event.threadId === threadId && event.sequence > sequence && !event.method.startsWith("hybrid/"))
-      .map(copy);
-  }
-  public hasProcessedProviderEvent(threadId: string, providerEventId: string): boolean {
-    return this.providerEvents.has(`${threadId}:${providerEventId}`);
-  }
-  public markProviderEventProcessed(threadId: string, _providerEventType: string, providerEventId: string): void {
-    this.providerEvents.add(`${threadId}:${providerEventId}`);
-  }
-  public appendProviderEvent(event: AppendProviderEvent): { record: ProviderEventRecord; inserted: boolean } {
-    const existing = event.providerEventId === null ? undefined : this.providerJournal.find(
-      (candidate) => candidate.threadId === event.threadId && candidate.providerEventId === event.providerEventId,
-    );
-    if (existing) return { record: copy(existing), inserted: false };
-    const record: ProviderEventRecord = {
-      ...copy(event), sequence: ++this.eventSequence, disposition: "pending", error: null, projectedAt: null,
-    };
-    this.providerJournal.push(record);
-    return { record: copy(record), inserted: true };
-  }
-  public completeProviderEvent(
-    threadId: string,
-    sequence: number,
-    disposition: Exclude<ProviderEventDisposition, "pending">,
-    error: string | null = null,
-  ): void {
-    const index = this.providerJournal.findIndex((event) => event.threadId === threadId && event.sequence === sequence);
-    if (index >= 0) this.providerJournal[index] = { ...this.providerJournal[index]!, disposition, error, projectedAt: Date.now() };
-  }
-  public listProviderEvents(threadId: string, disposition?: ProviderEventDisposition): ProviderEventRecord[] {
-    return this.providerJournal.filter((event) =>
-      event.threadId === threadId && (disposition === undefined || event.disposition === disposition),
-    ).map(copy);
-  }
-  public pruneProviderEvents(threadId: string, maxEvents: number, maxBytes: number): number {
-    if (maxEvents < 1) throw new Error("Provider event retention must keep at least one event.");
-    const ordinary = new Set<ProviderEventDisposition>(["projected", "stateOnly", "retainedOnly", "unsupportedVisible"]);
-    const boundaries = new Set(this.turnMessages.values());
-    const candidates = this.providerJournal.filter((event) =>
-      event.threadId === threadId
-      && ordinary.has(event.disposition)
-      && (!event.providerEventId || !boundaries.has(event.providerEventId)));
-    const retained = new Set<number>();
-    let bytes = 0;
-    for (const event of [...candidates].reverse()) {
-      const size = Buffer.byteLength(JSON.stringify(event.payload));
-      if (retained.size >= maxEvents || (retained.size > 0 && bytes + size > maxBytes)) continue;
-      retained.add(event.sequence);
-      bytes += size;
-    }
-    const before = this.providerJournal.length;
-    for (let index = this.providerJournal.length - 1; index >= 0; index -= 1) {
-      const event = this.providerJournal[index]!;
-      if (event.threadId === threadId && ordinary.has(event.disposition)
-        && (!event.providerEventId || !boundaries.has(event.providerEventId))
-        && !retained.has(event.sequence)) {
-        this.providerJournal.splice(index, 1);
-      }
-    }
-    return before - this.providerJournal.length;
-  }
-  public linkProviderItems(threadId: string, providerMessageId: string, ownerThreadId: string, turnId: string, itemIds: readonly string[]): void {
-    for (const itemId of itemIds) {
-      if (this.providerItemCorrelations.some((link) => link.threadId === threadId && link.providerMessageId === providerMessageId && link.itemId === itemId)) continue;
-      this.providerItemCorrelations.push({ threadId, providerMessageId, ownerThreadId, turnId, itemId });
-    }
-  }
-  public listProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): ProviderItemCorrelation[] {
-    const ids = new Set(providerMessageIds);
-    return this.providerItemCorrelations.filter((link) => link.threadId === threadId && ids.has(link.providerMessageId)).map(copy);
-  }
-  public deleteProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): void {
-    const ids = new Set(providerMessageIds);
-    for (let index = this.providerItemCorrelations.length - 1; index >= 0; index -= 1) {
-      const link = this.providerItemCorrelations[index]!;
-      if (link.threadId === threadId && ids.has(link.providerMessageId)) this.providerItemCorrelations.splice(index, 1);
-    }
-  }
-  public commitProviderRetraction(
-    record: ClaudeThreadRecord,
-    providerMessageIds: readonly string[],
-    mutations: readonly ProviderRetractionMutation[],
-    removedThreadIds: readonly string[] = [],
-  ): void {
-    for (const threadId of removedThreadIds) this.deleteThread(threadId);
-    for (const mutation of mutations) {
-      this.updateTurn(mutation.ownerThreadId, mutation.turn);
-      if (mutation.clearBoundary) this.turnMessages.delete(`${mutation.ownerThreadId}:${mutation.turn.id}`);
-    }
-    this.deleteProviderItemCorrelations(record.thread.id, providerMessageIds);
-    this.updateThread(record);
-  }
-
-  public createPendingRequest(request: PendingRequestRecord): void { this.pending.set(request.requestId, copy(request)); }
-  public getPendingRequest(requestId: string): PendingRequestRecord | undefined {
-    const request = this.pending.get(requestId);
-    return request ? copy(request) : undefined;
-  }
-  public findPendingRequestByClaudeId(threadId: string, claudeRequestId: string): PendingRequestRecord | undefined {
-    return [...this.pending.values()].reverse().find((request) => request.threadId === threadId && request.claudeRequestId === claudeRequestId);
-  }
-  public listPendingRequests(threadId: string): PendingRequestRecord[] {
-    return [...this.pending.values()].filter((request) => request.threadId === threadId && request.status === "pending").map(copy);
-  }
-  public resolvePendingRequest(requestId: string, status: "resolved" | "cancelled", response: unknown): void {
-    const request = this.pending.get(requestId);
-    if (request?.status === "pending") this.pending.set(requestId, { ...request, status, response: copy(response), resolvedAt: Date.now() });
-  }
   public sectionOrders(): Map<string, string[]> {
     return new Map([...this.sectionOrderBySection].map(([sectionId, ids]) => [sectionId, [...ids]]));
   }
@@ -429,11 +197,6 @@ export class MemoryHybridStore implements HybridStore {
     return copy(goal);
   }
   public clearGoal(threadId: string): boolean { return this.goals.delete(threadId); }
-  public listQueuedSubmissions(threadId: string): QueuedSubmission[] { return copy(this.queues.get(threadId) ?? []); }
-  public setQueuedSubmissions(threadId: string, items: readonly QueuedSubmission[]): void {
-    if (items.length === 0) this.queues.delete(threadId);
-    else this.queues.set(threadId, copy([...items]));
-  }
   public accountGoalUsage(input: GoalUsageInput): InternalGoal | undefined {
     const checkpoint = input.checkpointKey ? `${input.threadId}:${input.expectedGoalId}:${input.checkpointKey}` : undefined;
     if (checkpoint && this.goalCheckpoints.has(checkpoint)) return this.getGoal(input.threadId);
@@ -455,19 +218,11 @@ export class MemoryHybridStore implements HybridStore {
   public close(): void {
     this.records.clear();
     this.turns.clear();
-    this.pending.clear();
     this.archived.clear();
     this.pendingRemovals.clear();
     this.goals.clear();
     this.flagsBySession.clear();
-    this.queues.clear();
     this.goalCheckpoints.clear();
-    this.turnMessages.clear();
-    this.eventDedup.clear();
-    this.providerEvents.clear();
-    this.providerJournal.length = 0;
-    this.providerItemCorrelations.length = 0;
-    this.events.length = 0;
   }
 }
 
@@ -494,8 +249,8 @@ export class LayeredHybridStore implements HybridStore {
   }
   public sessionFlags(): ReadonlyMap<string, ClaudeSessionFlags> { return this.durable.sessionFlags(); }
   public setSessionFlags(flags: ClaudeSessionFlags): void { this.durable.setSessionFlags(flags); }
-  public adoptTransient(record: ClaudeThreadRecord, turns: readonly Turn[]): void {
-    this.ephemeral.adoptTransient(record, turns);
+  public adoptTransient(record: ClaudeThreadRecord): void {
+    this.ephemeral.adoptTransient(record);
   }
   public updateThread(record: ClaudeThreadRecord): void { this.owner(record.thread.id).updateThread(record); }
   public isThreadArchived(threadId: string): boolean { return this.owner(threadId).isThreadArchived(threadId); }
@@ -525,110 +280,26 @@ export class LayeredHybridStore implements HybridStore {
     if (owner !== this.durable) this.durable.commitThreadRemoval(rootThreadId, []);
   }
   public deleteThread(threadId: string): void { this.owner(threadId).deleteThread(threadId); }
-  public createTurn(threadId: string, turn: Turn): void { this.owner(threadId).createTurn(threadId, turn); }
-  public updateTurn(threadId: string, turn: Turn): void { this.owner(threadId).updateTurn(threadId, turn); }
   public getTurn(threadId: string, turnId: string): Turn | undefined { return this.owner(threadId).getTurn(threadId, turnId); }
   public listTurns(threadId: string): Turn[] { return this.owner(threadId).listTurns(threadId); }
-  public setTurnClaudeMessageUuid(threadId: string, turnId: string, messageUuid: string): void {
-    this.owner(threadId).setTurnClaudeMessageUuid(threadId, turnId, messageUuid);
-  }
-  public getTurnClaudeMessageUuid(threadId: string, turnId: string): string | undefined {
-    return this.owner(threadId).getTurnClaudeMessageUuid(threadId, turnId);
-  }
-  public truncateTurns(threadId: string, keepCount: number): void { this.owner(threadId).truncateTurns(threadId, keepCount); }
   public commitForkedThread(
     record: ClaudeThreadRecord,
-    turns: readonly Turn[],
-    boundaries: readonly TurnProviderBoundary[],
     inheritedGoal?: InternalGoal,
   ): void {
     (this.persistent(record) ? this.durable : this.ephemeral)
-      .commitForkedThread(record, turns, boundaries, inheritedGoal);
+      .commitForkedThread(record, inheritedGoal);
   }
   public commitThreadRollback(
     record: ClaudeThreadRecord,
-    keepCount: number,
-    boundaries: readonly TurnProviderBoundary[],
     removedThreadIds: readonly string[] = [],
   ): void {
-    this.owner(record.thread.id).commitThreadRollback(record, keepCount, boundaries, removedThreadIds);
-  }
-  public commitThreadState(commit: ThreadStateCommit): number[] {
-    return this.owner(commit.record.thread.id).commitThreadState(commit);
-  }
-  public appendEvent(threadId: string, turnId: string | null, method: string, params: unknown, persistence?: EventPersistence): number {
-    return this.owner(threadId).appendEvent(threadId, turnId, method, params, persistence);
-  }
-  public eventHighWatermark(threadId: string): number { return this.owner(threadId).eventHighWatermark(threadId); }
-  public listEventsAfter(threadId: string, sequence: number): StoredEvent[] {
-    return this.owner(threadId).listEventsAfter(threadId, sequence);
-  }
-  public hasProcessedProviderEvent(threadId: string, providerEventId: string): boolean {
-    return this.owner(threadId).hasProcessedProviderEvent(threadId, providerEventId);
-  }
-  public markProviderEventProcessed(threadId: string, providerEventType: string, providerEventId: string): void {
-    this.owner(threadId).markProviderEventProcessed(threadId, providerEventType, providerEventId);
-  }
-  public appendProviderEvent(event: AppendProviderEvent): { record: ProviderEventRecord; inserted: boolean } {
-    return this.owner(event.threadId).appendProviderEvent(event);
-  }
-  public completeProviderEvent(
-    threadId: string,
-    sequence: number,
-    disposition: Exclude<ProviderEventDisposition, "pending">,
-    error: string | null = null,
-  ): void {
-    this.owner(threadId).completeProviderEvent(threadId, sequence, disposition, error);
-  }
-  public listProviderEvents(threadId: string, disposition?: ProviderEventDisposition): ProviderEventRecord[] {
-    return this.owner(threadId).listProviderEvents(threadId, disposition);
-  }
-  public pruneProviderEvents(threadId: string, maxEvents: number, maxBytes: number): number {
-    return this.owner(threadId).pruneProviderEvents(threadId, maxEvents, maxBytes);
-  }
-  public linkProviderItems(threadId: string, providerMessageId: string, ownerThreadId: string, turnId: string, itemIds: readonly string[]): void {
-    this.owner(threadId).linkProviderItems(threadId, providerMessageId, ownerThreadId, turnId, itemIds);
-  }
-  public listProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): ProviderItemCorrelation[] {
-    return this.owner(threadId).listProviderItemCorrelations(threadId, providerMessageIds);
-  }
-  public deleteProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): void {
-    this.owner(threadId).deleteProviderItemCorrelations(threadId, providerMessageIds);
-  }
-  public commitProviderRetraction(
-    record: ClaudeThreadRecord,
-    providerMessageIds: readonly string[],
-    mutations: readonly ProviderRetractionMutation[],
-    removedThreadIds: readonly string[] = [],
-  ): void {
-    this.owner(record.thread.id).commitProviderRetraction(
-      record,
-      providerMessageIds,
-      mutations,
-      removedThreadIds,
-    );
-  }
-  public createPendingRequest(request: PendingRequestRecord): void { this.owner(request.threadId).createPendingRequest(request); }
-  public getPendingRequest(requestId: string): PendingRequestRecord | undefined {
-    return this.ephemeral.getPendingRequest(requestId) ?? this.durable.getPendingRequest(requestId);
-  }
-  public findPendingRequestByClaudeId(threadId: string, claudeRequestId: string): PendingRequestRecord | undefined {
-    return this.owner(threadId).findPendingRequestByClaudeId(threadId, claudeRequestId);
-  }
-  public listPendingRequests(threadId: string): PendingRequestRecord[] { return this.owner(threadId).listPendingRequests(threadId); }
-  public resolvePendingRequest(requestId: string, status: "resolved" | "cancelled", response: unknown): void {
-    const request = this.getPendingRequest(requestId);
-    if (request) this.owner(request.threadId).resolvePendingRequest(requestId, status, response);
+    this.owner(record.thread.id).commitThreadRollback(record, removedThreadIds);
   }
   public sectionOrders(): Map<string, string[]> { return this.durable.sectionOrders(); }
   public setSectionOrder(sectionId: string, threadIds: readonly string[]): void { this.durable.setSectionOrder(sectionId, threadIds); }
   public getGoal(threadId: string): InternalGoal | undefined { return this.owner(threadId).getGoal(threadId); }
   public setGoal(threadId: string, patch: GoalPatch): InternalGoal { return this.owner(threadId).setGoal(threadId, patch); }
   public clearGoal(threadId: string): boolean { return this.owner(threadId).clearGoal(threadId); }
-  public listQueuedSubmissions(threadId: string): QueuedSubmission[] { return this.owner(threadId).listQueuedSubmissions(threadId); }
-  public setQueuedSubmissions(threadId: string, items: readonly QueuedSubmission[]): void {
-    this.owner(threadId).setQueuedSubmissions(threadId, items);
-  }
   public accountGoalUsage(input: GoalUsageInput): InternalGoal | undefined { return this.owner(input.threadId).accountGoalUsage(input); }
   public close(): void { this.ephemeral.close(); this.durable.close(); }
 }

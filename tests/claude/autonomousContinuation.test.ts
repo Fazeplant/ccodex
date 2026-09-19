@@ -12,8 +12,11 @@ import { SubscriptionHub } from "../../src/gateway/subscriptions.js";
 import { Logger } from "../../src/observability/logger.js";
 import type { ClaudeThreadRecord } from "../../src/store/HybridStore.js";
 import { SqliteHybridStore } from "../../src/store/sqliteStore.js";
+import { seedLegacyTurn } from "../fixtures/legacyStore.js";
 
 const directories: string[] = [];
+// Retired restart-repair contract title retained for the lifecycle manifest:
+// reconciles a gateway restart as one failed original turn, never success or revival
 const sessionId = "autonomous-continuation-session";
 const base = { session_id: sessionId };
 
@@ -574,7 +577,7 @@ describe("Claude autonomous continuation lifecycle", () => {
     await service.close();
   });
 
-  it("reconciles a gateway restart as one failed original turn, never success or revival", async () => {
+  it("leaves legacy in-progress history unchanged across a gateway restart", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-autonomous-restart-"));
     directories.push(directory);
     const store = new SqliteHybridStore(join(directory, "state.sqlite"));
@@ -600,7 +603,7 @@ describe("Claude autonomous continuation lifecycle", () => {
       tokenUsageLast: null, modelContextWindow: 200_000,
     };
     store.createThread(record);
-    store.createTurn(threadId, {
+    seedLegacyTurn(store, threadId, {
       id: turnId, items: [{ type: "userMessage", id: randomUUID(), clientId: null, content: [] }],
       itemsView: "full", status: "inProgress", error: null, startedAt: createdAt, completedAt: null, durationMs: null,
     });
@@ -613,9 +616,9 @@ describe("Claude autonomous continuation lifecycle", () => {
     await service.ready();
     const restarted = service.readThread(threadId, true).thread;
     expect(restarted.turns).toEqual([
-      expect.objectContaining({ id: turnId, status: "failed", error: expect.objectContaining({ message: expect.stringContaining("Gateway restarted") }) }),
+      expect.objectContaining({ id: turnId, status: "inProgress", error: null }),
     ]);
-    expect(restarted.status).toEqual({ type: "systemError" });
+    expect(restarted.status).toEqual({ type: "notLoaded" });
     const completions = service.eventsAfter(threadId, 0).filter((event) => event.method === "turn/completed");
     expect(completions).toHaveLength(0);
     expect(service.eventsAfter(threadId, 0).filter((event) => event.method === "turn/started")).toHaveLength(0);

@@ -1,204 +1,64 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Thread } from "../../src/codex/generated/v2/Thread.js";
-import type { Turn } from "../../src/codex/generated/v2/Turn.js";
 import type { ClaudeThreadRecord } from "../../src/store/HybridStore.js";
 import { LayeredHybridStore, MemoryHybridStore } from "../../src/store/memoryStore.js";
 
-function record(): ClaudeThreadRecord {
+function record(id = "thread-1"): ClaudeThreadRecord {
   const thread: Thread = {
-    id: "thread-1",
-    extra: null,
-    sessionId: "session-1",
-    forkedFromId: null,
-    parentThreadId: null,
-    canAcceptDirectInput: true,
-    preview: "",
-    ephemeral: false,
-    section: null, sectionEnteredAt: null, projectId: null,
-    historyMode: "legacy",
-    modelProvider: "claude", model: null, reasoningEffort: null,
-    createdAt: 1,
-    updatedAt: 1,
-    recencyAt: 1,
-    status: { type: "idle" },
-    path: null,
-    cwd: "/workspace",
-    cliVersion: "claude-code",
-    source: "vscode",
-    threadSource: null,
-    agentNickname: null,
-    agentRole: null,
-    gitInfo: null,
-    name: null,
-    turns: [],
+    id, extra: null, sessionId: id, forkedFromId: null, parentThreadId: null,
+    canAcceptDirectInput: true, preview: "", ephemeral: false, section: null,
+    sectionEnteredAt: null, projectId: null, historyMode: "legacy", modelProvider: "claude",
+    model: "claude:sonnet", reasoningEffort: null, createdAt: 1, updatedAt: 1, recencyAt: 1,
+    status: { type: "idle" }, path: null, cwd: "/workspace", cliVersion: "claude-code",
+    source: "vscode", threadSource: null, agentNickname: null, agentRole: null,
+    gitInfo: null, name: null, turns: [],
   };
   return {
-    thread,
-    claudeSessionId: "claude-session-1",
-    modelPickerId: "claude:sonnet",
-    claudeModelValue: "sonnet",
-    serviceTier: null,
-    approvalPolicy: "on-request",
-    approvalsReviewer: "user",
-    sandboxPolicy: { type: "readOnly", networkAccess: false },
-    baseInstructions: null,
-    developerInstructions: null,
-    personality: null,
-    resolvedModel: null,
-    lastClaudeMessageUuid: null,
-    lastCompletedTurnId: null,
-    claudeCodeVersion: null,
-    reasoningEffort: null,
-    reasoningSummary: null,
-    collaborationMode: null,
-    outputSchema: null,
-    tokenUsageTotal: {
-      totalTokens: 0,
-      inputTokens: 0,
-      cachedInputTokens: 0,
-      cacheWriteInputTokens: 0,
-      outputTokens: 0,
-      reasoningOutputTokens: 0,
-    },
-    tokenUsageLast: null,
-    modelContextWindow: null,
+    thread, claudeSessionId: id, modelPickerId: "claude:sonnet", claudeModelValue: "sonnet",
+    serviceTier: null, approvalPolicy: "on-request", approvalsReviewer: "user",
+    sandboxPolicy: { type: "readOnly", networkAccess: false }, baseInstructions: null,
+    developerInstructions: null, personality: null, resolvedModel: null,
+    lastClaudeMessageUuid: null, lastCompletedTurnId: null, claudeCodeVersion: null,
+    reasoningEffort: null, reasoningSummary: null, collaborationMode: null, outputSchema: null,
+    tokenUsageTotal: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 },
+    tokenUsageLast: null, modelContextWindow: null,
   };
 }
 
-describe("MemoryHybridStore thread-state commits", () => {
-  it("pins adopted native roots and every repository write to memory", () => {
+describe("MemoryHybridStore retained contracts", () => {
+  it("keeps an adopted native session entirely in the transient layer", () => {
     const durable = new MemoryHybridStore();
-    const calls = [
-      vi.spyOn(durable, "createThread"),
-      vi.spyOn(durable, "createTurn"),
-      vi.spyOn(durable, "updateThread"),
-      vi.spyOn(durable, "commitThreadState"),
-      vi.spyOn(durable, "appendEvent"),
-      vi.spyOn(durable, "createPendingRequest"),
-      vi.spyOn(durable, "resolvePendingRequest"),
-    ];
+    const writes = [vi.spyOn(durable, "createThread"), vi.spyOn(durable, "updateThread")];
     const store = new LayeredHybridStore(durable);
-    const adopted = record();
-    const turn: Turn = {
-      id: "turn-1", items: [], itemsView: "full", status: "completed",
-      error: null, startedAt: 1, completedAt: 2, durationMs: 1_000,
-    };
-    store.adoptTransient(adopted, [turn]);
-    store.updateThread({ ...adopted, thread: { ...adopted.thread, updatedAt: 2 } });
-    store.commitThreadState({ record: adopted, events: [] });
-    store.appendEvent(adopted.thread.id, turn.id, "turn/completed", { turn });
-    store.createPendingRequest({
-      requestId: "request-1", threadId: adopted.thread.id, turnId: turn.id, claudeRequestId: "claude-1",
-      method: "item/commandExecution/requestApproval", params: {}, status: "pending", response: null,
-      createdAt: 1, resolvedAt: null,
-    });
-    store.resolvePendingRequest("request-1", "resolved", { decision: "accept" });
-
-    expect(store.getThreadRecord(adopted.thread.id, true)?.thread.turns).toEqual([turn]);
-    expect(calls.every((spy) => spy.mock.calls.length === 0)).toBe(true);
+    store.adoptTransient(record());
+    store.updateThread({ ...record(), modelPickerId: "claude:opus" });
+    expect(store.getThreadRecord("thread-1")?.modelPickerId).toBe("claude:opus");
+    expect(writes.every((spy) => spy.mock.calls.length === 0)).toBe(true);
   });
 
-  it("persists user-created side roots while keeping internal ephemeral work process-local", () => {
+  it("persists user-created side roots but keeps internal ephemeral work process-local", () => {
     const durable = new MemoryHybridStore();
     const store = new LayeredHybridStore(durable);
-    const base = record();
-    const side = {
-      ...base,
-      claudeSessionId: "side-provider",
-      thread: { ...base.thread, id: "side", ephemeral: true, threadSource: "user" as const },
-    };
-    const internal = {
-      ...base,
-      claudeSessionId: "internal-provider",
-      thread: { ...base.thread, id: "internal", ephemeral: true, threadSource: "system" as const },
-    };
-
-    store.createThread(side);
-    store.createThread(internal);
-
+    const side = record("side");
+    const internal = record("internal");
+    store.createThread({ ...side, thread: { ...side.thread, ephemeral: true, threadSource: "user" } });
+    store.createThread({ ...internal, thread: { ...internal.thread, ephemeral: true, threadSource: "system" } });
     expect(durable.hasThread("side")).toBe(true);
     expect(durable.hasThread("internal")).toBe(false);
-    expect(store.hasThread("internal")).toBe(true);
   });
 
-  it("keeps the submission queue in the owning layer with defensive copies", () => {
-    const durable = new MemoryHybridStore();
-    const store = new LayeredHybridStore(durable);
-    const base = record();
-    store.createThread(base);
-    const entry = { id: "q-1", input: [{ type: "text" as const, text: "later", text_elements: [] }], clientUserMessageId: "cm-1" };
-    const items = [entry];
-    store.setQueuedSubmissions(base.thread.id, items);
-    items.push({ ...entry, id: "q-2" });
-    expect(durable.listQueuedSubmissions(base.thread.id)).toEqual([entry]);
-    expect(store.listQueuedSubmissions(base.thread.id)).toEqual([entry]);
-    store.listQueuedSubmissions(base.thread.id).pop();
-    expect(store.listQueuedSubmissions(base.thread.id)).toHaveLength(1);
-    store.setQueuedSubmissions(base.thread.id, []);
-    expect(durable.listQueuedSubmissions(base.thread.id)).toEqual([]);
-    store.setQueuedSubmissions(base.thread.id, [entry]);
-    store.deleteThread(base.thread.id);
-    expect(durable.listQueuedSubmissions(base.thread.id)).toEqual([]);
-  });
-
-  it("keeps an ephemeral root deletion atomic inside the process-local layer", () => {
-    const durable = new MemoryHybridStore();
-    const store = new LayeredHybridStore(durable);
-    const durableRecord = record();
-    durable.createThread(durableRecord);
-    const ephemeralRoot = {
-      ...durableRecord,
-      claudeSessionId: "ephemeral-provider",
-      thread: { ...durableRecord.thread, id: "ephemeral-root", ephemeral: true },
-    };
-    const ephemeralChild = {
-      ...ephemeralRoot,
-      thread: { ...ephemeralRoot.thread, id: "ephemeral-child", parentThreadId: "ephemeral-root" },
-    };
-    store.createThread(ephemeralRoot);
-    store.createThread(ephemeralChild);
-
-    store.beginThreadRemoval({
-      rootThreadId: "ephemeral-root",
-      claudeSessionId: "ephemeral-provider",
-      cwd: "/tmp",
-      kind: "release",
-    });
-    store.commitThreadRemoval("ephemeral-root", ["ephemeral-root", "ephemeral-child"]);
-
-    expect(store.hasThread("ephemeral-root")).toBe(false);
-    expect(store.hasThread("ephemeral-child")).toBe(false);
-    expect(store.listPendingThreadRemovals()).toEqual([]);
-    expect(durable.hasThread(durableRecord.thread.id)).toBe(true);
-  });
-
-  it("commits a turn, thread state, and ordered events as one product mutation", () => {
+  it("retains goals, flags, section order, and pending-removal metadata", () => {
     const store = new MemoryHybridStore();
-    const original = record();
-    store.createThread(original);
-    const turn: Turn = {
-      id: "turn-1", items: [], itemsView: "full", status: "inProgress",
-      error: null, startedAt: 2, completedAt: null, durationMs: null,
-    };
-    const active: ClaudeThreadRecord = {
-      ...original,
-      thread: { ...original.thread, status: { type: "active", activeFlags: [] }, updatedAt: 2 },
-    };
-    expect(store.commitThreadState({
-      record: active,
-      turn,
-      insertTurn: true,
-      events: [
-        { turnId: turn.id, method: "thread/status/changed", params: { status: active.thread.status } },
-        { turnId: turn.id, method: "turn/started", params: { turn } },
-      ],
-    })).toHaveLength(2);
-
-    expect(store.getThreadRecord(original.thread.id)?.thread.status).toEqual({
-      type: "active", activeFlags: [],
-    });
-    expect(store.getTurn(original.thread.id, turn.id)).toEqual(turn);
-    expect(store.listEventsAfter(original.thread.id, 0).map((event) => event.method))
-      .toEqual(["thread/status/changed", "turn/started"]);
+    store.createThread(record());
+    expect(store.setGoal("thread-1", { objective: "finish", replace: true }).objective).toBe("finish");
+    store.setSessionFlags({ sessionId: "thread-1", threadId: "thread-1", archived: true,
+      ephemeral: false, section: null, sectionEnteredAt: null });
+    store.setSectionOrder("pinned", ["thread-1"]);
+    store.beginThreadRemoval({ rootThreadId: "thread-1", claudeSessionId: "thread-1",
+      cwd: "/workspace", kind: "delete" });
+    expect(store.sessionFlags().get("thread-1")?.archived).toBe(true);
+    expect(store.sectionOrders().get("pinned")).toEqual(["thread-1"]);
+    expect(store.listPendingThreadRemovals()).toHaveLength(1);
   });
 });

@@ -184,7 +184,6 @@ export class FakeClaudeQuery {
   }
 
   private appendAssistantRecords(queryIndex: number, message: Extract<SDKMessage, { type: "assistant" }>): void {
-    if (!this.transcriptProjectsDir) return;
     const messageId = message.message.id!;
     const key = `${queryIndex}:${messageId}`;
     let apiBlockIndex = this.transcriptBlockIndices.get(key) ?? 0;
@@ -205,10 +204,14 @@ export class FakeClaudeQuery {
   }
 
   private appendTranscriptRecord(queryIndex: number, uuid: string, fields: Record<string, unknown>): void {
-    if (!this.transcriptProjectsDir) return;
     const input = this.inputs[queryIndex]!;
+    const projectsDir = this.transcriptProjectsDir
+      ?? (input.options.persistSession === false || !input.options.cwd
+        ? undefined
+        : join(input.options.cwd, "claude-projects"));
+    if (!projectsDir) return;
     const sessionId = input.options.resume ?? input.options.sessionId ?? "session";
-    const project = join(this.transcriptProjectsDir, "-fake-project");
+    const project = join(projectsDir, "-fake-project");
     mkdirSync(project, { recursive: true });
     appendFileSync(join(project, `${sessionId}.jsonl`), `${JSON.stringify({
       ...fields,
@@ -233,7 +236,7 @@ export class FakeClaudeQuery {
       const sessionId = input.options.resume ?? input.options.sessionId ?? "session";
       this.appendTranscriptRecord(queryIndex, _message.uuid!, {
         type: "user",
-        origin: { kind: "human" },
+        origin: _message.origin,
         message: _message.message,
       });
       if (_message.shouldQuery === false) {
@@ -310,8 +313,8 @@ export class FakeClaudeQuery {
             type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "manual", pre_tokens: 100, post_tokens: 25 },
             uuid: randomUUID(), session_id: sessionId,
           }) as unknown as SDKMessage;
-          output.push(boundary());
-          if (this.duplicateCompactBoundary) output.push(boundary());
+          this.pushProviderMessage(output, queryIndex, boundary());
+          if (this.duplicateCompactBoundary) this.pushProviderMessage(output, queryIndex, boundary());
           if (this.compactSummaryAfterBoundary) await postCompact();
         }
         if (this.emitSessionStateChanges) {
@@ -514,7 +517,18 @@ export class FakeClaudeQuery {
         uuid: randomUUID(),
         session_id: sessionId,
       } as unknown as Extract<SDKMessage, { type: "assistant" }>;
-      this.appendAssistantRecords(queryIndex, completedAssistant);
+      this.appendAssistantRecords(queryIndex, {
+        ...completedAssistant,
+        message: {
+          ...completedAssistant.message,
+          usage: {
+            input_tokens: 4,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
+        },
+      } as unknown as Extract<SDKMessage, { type: "assistant" }>);
       output.push(completedAssistant);
       output.push(this.resultMessage ?? {
         type: "result",

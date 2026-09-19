@@ -116,8 +116,9 @@ describe("Phase 3 ownership boundary", () => {
 
   it("routes child approvals through their canonical root session", () => {
     const resolution = method("async resolveServerRequest", "replayPendingRequests");
-    expect(resolution).toContain("while (owner.thread.parentThreadId)");
-    expect(resolution).toContain("this.sessions.submit(owner.thread.id");
+    expect(resolution).toContain("for (const ownerThreadId of this.sessions.activeOwnerIds())");
+    expect(resolution).toContain("session?.liveSnapshot().pendingRequests");
+    expect(resolution).toContain('session.submit({ type: "resolveInteraction"');
     expect(resolution).not.toContain("this.interactions.resolve");
   });
 
@@ -149,7 +150,7 @@ describe("Phase 3 ownership boundary", () => {
     expect(session).toContain('case "updateDesiredSettings"');
     const sessionSettings = section(session, 'case "updateDesiredSettings"', 'case "announceThread"');
     expect(sessionSettings).toContain("this.commitState(updated");
-    expect(sessionSettings).not.toContain("this.repository.update(updated)");
+    expect(sessionSettings).toContain("this.repository.update(updated)");
     expect(sessionSettings).not.toContain('this.publish(null, "thread/settings/updated"');
     expect(runtimeFactory).toContain("startup: RuntimeStartup");
     expect(runtimeFactory).not.toContain("appliedRecord");
@@ -178,7 +179,7 @@ describe("Phase 3 ownership boundary", () => {
   });
 
   it("commits single-thread lifecycle state before publishing its durable events", () => {
-    const start = section(session, "private startTurn", "private recoverAfterRestart");
+    const start = section(session, "private startTurn", "private finishTurn");
     const finish = section(session, "private finishTurn", "private goalContext");
     const interactionStatus = section(session, "private syncInteractionStatus", "private inspectRuntime");
     for (const source of [start, finish, interactionStatus]) {
@@ -253,12 +254,8 @@ describe("Phase 3 ownership boundary", () => {
       .not.toContain("applySettings");
     expect(session).toContain("private appendReviewExit");
     expect(service).not.toContain("InteractionBridge");
-    const recovery = section(service, "private async reconcileAfterRestart", "private async unloadIdleRuntimes");
-    expect(recovery).not.toContain("failedAfterCrash");
-    expect(recovery).not.toContain("this.store.updateThread");
-    expect(recovery).not.toContain('"turn/completed"');
-    // Goal restart publication remains a named Phase 7 writer-deletion gate.
-    expect(session).toContain('case "recoverAfterRestart"');
+    expect(service).not.toContain("reconcileAfterRestart");
+    expect(session).not.toContain('case "recoverAfterRestart"');
     const review = section(connection, 'message.method === "review/start"', 'message.method === "thread/goal/set"');
     expect(section(review, "announceThread", "sendResult")).toContain("announceThread");
   });

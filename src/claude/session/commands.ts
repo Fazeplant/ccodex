@@ -52,6 +52,7 @@ export interface ClaudeLiveSnapshot {
     readonly providerCostUsdTotal: number;
   };
   readonly status: Thread["status"];
+  readonly preview: string;
   readonly lastClaudeMessageUuid: string | null;
   readonly seq: number;
 }
@@ -195,11 +196,6 @@ export interface MainStreamProjection {
 export interface CompletedSessionTurn {
   readonly record: ClaudeThreadRecord;
   readonly turn: Turn;
-}
-
-export interface RestartRecovery {
-  readonly recoveredTurnIds: readonly string[];
-  readonly abandonedProviderEventTypes: readonly string[];
 }
 
 export type LifecycleFact =
@@ -415,11 +411,7 @@ export type ClaudeSessionCommand =
   }
   | { readonly type: "liveSnapshot" }
   | { readonly type: "notificationsAfter"; readonly seq: number }
-  | { readonly type: "recoverAfterRestart"; readonly statusCommandEnabled: boolean }
   | { readonly type: "purgeStartupProjection" }
-  | {
-    readonly type: "snapshotBranch";
-  }
   | {
     readonly type: "commitForkTarget";
     readonly record: ClaudeThreadRecord;
@@ -430,9 +422,8 @@ export type ClaudeSessionCommand =
   }
   | {
     readonly type: "commitRollback";
-    readonly expectedRevision: string;
     readonly replacementSessionId: string;
-    readonly keepCount: number;
+    readonly retainedTurns: readonly Turn[];
     readonly sourceBoundaries: readonly TurnProviderBoundary[];
     readonly uuidMap: readonly (readonly [string, string])[];
   }

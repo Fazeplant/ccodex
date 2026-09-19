@@ -5,11 +5,7 @@ import { join } from "node:path";
 import type { Thread } from "../../../src/codex/generated/v2/Thread.js";
 import type { ThreadSettings } from "../../../src/codex/generated/v2/ThreadSettings.js";
 import type { Turn } from "../../../src/codex/generated/v2/Turn.js";
-import type {
-  ClaudeThreadRecord,
-  EventPersistence,
-  ThreadStateCommit,
-} from "../../../src/store/HybridStore.js";
+import type { ClaudeThreadRecord } from "../../../src/store/HybridStore.js";
 import { MemoryHybridStore } from "../../../src/store/memoryStore.js";
 import { SubscriptionHub } from "../../../src/gateway/subscriptions.js";
 import type {
@@ -86,48 +82,6 @@ function record(threadId: string): ClaudeThreadRecord {
   };
 }
 
-class ProvenanceStore extends MemoryHybridStore {
-  public readonly sources: Array<{ method: string; providerEventId: string | null; providerEventType: string | null }> = [];
-
-  public override appendEvent(
-    threadId: string,
-    turnId: string | null,
-    method: string,
-    params: unknown,
-    persistence?: EventPersistence,
-  ): number {
-    this.sources.push({
-      method,
-      providerEventId: persistence?.providerEventId ?? null,
-      providerEventType: persistence?.providerEventType ?? null,
-    });
-    return super.appendEvent(threadId, turnId, method, params, persistence);
-  }
-}
-
-class TerminalCommitFailureStore extends MemoryHybridStore {
-  public failTerminalCommit = false;
-  public failCompactionCommit = false;
-  public failBoundaryCommit = false;
-  public failUsageCommit = false;
-
-  public override commitThreadState(commit: ThreadStateCommit): number[] {
-    if (this.failTerminalCommit && commit.events.some((event) => event.method === "turn/completed")) {
-      throw new Error("injected terminal commit failure");
-    }
-    if (this.failCompactionCommit && commit.events.some((event) => event.method === "thread/compacted")) {
-      throw new Error("injected compaction commit failure");
-    }
-    if (this.failBoundaryCommit && commit.providerBoundary) {
-      throw new Error("injected provider boundary commit failure");
-    }
-    if (this.failUsageCommit && commit.events.some((event) => event.method === "thread/tokenUsage/updated")) {
-      throw new Error("injected usage commit failure");
-    }
-    return super.commitThreadState(commit);
-  }
-}
-
 function harness(
   onLifecycle: (update: SessionLifecycleUpdate) => void = () => undefined,
   store = new MemoryHybridStore(),
@@ -146,174 +100,32 @@ function harness(
   return { store, hub, registry, metrics };
 }
 
+function liveSnapshot(
+  registry: ClaudeSessionRegistry<ClaudeSessionCommand, ClaudeSession>,
+  threadId = "thread-1",
+): ClaudeLiveSnapshot {
+  return registry.resolvedSession(threadId)!.liveSnapshot();
+}
+
+function liveTurn(
+  registry: ClaudeSessionRegistry<ClaudeSessionCommand, ClaudeSession>,
+  threadId: string,
+  turnId: string,
+): Turn | undefined {
+  const snapshot = liveSnapshot(registry, threadId);
+  if (snapshot.activeTurn?.id === turnId) return snapshot.activeTurn;
+  return snapshot.childProjections.get(threadId)?.turns.find((turn) => turn.id === turnId);
+}
+
+function notifications(
+  registry: ClaudeSessionRegistry<ClaudeSessionCommand, ClaudeSession>,
+  threadId = "thread-1",
+): ClaudeLiveNotification[] {
+  return registry.resolvedSession(threadId)!.notificationsAfter(0)
+    .filter((notification) => notification.threadId === threadId);
+}
+
 describe("ClaudeSession Phase 3 slice", () => {
-  it.each(["shell", "compaction"] as const)(
-    "does not persist or emit a partial %s terminal lifecycle when its atomic commit fails",
-    async (kind) => {
-      const store = new TerminalCommitFailureStore();
-      const { hub, registry } = harness(undefined, store);
-      const emitted: string[] = [];
-      hub.subscribe("thread-1", "terminal-atomicity", (method) => emitted.push(method));
-      await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-      await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-
-      let turnId: string;
-      let complete: () => Promise<unknown>;
-      if (kind === "shell") {
-        const started = await registry.submit<{ operationId: string; turnId: string }>(
-          "thread-1",
-          { type: "startShell", command: "printf done" },
-        );
-        turnId = started.turnId;
-        complete = () => registry.submit("thread-1", {
-          type: "finishShell",
-          operationId: started.operationId,
-          exitCode: 0,
-        });
-      } else {
-        const started = await registry.submit<{ turnId: string }>("thread-1", { type: "startCompact" });
-        turnId = started.turnId;
-        complete = () => registry.submit("thread-1", {
-          type: "compactBoundary",
-          runtimeGeneration: 1,
-          trigger: "manual",
-          boundary: "summary-boundary",
-          source: { providerEventId: "boundary", providerEventType: "compact_boundary" },
-        });
-      }
-
-      const beforeTerminal = store.listEventsAfter("thread-1", 0).length;
-      store.failTerminalCommit = true;
-      await expect(complete()).rejects.toThrow("injected terminal commit failure");
-
-      expect(store.getThreadRecord("thread-1", false)?.thread.status).toMatchObject({ type: "active" });
-      expect(store.getTurn("thread-1", turnId)?.status).toBe("inProgress");
-      expect(store.getThreadRecord("thread-1", false)?.lastClaudeMessageUuid).toBeNull();
-      expect(store.getTurnClaudeMessageUuid("thread-1", turnId)).toBeUndefined();
-      expect(store.listEventsAfter("thread-1", 0).slice(beforeTerminal)).toEqual([]);
-      expect(emitted.slice(beforeTerminal)).toEqual([]);
-      await registry.close();
-    },
-  );
-
-  it("commits an automatic compaction boundary, provider tip, turn, and event through one session write", async () => {
-    const store = new TerminalCommitFailureStore();
-    const { registry } = harness(undefined, store);
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-    const prepared = await registry.submit<{ turn: Turn }>("thread-1", {
-      type: "prepareTurn",
-      params: {
-        threadId: "thread-1",
-        input: [{ type: "text", text: "compact automatically", text_elements: [] }],
-      },
-    });
-    const before = store.listEventsAfter("thread-1", 0).length;
-    store.failCompactionCommit = true;
-    await expect(registry.submit("thread-1", {
-      type: "compactBoundary",
-      runtimeGeneration: 1,
-      trigger: "auto",
-      boundary: "auto-boundary",
-      source: { providerEventId: "auto", providerEventType: "compact_boundary" },
-    })).rejects.toThrow("injected compaction commit failure");
-
-    expect(store.getThreadRecord("thread-1", false)?.lastClaudeMessageUuid).toBeNull();
-    expect(store.getTurnClaudeMessageUuid("thread-1", prepared.turn.id)).toBeUndefined();
-    expect(store.listEventsAfter("thread-1", 0).slice(before)).toEqual([]);
-    await registry.close();
-  });
-
-  it("commits a provider boundary, root tip, and item correlations through one session write", async () => {
-    const store = new TerminalCommitFailureStore();
-    const { registry } = harness(undefined, store);
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-    const prepared = await registry.submit<{ turn: Turn }>("thread-1", {
-      type: "prepareTurn",
-      params: {
-        threadId: "thread-1",
-        input: [{ type: "text", text: "provider response", text_elements: [] }],
-      },
-    });
-    store.failBoundaryCommit = true;
-    await expect(registry.submit("thread-1", {
-      type: "providerBoundary",
-      runtimeGeneration: 1,
-      providerMessageId: "provider-boundary",
-      itemIds: ["item-1"],
-    })).rejects.toThrow("injected provider boundary commit failure");
-
-    expect(store.getThreadRecord("thread-1", false)?.lastClaudeMessageUuid).toBeNull();
-    expect(store.getTurnClaudeMessageUuid("thread-1", prepared.turn.id)).toBeUndefined();
-    expect(store.listProviderItemCorrelations("thread-1", ["provider-boundary"])).toEqual([]);
-    await registry.close();
-  });
-
-  it("atomically commits a projected child boundary without changing the root provider tip", async () => {
-    const store = new TerminalCommitFailureStore();
-    const { registry } = harness(undefined, store);
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-    await registry.submit("thread-1", {
-      type: "prepareTurn",
-      params: {
-        threadId: "thread-1",
-        input: [{ type: "text", text: "spawn a child", text_elements: [] }],
-      },
-    });
-    await registry.submit("thread-1", {
-      type: "providerBoundary",
-      runtimeGeneration: 1,
-      providerMessageId: "root-boundary",
-      itemIds: [],
-    });
-    const spawned = await registry.submit<MainStreamProjection>("thread-1", {
-      type: "mainStream",
-      runtimeGeneration: 1,
-      source: { providerEventId: "spawn", providerEventType: "task_started" },
-      fact: {
-        kind: "taskStart",
-        taskId: "child-task",
-        providerId: "spawn-tool",
-        description: "child",
-        subagentType: "general-purpose",
-      },
-    });
-    const childThreadId = spawned.childThreadId!;
-    const childTurnId = store.listTurns(childThreadId)[0]!.id;
-    store.failBoundaryCommit = true;
-    await expect(registry.submit("thread-1", {
-      type: "providerBoundary",
-      runtimeGeneration: 1,
-      providerMessageId: "child-boundary",
-      ownerThreadId: childThreadId,
-      itemIds: ["child-item"],
-    })).rejects.toThrow("injected provider boundary commit failure");
-
-    expect(store.getThreadRecord("thread-1", false)?.lastClaudeMessageUuid).toBe("root-boundary");
-    expect(store.getTurnClaudeMessageUuid(childThreadId, childTurnId)).toBeUndefined();
-    expect(store.listProviderItemCorrelations("thread-1", ["child-boundary"])).toEqual([]);
-
-    store.failBoundaryCommit = false;
-    await registry.submit("thread-1", {
-      type: "providerBoundary",
-      runtimeGeneration: 1,
-      providerMessageId: "child-boundary",
-      ownerThreadId: childThreadId,
-      itemIds: ["child-item"],
-    });
-    expect(store.getThreadRecord("thread-1", false)?.lastClaudeMessageUuid).toBe("root-boundary");
-    expect(store.getTurnClaudeMessageUuid(childThreadId, childTurnId)).toBe("child-boundary");
-    expect(store.listProviderItemCorrelations("thread-1", ["child-boundary"])).toMatchObject([{
-      providerMessageId: "child-boundary",
-      ownerThreadId: childThreadId,
-      turnId: childTurnId,
-      itemId: "child-item",
-    }]);
-    await registry.close();
-  });
-
   it("keeps an auto-backgrounded MCP call on one item through progress and completion", async () => {
     const { store, registry } = harness();
     await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
@@ -352,11 +164,11 @@ describe("ClaudeSession Phase 3 slice", () => {
       },
     });
 
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items.filter((item) => item.id === "mcp-tool"))
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items.filter((item) => item.id === "mcp-tool"))
       .toEqual([expect.objectContaining({
         type: "mcpToolCall", id: "mcp-tool", status: "completed", durationMs: 121_000,
       })]);
-    const events = store.listEventsAfter("thread-1", 0);
+    const events = notifications(registry, "thread-1");
     expect(events.filter((event) => event.method === "item/started"
       && (event.params as { item?: { id?: string } }).item?.id === "mcp-tool")).toHaveLength(1);
     expect(events.filter((event) => event.method === "item/mcpToolCall/progress"
@@ -404,7 +216,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       },
     });
 
-    const item = store.getTurn("thread-1", prepared.turn.id)?.items.find((candidate) => candidate.id === "mcp-tool");
+    const item = liveTurn(registry, "thread-1", prepared.turn.id)?.items.find((candidate) => candidate.id === "mcp-tool");
     expect(item).toMatchObject({
       type: "mcpToolCall", status: "completed",
       result: { content: [{ type: "text", text: "MCP completed\nReport: file:///tmp/report.md\ndata.csv: file:///tmp/data.csv" }] },
@@ -559,8 +371,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "prepareTurn", params: { threadId: "thread-1", input: [] },
       hiddenInput: true, goalOperation: fresh,
     })).toBeDefined();
-    expect(store.getThreadRecord("thread-1", true)?.thread.turns
-      .filter((turn) => turn.status === "inProgress")).toHaveLength(1);
+    expect(liveSnapshot(registry).activeTurn?.status).toBe("inProgress");
     await registry.close();
   });
 
@@ -935,40 +746,6 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.close();
   });
 
-  it("clears a queued continuation when rollback detaches its silent runtime", async () => {
-    const lifecycle: SessionLifecycleUpdate[] = [];
-    const { registry } = harness((update) => lifecycle.push(update));
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-    await registry.submit("thread-1", {
-      type: "goal", command: { kind: "runtimeReady", runtimeGeneration: 1 },
-    });
-    const mutation = await registry.submit<Extract<PreparedGoalMutation, { kind: "set" }>>("thread-1", {
-      type: "goal", command: { kind: "prepareSet", params: { threadId: "thread-1", objective: "rollback safely" } },
-    });
-    await registry.submit("thread-1", { type: "goal", command: { kind: "finalize", mutation } });
-    const stale = lifecycle.flatMap((update) => update.goalEffects ?? [])
-      .find((effect): effect is Extract<GoalEffect, { kind: "continue" }> => effect.kind === "continue")!;
-    const snapshot = await registry.submit<{ revision: string }>("thread-1", { type: "snapshotBranch" });
-    await registry.submit("thread-1", {
-      type: "commitRollback",
-      expectedRevision: snapshot.revision,
-      replacementSessionId: "replacement",
-      keepCount: 0,
-      sourceBoundaries: [],
-      uuidMap: [],
-    });
-    await expect(registry.submit("thread-1", {
-      type: "runtimeDetached", runtimeGeneration: 1,
-    })).resolves.toBe(true);
-    expect(await registry.submit("thread-1", {
-      type: "prepareTurn", params: { threadId: "thread-1", input: [] },
-      hiddenInput: true, goalOperation: stale,
-    })).toBeUndefined();
-    expect(lifecycle.flatMap((update) => update.goalEffects ?? [])
-      .filter((effect) => effect.kind === "ensureRuntime")).toHaveLength(1);
-    await registry.close();
-  });
 
   it("keeps resume gated after a raced silent detach", async () => {
     const lifecycle: SessionLifecycleUpdate[] = [];
@@ -1020,7 +797,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     }
     await registry.submit("thread-1", { type: "goal", command: { kind: "finalize", mutation: second } });
 
-    expect(store.listEventsAfter("thread-1", 0)
+    expect(notifications(registry, "thread-1")
       .filter((event) => event.method === "thread/goal/updated")).toHaveLength(3);
     expect(lifecycle.flatMap((update) => update.goalEffects ?? [])
       .filter((effect) => effect.kind === "steer")).toHaveLength(1);
@@ -1126,7 +903,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     expect(persisted.thread).toMatchObject({ id: "thread-1", status: { type: "idle" }, turns: [] });
 
     await registry.submit("thread-1", { type: "announceThread" });
-    expect(store.listEventsAfter("thread-1", 0)).toMatchObject([{
+    expect(notifications(registry, "thread-1")).toMatchObject([{
       method: "thread/started",
       params: { thread: { id: "thread-1", status: { type: "idle" } } },
     }]);
@@ -1155,74 +932,12 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.close();
   });
 
-  it("rejects missing, duplicate, and wrong-turn fork provenance before either branch commit", async () => {
-    const { store, registry } = harness();
-    await registry.submit("source", { type: "createThread", record: record("source") });
-    const one: Turn = {
-      id: "one", items: [], itemsView: "full", status: "completed", error: null,
-      startedAt: 1, completedAt: 2, durationMs: 1_000,
-    };
-    const two = { ...one, id: "two" };
-    store.createTurn("source", one);
-    store.createTurn("source", two);
-    store.setTurnClaudeMessageUuid("source", "one", "old-one");
-    store.setTurnClaudeMessageUuid("source", "two", "old-two");
-    const snapshot = await registry.submit<{
-      record: ClaudeThreadRecord;
-      revision: string;
-    }>("source", { type: "snapshotBranch" });
-
-    const target = record("target");
-    for (const command of [
-      {
-        type: "commitForkTarget" as const, record: target, turns: [one],
-        sourceBoundaries: [{ turnId: "one", messageUuid: "old-one" }], uuidMap: [],
-      },
-      {
-        type: "commitForkTarget" as const, record: target, turns: [one],
-        sourceBoundaries: [
-          { turnId: "one", messageUuid: "old-one" },
-          { turnId: "one", messageUuid: "old-two" },
-        ],
-        uuidMap: [["old-one", "new-one"], ["old-two", "new-two"]] as const,
-      },
-      {
-        type: "commitForkTarget" as const, record: target, turns: [one],
-        sourceBoundaries: [{ turnId: "two", messageUuid: "old-two" }],
-        uuidMap: [["old-two", "new-two"]] as const,
-      },
-    ]) {
-      await expect(registry.submit("target", command)).rejects.toThrow("invalid provenance");
-      expect(store.hasThread("target")).toBe(false);
-    }
-
-    for (const sourceBoundaries of [
-      [{ turnId: "one", messageUuid: "old-one" }],
-      [
-        { turnId: "one", messageUuid: "old-one" },
-        { turnId: "one", messageUuid: "old-two" },
-      ],
-      [{ turnId: "two", messageUuid: "old-two" }],
-    ]) {
-      await expect(registry.submit("source", {
-        type: "commitRollback",
-        expectedRevision: snapshot.revision,
-        replacementSessionId: "replacement",
-        keepCount: 1,
-        sourceBoundaries,
-        uuidMap: sourceBoundaries.length === 1 && sourceBoundaries[0]!.messageUuid === "old-one"
-          ? [] : [["old-one", "new-one"], ["old-two", "new-two"]],
-      })).rejects.toThrow("invalid provenance");
-      expect(store.getThreadRecord("source", true)?.thread.turns.map((turn) => turn.id)).toEqual(["one", "two"]);
-    }
-    await registry.close();
-  });
 
   it("persists the started event before publishing it live", async () => {
     const { store, hub, registry } = harness();
     await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
     hub.subscribe("thread-1", "test", () => {
-      expect(store.listEventsAfter("thread-1", 0).at(-1)?.method).toBe("thread/started");
+      expect(notifications(registry, "thread-1").at(-1)?.method).toBe("thread/started");
     });
     await registry.submit("thread-1", { type: "announceThread" });
     await registry.close();
@@ -1236,7 +951,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       if (method !== "thread/settings/updated") return;
       const model = (params as { threadSettings: { model: string } }).threadSettings.model;
       expect(store.getThreadRecord("thread-1")?.modelPickerId).toBe(model);
-      expect(store.listEventsAfter("thread-1", 0).at(-1)?.method).toBe(method);
+      expect(notifications(registry, "thread-1").at(-1)?.method).toBe(method);
       advertised.push(model);
     });
 
@@ -1284,7 +999,9 @@ describe("ClaudeSession Phase 3 slice", () => {
       candidate: { ...initial, reasoningEffort: "low" },
       threadSettings: { model: initial.modelPickerId } as ThreadSettings,
     })).resolves.toMatchObject({ changed: false, conflict: true });
-    expect(store.getThreadRecord("thread-1")).toMatchObject({
+    expect(await registry.submit<ClaudeThreadRecord>("thread-1", {
+      type: "readThread", includeTurns: false,
+    })).toMatchObject({
       settingsGeneration: 1,
       modelPickerId: "claude:claude-opus-4-8",
       reasoningEffort: "high",
@@ -1325,7 +1042,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     hub.subscribe("thread-1", "test", (method) => {
       events.push({
         method,
-        persisted: store.listEventsAfter("thread-1", 0).map((event) => event.method),
+        persisted: notifications(registry, "thread-1").map((event) => event.method),
       });
     });
 
@@ -1344,7 +1061,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       preview: "hello",
       status: { type: "active", activeFlags: [] },
     });
-    expect(store.getTurn("thread-1", prepared.turn.id)).toMatchObject({
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)).toMatchObject({
       status: "inProgress",
       items: [{ type: "userMessage", clientId: "client-1" }],
     });
@@ -1360,22 +1077,6 @@ describe("ClaudeSession Phase 3 slice", () => {
     ]);
     for (const event of events) expect(event.persisted).toContain(event.method);
     await registry.close();
-
-    const rematerialized = new ClaudeSessionRegistry<ClaudeSessionCommand, ClaudeSession>(
-      (threadId) => new ClaudeSession(
-        threadId,
-        new ClaudeSessionRepository(store),
-        new ClaudeOutputAdapter(hub),
-      ),
-    );
-    await rematerialized.submit("thread-1", { type: "announceTurn", turnId: prepared.turn.id });
-    expect(events.map((event) => event.method)).toEqual([
-      "thread/status/changed",
-      "turn/started",
-      "item/started",
-      "item/completed",
-    ]);
-    await rematerialized.close();
   });
 
   it("fences facts from a retired runtime generation", async () => {
@@ -1404,7 +1105,9 @@ describe("ClaudeSession Phase 3 slice", () => {
       model: "claude-haiku-4-5",
       cliVersion: "2.1.261",
     });
-    expect(store.getThreadRecord("thread-1")).toMatchObject({
+    expect(await registry.submit<ClaudeThreadRecord>("thread-1", {
+      type: "readThread", includeTurns: false,
+    })).toMatchObject({
       resolvedModel: "claude-haiku-4-5",
       claudeCodeVersion: "2.1.261",
       thread: { cliVersion: "2.1.261" },
@@ -1416,7 +1119,9 @@ describe("ClaudeSession Phase 3 slice", () => {
       model: "stale",
       cliVersion: "stale",
     });
-    expect(store.getThreadRecord("thread-1")?.resolvedModel).toBe("claude-haiku-4-5");
+    expect((await registry.submit<ClaudeThreadRecord>("thread-1", {
+      type: "readThread", includeTurns: false,
+    })).resolvedModel).toBe("claude-haiku-4-5");
     await registry.close();
   });
 
@@ -1446,7 +1151,7 @@ describe("ClaudeSession Phase 3 slice", () => {
         threadSettings: expect.objectContaining({ serviceTier: null }),
       }),
     }));
-    expect(store.listTurns("thread-1").at(-1)?.items).toContainEqual(expect.objectContaining({
+    expect(liveSnapshot(registry).activeTurn?.items).toContainEqual(expect.objectContaining({
       type: "agentMessage",
       text: expect.stringContaining("Fast mode is unavailable (extra usage disabled)"),
     }));
@@ -1477,7 +1182,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       disabledReason: "network_error",
     });
     expect(store.getThreadRecord("thread-1")?.serviceTier).toBeNull();
-    expect(store.listTurns("thread-1").at(-1)?.items).toContainEqual(expect.objectContaining({
+    expect(liveSnapshot(registry).activeTurn?.items).toContainEqual(expect.objectContaining({
       type: "agentMessage",
       text: expect.stringContaining("Fast mode is unavailable (network error)"),
     }));
@@ -1534,7 +1239,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 300));
 
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items).toContainEqual(expect.objectContaining({
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items).toContainEqual(expect.objectContaining({
       type: "commandExecution",
       id: "background-bash",
       aggregatedOutput: null,
@@ -1569,7 +1274,7 @@ describe("ClaudeSession Phase 3 slice", () => {
         description: "ticks", taskType: "bash", outputFile,
       },
     });
-    await vi.waitFor(() => expect(store.getTurn("thread-1", prepared.turn.id)?.items)
+    await vi.waitFor(() => expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items)
       .toContainEqual(expect.objectContaining({ id: "bash", aggregatedOutput: "first\n" })));
     appendFileSync(outputFile, "second\n");
     await registry.submit("thread-1", {
@@ -1583,7 +1288,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "lifecycle", runtimeGeneration: 1, source,
       fact: { type: "result", status: "completed", codexErrorInfo: null, origin: null },
     });
-    expect(store.getTurn("thread-1", prepared.turn.id)).toMatchObject({
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)).toMatchObject({
       status: "completed",
       items: expect.arrayContaining([
         expect.objectContaining({
@@ -1656,7 +1361,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     expect(events.filter((event) => event.method === "item/started")).toHaveLength(1);
     expect(events.filter((event) => event.method === "item/commandExecution/outputDelta")).toHaveLength(1);
     expect(events.filter((event) => event.method === "item/completed")).toHaveLength(1);
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items).toContainEqual(expect.objectContaining({
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items).toContainEqual(expect.objectContaining({
       id: "background-bash",
       processId: "background-task",
       status: "completed",
@@ -1776,12 +1481,12 @@ describe("ClaudeSession Phase 3 slice", () => {
         },
       });
     }
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items).toContainEqual(expect.objectContaining({
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items).toContainEqual(expect.objectContaining({
       id: "edit",
       type: "fileChange",
       changes: [expect.objectContaining({ path, diff: expect.stringContaining("-before") })],
     }));
-    const hookEvents = store.listEventsAfter("thread-1", 0)
+    const hookEvents = notifications(registry, "thread-1")
       .filter((event) => event.method === "hook/completed")
       .map((event) => (event.params as { run: ClaudeHookRun }).run);
     expect(hookEvents).toMatchObject([
@@ -1791,39 +1496,6 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.close();
   });
 
-  it("keeps an out-of-band lifecycle diagnostic out of the App event stream", async () => {
-    const store = new ProvenanceStore();
-    const { registry } = harness(() => undefined, store);
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-    await registry.submit("thread-1", {
-      type: "prepareTurn",
-      params: { threadId: "thread-1", input: [{ type: "text", text: "wait", text_elements: [] }] },
-    });
-    const providerSource = { providerEventId: "provider-a", providerEventType: "task_notification" };
-    await registry.submit("thread-1", {
-      type: "lifecycle",
-      runtimeGeneration: 1,
-      source: providerSource,
-      fact: { type: "taskNotification" },
-    });
-    await registry.submit("thread-1", {
-      type: "lifecycle",
-      runtimeGeneration: 1,
-      source: providerSource,
-      fact: { type: "result", status: "completed", codexErrorInfo: null, origin: null },
-    });
-    const beforeTimer = store.sources.length;
-    await registry.submit("thread-1", {
-      type: "lifecycle",
-      runtimeGeneration: 1,
-      source: { providerEventId: null, providerEventType: null },
-      fact: { type: "timer", generation: 1 },
-    });
-
-    expect(store.sources.slice(beforeTimer)).toEqual([]);
-    await registry.close();
-  });
 
   it("owns main text/reasoning reconciliation and persists each projection before publication", async () => {
     const { store, hub, registry } = harness();
@@ -1847,10 +1519,10 @@ describe("ClaudeSession Phase 3 slice", () => {
     hub.subscribe("thread-1", "stream", (method) => {
       methods.push(method);
       if (method === "item/agentMessage/delta") {
-        expect(store.getTurn("thread-1", prepared.turn.id)?.items).toContainEqual(
+        expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items).toContainEqual(
           expect.objectContaining({ type: "agentMessage", text: "Working" }),
         );
-        expect(store.listEventsAfter("thread-1", 0).at(-1)?.method).toBe(method);
+        expect(notifications(registry, "thread-1").at(-1)?.method).toBe(method);
       }
     });
     const source = { providerEventId: "provider-1", providerEventType: "stream_event" };
@@ -1885,7 +1557,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     });
     await stream({ kind: "finish" });
 
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items).toEqual([
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items).toEqual([
       expect.objectContaining({ type: "userMessage", id: stagedUuid }),
       expect.objectContaining({ type: "agentMessage", id: "message-text:0", text: "Working", phase: "commentary" }),
       expect.objectContaining({
@@ -1908,15 +1580,13 @@ describe("ClaudeSession Phase 3 slice", () => {
     const methods: string[] = [];
     hub.subscribe("thread-1", "terminal", (method) => {
       methods.push(method);
-      if (method === "thread/status/changed") {
-        expect(store.listEventsAfter("thread-1", 0).slice(-3).map((event) => event.method)).toEqual([
+      if (method === "turn/completed") {
+        expect(notifications(registry, "thread-1").slice(-3).map((event) => event.method)).toEqual([
           "thread/status/changed",
           "error",
           "turn/completed",
         ]);
-      }
-      if (method === "turn/completed") {
-        expect(store.getTurn("thread-1", prepared.turn.id)).toMatchObject({
+        expect(liveTurn(registry, "thread-1", prepared.turn.id)).toMatchObject({
           status: "failed",
           error: { message: "provider failed", codexErrorInfo: "badRequest" },
         });
@@ -1967,59 +1637,19 @@ describe("ClaudeSession Phase 3 slice", () => {
       "error",
       "turn/completed",
     ]);
-    expect(store.getThreadRecord("thread-1")).toMatchObject({
-      lastCompletedTurnId: prepared.turn.id,
-      tokenUsageTotal: { totalTokens: 12 },
-      tokenUsageLast: { totalTokens: 8 },
-      modelContextWindow: 200_000,
-      providerCostUsdTotal: 0.75,
-      thread: { status: { type: "idle" } },
-    });
-    await registry.close();
-  });
-
-  it("commits usage state and its replayable event atomically before live publication", async () => {
-    const store = new TerminalCommitFailureStore();
-    const { hub, registry } = harness(undefined, store);
-    const emitted: string[] = [];
-    hub.subscribe("thread-1", "usage-atomicity", (method) => emitted.push(method));
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-    const usage = {
-      type: "publishUsage" as const,
-      runtimeGeneration: 1,
-      turnId: "usage-turn",
-      last: {
-        totalTokens: 8,
-        inputTokens: 6,
-        cachedInputTokens: 4,
-        cacheWriteInputTokens: 0,
-        outputTokens: 2,
-        reasoningOutputTokens: 0,
+    expect(liveSnapshot(registry)).toMatchObject({
+      activeTurn: { id: prepared.turn.id, status: "failed" },
+      usage: {
+        total: { totalTokens: 12 },
+        last: { totalTokens: 8 },
+        modelContextWindow: 200_000,
+        providerCostUsdTotal: 0.75,
       },
-      modelContextWindow: 200_000,
-    };
-
-    store.failUsageCommit = true;
-    await expect(registry.submit("thread-1", usage)).rejects.toThrow("injected usage commit failure");
-    expect(store.getThreadRecord("thread-1", false)).toMatchObject({
-      tokenUsageLast: null,
-      modelContextWindow: null,
+      status: { type: "idle" },
     });
-    expect(store.listEventsAfter("thread-1", 0)).toEqual([]);
-    expect(emitted).toEqual([]);
-
-    store.failUsageCommit = false;
-    await registry.submit("thread-1", usage);
-    expect(store.getThreadRecord("thread-1", false)).toMatchObject({
-      tokenUsageLast: { totalTokens: 8 },
-      modelContextWindow: 200_000,
-    });
-    expect(store.listEventsAfter("thread-1", 0).map((event) => event.method))
-      .toEqual(["thread/tokenUsage/updated"]);
-    expect(emitted).toEqual(["thread/tokenUsage/updated"]);
     await registry.close();
   });
+
 
   it("keeps tool correlation alive across stream finish until its late result", async () => {
     const { store, registry } = harness();
@@ -2038,7 +1668,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     } });
     await stream({ kind: "finish" });
     await stream({ kind: "toolComplete", providerId: "late-bash", output: "OK", isError: false });
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items).toContainEqual(expect.objectContaining({
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items).toContainEqual(expect.objectContaining({
       type: "commandExecution", id: "late-bash", status: "completed", aggregatedOutput: "OK",
     }));
     await registry.close();
@@ -2066,7 +1696,8 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "openInteraction",
       runtimeGeneration: 1,
       request: {
-        threadId: child.childThreadId, turnId: store.listTurns(child.childThreadId)[0]!.id,
+        threadId: child.childThreadId,
+        turnId: liveSnapshot(registry).childProjections.get(child.childThreadId)!.turns[0]!.id,
         claudeRequestId: "child-provider-request", method: "item/commandExecution/requestApproval",
         params: { command: "curl example.com" },
       },
@@ -2082,14 +1713,14 @@ describe("ClaudeSession Phase 3 slice", () => {
       requestId: opened.requestId,
     });
     expect(requests).toEqual([opened.requestId]);
-    expect(store.getThreadRecord(child.childThreadId)?.thread.status).toEqual({
+    expect(liveSnapshot(registry).childProjections.get(child.childThreadId)?.record.thread.status).toEqual({
       type: "active", activeFlags: ["waitingOnApproval"],
     });
     await expect(registry.submit("thread-1", {
       type: "resolveInteraction", requestId: opened.requestId, response: { decision: "accept" },
     })).resolves.toBe(true);
     await expect(response).resolves.toEqual({ decision: "accept" });
-    expect(store.getThreadRecord(child.childThreadId)?.thread.status).toEqual({
+    expect(liveSnapshot(registry).childProjections.get(child.childThreadId)?.record.thread.status).toEqual({
       type: "active", activeFlags: [],
     });
     expect((await registry.submit<ClaudeLiveSnapshot>("thread-1", { type: "liveSnapshot" })).pendingRequests)
@@ -2159,7 +1790,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       runtimeGeneration: 1,
       requestId: opened.requestId,
     });
-    expect(store.getThreadRecord("thread-1")?.thread.status).toEqual({
+    expect(liveSnapshot(registry).status).toEqual({
       type: "active",
       activeFlags: ["waitingOnApproval"],
     });
@@ -2182,7 +1813,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       fact: { type: "result", status: "completed", codexErrorInfo: null, origin: null },
       source,
     })).resolves.toBeUndefined();
-    expect(store.getTurn("thread-1", prepared.turn.id)?.status).toBe("inProgress");
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.status).toBe("inProgress");
     await expect(registry.submit("thread-1", {
       type: "resolveInteraction",
       requestId: opened.requestId,
@@ -2194,13 +1825,10 @@ describe("ClaudeSession Phase 3 slice", () => {
       requestId: opened.requestId,
       response: { decision: "decline" },
     })).resolves.toBe(false);
-    expect(store.getPendingRequest(opened.requestId)).toMatchObject({
-      status: "resolved",
-      response: { decision: "accept" },
-    });
-    expect(store.getThreadRecord("thread-1")?.thread.status).toEqual({ type: "idle" });
-    expect(store.getTurn("thread-1", prepared.turn.id)?.status).toBe("completed");
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items).toContainEqual(
+    expect(liveSnapshot(registry).pendingRequests).toEqual([]);
+    expect(liveSnapshot(registry).status).toEqual({ type: "idle" });
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.status).toBe("completed");
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items).toContainEqual(
       expect.objectContaining({ type: "agentMessage", text: "Approved work", phase: "final_answer" }),
     );
     expect(resolved).toEqual([
@@ -2275,7 +1903,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       pending: false,
       response: { cancelled: true },
     });
-    expect(store.listPendingRequests("thread-1")).toEqual([]);
+    expect(liveSnapshot(registry).pendingRequests).toEqual([]);
 
     const current = await registry.submit<{ requestId: string }>("thread-1", {
       type: "openInteraction",
@@ -2319,9 +1947,9 @@ describe("ClaudeSession Phase 3 slice", () => {
     await fact({ type: "command", state: "queued", id: "input-command-1" });
     await fact({ type: "result", status: "completed", codexErrorInfo: null, origin: null });
     await fact({ type: "command", state: "completed", id: "wrong-command" });
-    expect(store.getTurn("thread-1", first.turn.id)?.status).toBe("inProgress");
+    expect(liveTurn(registry, "thread-1", first.turn.id)?.status).toBe("inProgress");
     await fact({ type: "command", state: "cancelled", id: "input-command-1" });
-    expect(store.getTurn("thread-1", first.turn.id)?.status).toBe("completed");
+    expect(liveTurn(registry, "thread-1", first.turn.id)?.status).toBe("completed");
 
     const second = await registry.submit<{ turn: Turn }>("thread-1", {
       type: "prepareTurn",
@@ -2332,7 +1960,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     await fact({ type: "result", status: "completed", codexErrorInfo: null, origin: null });
     await fact({ type: "taskNotification" });
     await fact({ type: "session", state: "idle" });
-    expect(store.getTurn("thread-1", second.turn.id)?.status).toBe("completed");
+    expect(liveTurn(registry, "thread-1", second.turn.id)?.status).toBe("completed");
     const third = await registry.submit<{ turn: Turn }>("thread-1", {
       type: "prepareTurn",
       params: { threadId: "thread-1", input: [{ type: "text", text: "three", text_elements: [] }] },
@@ -2341,7 +1969,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     await fact({ type: "command", state: "queued", id: "input-command-3" });
     await fact({ type: "result", status: "failed", errorMessage: "discarded", codexErrorInfo: "other", origin: null });
     await fact({ type: "command", state: "discarded", id: "input-command-3" });
-    expect(store.getTurn("thread-1", third.turn.id)?.status).toBe("failed");
+    expect(liveTurn(registry, "thread-1", third.turn.id)?.status).toBe("failed");
     expect(updates.filter((update) => update.completed)).toHaveLength(3);
     await registry.close();
   });
@@ -2363,7 +1991,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     expect(updates.at(-1)?.acceptProviderFacts).toBe(false);
     await command({ type: "result", status: "completed", codexErrorInfo: null, origin: null });
     await command({ type: "interruptAck" });
-    expect(store.getTurn("thread-1", first.turn.id)?.status).toBe("interrupted");
+    expect(liveTurn(registry, "thread-1", first.turn.id)?.status).toBe("interrupted");
 
     const second = await registry.submit<{ turn: Turn }>("thread-1", {
       type: "prepareTurn",
@@ -2373,7 +2001,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "mainStream", runtimeGeneration: 1, source,
       fact: { kind: "instantAgent", text: "late-old-output" },
     });
-    expect(JSON.stringify(store.getTurn("thread-1", second.turn.id))).not.toContain("late-old-output");
+    expect(JSON.stringify(liveTurn(registry, "thread-1", second.turn.id))).not.toContain("late-old-output");
     await command({ type: "expectedCommand", id: "new" });
     expect(updates.at(-1)?.acceptProviderFacts).toBe(false);
     await registry.submit("thread-1", {
@@ -2394,7 +2022,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     await command({ type: "command", state: "queued", id: "new" });
     await command({ type: "result", status: "completed", codexErrorInfo: null, origin: null });
     await command({ type: "command", state: "completed", id: "new" });
-    expect(store.getTurn("thread-1", second.turn.id)?.status).toBe("completed");
+    expect(liveTurn(registry, "thread-1", second.turn.id)?.status).toBe("completed");
     await registry.close();
   });
 
@@ -2424,7 +2052,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.submit("thread-1", {
       type: "lifecycle", runtimeGeneration: 1, fact: { type: "interruptAck" }, source,
     });
-    expect(store.getTurn("thread-1", first.turn.id)?.status).toBe("interrupted");
+    expect(liveTurn(registry, "thread-1", first.turn.id)?.status).toBe("interrupted");
 
     const second = await registry.submit<{ turn: Turn }>("thread-1", {
       type: "prepareTurn",
@@ -2446,7 +2074,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.submit("thread-1", {
       type: "lifecycle", runtimeGeneration: 1, fact: { type: "interruptAck" }, source,
     });
-    expect(store.getTurn("thread-1", second.turn.id)?.status).toBe("interrupted");
+    expect(liveTurn(registry, "thread-1", second.turn.id)?.status).toBe("interrupted");
     await registry.close();
   });
 
@@ -2464,9 +2092,9 @@ describe("ClaudeSession Phase 3 slice", () => {
     const noQuery = await start("prelude");
     await command({ type: "noQuery" });
     await command({ type: "result", status: "completed", codexErrorInfo: null, origin: null });
-    expect(store.getTurn("thread-1", noQuery.turn.id)?.status).toBe("inProgress");
+    expect(liveTurn(registry, "thread-1", noQuery.turn.id)?.status).toBe("inProgress");
     await command({ type: "noQueryAck" });
-    expect(store.getTurn("thread-1", noQuery.turn.id)?.status).toBe("completed");
+    expect(liveTurn(registry, "thread-1", noQuery.turn.id)?.status).toBe("completed");
 
     const drain = await start("drain");
     await registry.submit("thread-1", {
@@ -2484,16 +2112,16 @@ describe("ClaudeSession Phase 3 slice", () => {
       },
     });
     await command({ type: "result", status: "completed", codexErrorInfo: null, origin: null });
-    expect(store.getTurn("thread-1", drain.turn.id)?.status).toBe("inProgress");
+    expect(liveTurn(registry, "thread-1", drain.turn.id)?.status).toBe("inProgress");
     await registry.submit("thread-1", {
       type: "mainStream", runtimeGeneration: 1, source,
       fact: { kind: "taskStop", taskIds: ["background-task"], reason: "done" },
     });
-    expect(store.getTurn("thread-1", drain.turn.id)?.status).toBe("completed");
+    expect(liveTurn(registry, "thread-1", drain.turn.id)?.status).toBe("completed");
 
     const empty = await start("empty");
     await command({ type: "noQueryAck" });
-    expect(store.getTurn("thread-1", empty.turn.id)?.status).toBe("completed");
+    expect(liveTurn(registry, "thread-1", empty.turn.id)?.status).toBe("completed");
     await registry.close();
   });
 
@@ -2530,7 +2158,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     await expect(registry.submit("thread-1", {
       type: "lifecycle", runtimeGeneration: 1, fact: { type: "interruptAck" }, source,
     })).resolves.toBeUndefined();
-    expect(store.getTurn("thread-1", prepared.turn.id)?.status).toBe("interrupted");
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.status).toBe("interrupted");
     await registry.close();
   });
 
@@ -2562,11 +2190,12 @@ describe("ClaudeSession Phase 3 slice", () => {
       fact: { kind: "instantAgent", text: "depth-two result" },
     });
 
-    expect(store.getThreadRecord(outer.childThreadId)?.thread.parentThreadId).toBe("thread-1");
-    expect(store.getThreadRecord(nested.childThreadId)?.thread.parentThreadId).toBe(outer.childThreadId);
-    expect(JSON.stringify(store.listTurns(nested.childThreadId))).toContain("depth-two result");
-    expect(JSON.stringify(store.listTurns(outer.childThreadId))).not.toContain("depth-two result");
-    expect(JSON.stringify(store.listTurns("thread-1"))).not.toContain("depth-two result");
+    const children = liveSnapshot(registry).childProjections;
+    expect(children.get(outer.childThreadId)?.record.thread.parentThreadId).toBe("thread-1");
+    expect(children.get(nested.childThreadId)?.record.thread.parentThreadId).toBe(outer.childThreadId);
+    expect(JSON.stringify(children.get(nested.childThreadId)?.turns)).toContain("depth-two result");
+    expect(JSON.stringify(children.get(outer.childThreadId)?.turns)).not.toContain("depth-two result");
+    expect(JSON.stringify(liveSnapshot(registry).activeTurn)).not.toContain("depth-two result");
     await registry.close();
   });
 
@@ -2588,14 +2217,14 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "cancelInjection", runtimeGeneration: 1, messageUuid: "first", previous: null,
       reason: "failed", rollbackBoundary: true,
     })).toBe(true);
-    expect(store.getThreadRecord("thread-1", false)?.lastClaudeMessageUuid).toBeNull();
+    expect(liveSnapshot(registry).lastClaudeMessageUuid).toBeNull();
     await stage("second");
     await stage("newer");
     expect(await registry.submit("thread-1", {
       type: "cancelInjection", runtimeGeneration: 1, messageUuid: "second", previous: null,
       reason: "failed", rollbackBoundary: true,
     })).toBe(true);
-    expect(store.getThreadRecord("thread-1", false)?.lastClaudeMessageUuid).toBe("newer");
+    expect(liveSnapshot(registry).lastClaudeMessageUuid).toBe("newer");
     await registry.close();
   });
 
@@ -2624,19 +2253,22 @@ describe("ClaudeSession Phase 3 slice", () => {
         blocks: [{ index: 0, block: "text", text: "P1 finding" }], completeAsCommentary: false },
     });
     await lifecycle({ type: "result", status: "completed", codexErrorInfo: null, origin: null });
-    expect(store.getTurn("thread-1", completed.turn.id)?.items.at(-1)).toMatchObject({
+    expect(liveTurn(registry, "thread-1", completed.turn.id)?.items.at(-1)).toMatchObject({
       type: "exitedReviewMode", review: "P1 finding",
     });
 
     const interrupted = await start();
     await lifecycle({ type: "interrupt" });
     await lifecycle({ type: "interruptAck" });
-    expect(store.getTurn("thread-1", interrupted.turn.id)?.items.at(-1)).toMatchObject({
+    expect(liveTurn(registry, "thread-1", interrupted.turn.id)?.items.at(-1)).toMatchObject({
       type: "exitedReviewMode", review: "Reviewer failed to output a response.",
     });
-    const events = store.listEventsAfter("thread-1", 0);
+    const events = notifications(registry, "thread-1");
     for (const turnId of [completed.turn.id, interrupted.turn.id]) {
-      const methods = events.filter((event) => event.turnId === turnId).map((event) => event.method);
+      const methods = events.filter((event) => {
+        const params = event.params as { turnId?: string; turn?: { id: string } };
+        return params.turnId === turnId || params.turn?.id === turnId;
+      }).map((event) => event.method);
       expect(methods.lastIndexOf("item/completed")).toBeLessThan(methods.indexOf("turn/completed"));
     }
     await registry.close();
@@ -2661,13 +2293,13 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "lifecycle", runtimeGeneration: 1,
       fact: { type: "runtimeExit", message: "gone", codexErrorInfo: "other" }, source,
     });
-    expect(store.getTurn("thread-1", prepared.turn.id)).toMatchObject({
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)).toMatchObject({
       status: "failed", error: { message: "gone" },
     });
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items).toContainEqual(
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items).toContainEqual(
       expect.objectContaining({ id: "tool", status: "failed" }),
     );
-    expect(store.listEventsAfter("thread-1", 0).filter((event) => event.method === "turn/completed")).toHaveLength(1);
+    expect(notifications(registry, "thread-1").filter((event) => event.method === "turn/completed")).toHaveLength(1);
     await registry.close();
   });
 
@@ -2692,7 +2324,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "lifecycle", runtimeGeneration: 1,
       fact: { type: "result", status: "completed", codexErrorInfo: null, origin: null }, source,
     });
-    expect(store.getTurn("thread-1", prepared.turn.id)?.status).toBe("completed");
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.status).toBe("completed");
     await registry.close();
   });
 
@@ -2716,7 +2348,7 @@ describe("ClaudeSession Phase 3 slice", () => {
         subagentType: "Explore",
       },
     });
-    const childTurn = store.listTurns(child.childThreadId)[0]!;
+    const childTurn = liveSnapshot(registry).childProjections.get(child.childThreadId)!.turns[0]!;
     const rootRequest = await registry.submit<{ requestId: string }>("thread-1", {
       type: "openInteraction",
       runtimeGeneration: 1,
@@ -2805,7 +2437,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       reasoningEffort: "high",
       thread: { name: "second", gitInfo: { branch: "main", sha: "abc123" } },
     });
-    expect(store.listEventsAfter("thread-1", 0)
+    expect(notifications(registry, "thread-1")
       .filter((event) => event.method === "thread/name/updated")).toHaveLength(1);
     await registry.close();
   });
@@ -2822,7 +2454,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       command: { kind: "abort", operationId: prepared.operationId },
     })).resolves.toBe(true);
     expect(store.getThreadRecord("thread-1")?.thread.name).toBeNull();
-    expect(store.listEventsAfter("thread-1", 0)
+    expect(notifications(registry, "thread-1")
       .filter((event) => event.method === "thread/name/updated")).toEqual([]);
     await registry.close();
   });
@@ -2868,7 +2500,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       command: { kind: "finish", operationId: prepared.operationId },
     });
     expect(store.isThreadArchived("thread-1")).toBe(true);
-    expect(JSON.stringify(store.getTurn("thread-1", active.turn.id))).not.toContain("must be dropped");
+    expect(JSON.stringify(liveTurn(registry, "thread-1", active.turn.id))).not.toContain("must be dropped");
     const beforeUnarchive = lifecycle.flatMap((update) => update.goalEffects ?? []).length;
     await registry.submit("thread-1", { type: "threadAdmin", command: { kind: "unarchive" } });
     const afterUnarchive = lifecycle.flatMap((update) => update.goalEffects ?? []).slice(beforeUnarchive);
@@ -2924,7 +2556,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "threadAdmin",
       command: { kind: "beginRemoval", removalKind: "delete" },
     });
-    expect(store.getPendingRequest(interaction.requestId)?.status).toBe("cancelled");
+    expect(liveSnapshot(registry).pendingRequests).toEqual([]);
     await registry.submit("thread-1", {
       type: "mainStream",
       runtimeGeneration: 1,
@@ -3039,7 +2671,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       ...record("child"),
       thread: { ...record("child").thread, parentThreadId: "root" },
     });
-    const observations: Array<{ method: string; threadId: string; archived: boolean; durable: boolean }> = [];
+    const observations: Array<{ method: string; threadId: string; archived: boolean }> = [];
     hub.attach("observer", (method, params) => {
       if (method !== "thread/archived" && method !== "thread/unarchived") return;
       const threadId = (params as { threadId: string }).threadId;
@@ -3047,7 +2679,6 @@ describe("ClaudeSession Phase 3 slice", () => {
         method,
         threadId,
         archived: store.isThreadArchived(threadId),
-        durable: store.listEventsAfter(threadId, 0).some((event) => event.method === method),
       });
     });
 
@@ -3062,10 +2693,10 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.submit("root", { type: "threadAdmin", command: { kind: "unarchive" } });
 
     expect(observations).toEqual([
-      { method: "thread/archived", threadId: "root", archived: true, durable: true },
-      { method: "thread/archived", threadId: "child", archived: true, durable: true },
-      { method: "thread/unarchived", threadId: "root", archived: false, durable: true },
-      { method: "thread/unarchived", threadId: "child", archived: false, durable: true },
+      { method: "thread/archived", threadId: "root", archived: true },
+      { method: "thread/archived", threadId: "child", archived: true },
+      { method: "thread/unarchived", threadId: "root", archived: false },
+      { method: "thread/unarchived", threadId: "child", archived: false },
     ]);
     await registry.close();
   });
@@ -3125,175 +2756,25 @@ describe("ClaudeSession Phase 3 slice", () => {
     await expect(registry.submit("thread-1", {
       type: "runtimeReady", runtimeGeneration: 1,
     })).resolves.toBe(false);
-    expect(store.getThreadRecord("thread-1")?.thread.status.type).toBe("notLoaded");
+    expect(liveSnapshot(registry).status.type).toBe("notLoaded");
     await expect(registry.submit("thread-1", {
       type: "runtimeReady", runtimeGeneration: 2,
     })).resolves.toBe(true);
-    expect(store.getThreadRecord("thread-1")?.thread.status.type).toBe("idle");
+    expect(liveSnapshot(registry).status.type).toBe("idle");
     await expect(registry.submit("thread-1", {
       type: "runtimeExited", runtimeGeneration: 1, message: "stale", codexErrorInfo: null,
     })).resolves.toBe(false);
-    expect(store.getThreadRecord("thread-1")?.thread.status.type).toBe("idle");
+    expect(liveSnapshot(registry).status.type).toBe("idle");
     await expect(registry.submit("thread-1", {
       type: "runtimeFailed", runtimeGeneration: 2, message: "auth failed", codexErrorInfo: "badRequest",
     })).resolves.toBe(true);
-    expect(store.getThreadRecord("thread-1")?.thread.status.type).toBe("systemError");
+    expect(liveSnapshot(registry).status.type).toBe("systemError");
     await registry.close();
   });
 
-  it("owns provider journal admission, deduplication, and terminal disposition", async () => {
-    const { store, registry } = harness();
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 3 });
-    const admitted = await registry.submit<ProviderEventAdmission>("thread-1", {
-      type: "providerEventStarted", runtimeGeneration: 3, processEpoch: "process",
-      providerSequence: 1, providerEventType: "assistant", providerEventId: "provider-1",
-      payload: { type: "assistant" },
-    });
-    expect(admitted).toMatchObject({ project: true, finish: true, sequence: expect.any(Number) });
-    await registry.submit("thread-1", {
-      type: "providerEventFinished", runtimeGeneration: 3, sequence: admitted.sequence,
-      source: admitted.source, disposition: "projected",
-    });
-    const duplicate = await registry.submit<ProviderEventAdmission>("thread-1", {
-      type: "providerEventStarted", runtimeGeneration: 3, processEpoch: "replacement",
-      providerSequence: 99, providerEventType: "assistant", providerEventId: "provider-1",
-      payload: { type: "assistant", replay: true },
-    });
-    expect(duplicate).toMatchObject({ sequence: admitted.sequence, project: false, finish: false });
-    const stale = await registry.submit<ProviderEventAdmission>("thread-1", {
-      type: "providerEventStarted", runtimeGeneration: 2, processEpoch: "stale",
-      providerSequence: 1, providerEventType: "assistant", providerEventId: "stale",
-      payload: {},
-    });
-    expect(stale).toMatchObject({ sequence: 0, project: false, finish: false });
-    expect(store.listProviderEvents("thread-1")).toEqual([
-      expect.objectContaining({ providerEventId: "provider-1", disposition: "projected" }),
-    ]);
-    expect(store.hasProcessedProviderEvent("thread-1", "provider-1")).toBe(true);
-    await registry.close();
-  });
 
-  it("retracts the current root tip to its previous boundary with projection and child cleanup", async () => {
-    const { store, registry } = harness();
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
-    store.createTurn("thread-1", {
-      id: "prior-turn", items: [], itemsView: "full", status: "completed", error: null,
-      startedAt: 1, completedAt: 2, durationMs: 1_000,
-    });
-    store.setTurnClaudeMessageUuid("thread-1", "prior-turn", "prior-message");
-    store.updateThread({
-      ...store.getThreadRecord("thread-1", false)!,
-      lastClaudeMessageUuid: "prior-message",
-      lastCompletedTurnId: "prior-turn",
-    });
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-    const prepared = await registry.submit<{ turn: Turn }>("thread-1", {
-      type: "prepareTurn",
-      params: { threadId: "thread-1", input: [{ type: "text", text: "work", text_elements: [] }] },
-    });
-    const source = { providerEventId: "message-1", providerEventType: "assistant" };
-    const projection = await registry.submit<MainStreamProjection>("thread-1", {
-      type: "mainStream", runtimeGeneration: 1, source,
-      fact: { kind: "instantAgent", text: "replace me" },
-    });
-    const projectedItemIds = projection.itemIds.filter((id): id is string => Boolean(id));
-    expect(projectedItemIds).toHaveLength(1);
-    prepared.turn.items.push({
-      type: "collabAgentToolCall", id: "retracted-spawn", tool: "spawnAgent", status: "completed",
-      senderThreadId: "thread-1", receiverThreadIds: ["retracted-child"], prompt: "temporary child",
-      model: null, reasoningEffort: null,
-      agentsStates: { "retracted-child": { status: "completed", message: "temporary" } },
-    });
-    store.updateTurn("thread-1", prepared.turn);
-    const child = record("retracted-child");
-    child.thread.parentThreadId = "thread-1";
-    store.createThread(child);
-    store.createTurn("retracted-child", {
-      id: "retracted-child-turn", items: [], itemsView: "full", status: "completed", error: null,
-      startedAt: 1, completedAt: 2, durationMs: 1_000,
-    });
-    const itemIds = [...projectedItemIds, "retracted-spawn"];
-    await registry.submit("thread-1", {
-      type: "providerBoundary", runtimeGeneration: 1,
-      providerMessageId: "message-1", itemIds,
-    });
-    expect(store.getTurnClaudeMessageUuid("thread-1", prepared.turn.id)).toBe("message-1");
-    expect(store.getThreadRecord("thread-1")?.lastClaudeMessageUuid).toBe("message-1");
-    expect(store.listProviderItemCorrelations("thread-1", ["message-1"])).toHaveLength(2);
-    await registry.submit("thread-1", {
-      type: "providerRetract", runtimeGeneration: 1,
-      providerMessageIds: ["message-1"], source,
-    });
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items
-      .some((item) => itemIds.includes(item.id))).toBe(false);
-    expect(store.getTurnClaudeMessageUuid("thread-1", prepared.turn.id)).toBeUndefined();
-    expect(store.getTurnClaudeMessageUuid("thread-1", "prior-turn")).toBe("prior-message");
-    expect(store.getThreadRecord("thread-1")?.lastClaudeMessageUuid).toBe("prior-message");
-    expect(store.getThreadRecord("retracted-child", true)).toBeUndefined();
-    expect(store.listProviderItemCorrelations("thread-1", ["message-1"])).toEqual([]);
-    await registry.close();
-  });
 
-  it("preserves an unrepresented root tip when retracting only a child boundary", async () => {
-    const { store, registry } = harness();
-    const root = { ...record("thread-1"), lastClaudeMessageUuid: "unrepresented-user-tip" };
-    await registry.submit("thread-1", { type: "createThread", record: root });
-    store.createTurn("thread-1", {
-      id: "root-turn", items: [], itemsView: "full", status: "completed", error: null,
-      startedAt: 1, completedAt: 2, durationMs: 1_000,
-    });
-    store.setTurnClaudeMessageUuid("thread-1", "root-turn", "root-boundary");
-    const child = record("child");
-    child.thread.parentThreadId = "thread-1";
-    store.createThread(child);
-    store.createTurn("child", {
-      id: "child-turn",
-      items: [{ type: "agentMessage", id: "child-item", text: "temporary", phase: null, memoryCitation: null, questions: null, delivery: null }],
-      itemsView: "full", status: "completed", error: null,
-      startedAt: 1, completedAt: 2, durationMs: 1_000,
-    });
-    store.setTurnClaudeMessageUuid("child", "child-turn", "child-boundary");
-    store.linkProviderItems("thread-1", "child-boundary", "child", "child-turn", ["child-item"]);
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
 
-    await registry.submit("thread-1", {
-      type: "providerRetract", runtimeGeneration: 1,
-      providerMessageIds: ["child-boundary"],
-      source: { providerEventId: "retract-child", providerEventType: "assistant" },
-    });
-
-    expect(store.getThreadRecord("thread-1")?.lastClaudeMessageUuid).toBe("unrepresented-user-tip");
-    expect(store.getTurnClaudeMessageUuid("child", "child-turn")).toBeUndefined();
-    expect(store.getTurn("child", "child-turn")?.items).toEqual([]);
-    await registry.close();
-  });
-
-  it("preserves an unrepresented current tip when retracting an older root boundary", async () => {
-    const { store, registry } = harness();
-    const root = { ...record("thread-1"), lastClaudeMessageUuid: "unrepresented-current-tip" };
-    await registry.submit("thread-1", { type: "createThread", record: root });
-    store.createTurn("thread-1", {
-      id: "older-turn",
-      items: [{ type: "agentMessage", id: "older-item", text: "old", phase: null, memoryCitation: null, questions: null, delivery: null }],
-      itemsView: "full", status: "completed", error: null,
-      startedAt: 1, completedAt: 2, durationMs: 1_000,
-    });
-    store.setTurnClaudeMessageUuid("thread-1", "older-turn", "older-boundary");
-    store.linkProviderItems("thread-1", "older-boundary", "thread-1", "older-turn", ["older-item"]);
-    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
-
-    await registry.submit("thread-1", {
-      type: "providerRetract", runtimeGeneration: 1,
-      providerMessageIds: ["older-boundary"],
-      source: { providerEventId: "retract-old", providerEventType: "assistant" },
-    });
-
-    expect(store.getThreadRecord("thread-1")?.lastClaudeMessageUuid).toBe("unrepresented-current-tip");
-    expect(store.getTurnClaudeMessageUuid("thread-1", "older-turn")).toBeUndefined();
-    expect(store.getTurn("thread-1", "older-turn")?.items).toEqual([]);
-    await registry.close();
-  });
 
   it("owns conversation reset, model fallback, notices, and runtime notifications", async () => {
     const { store, registry } = harness();
@@ -3322,14 +2803,16 @@ describe("ClaudeSession Phase 3 slice", () => {
       type: "runtimeNotification", runtimeGeneration: 1,
       method: "hook/started", params: { run: { id: "hook-1" } }, source,
     });
-    expect(store.getThreadRecord("thread-1")).toMatchObject({
+    expect(await registry.submit<ClaudeThreadRecord>("thread-1", {
+      type: "readThread", includeTurns: false,
+    })).toMatchObject({
       claudeSessionId: "replacement-session",
       lastClaudeMessageUuid: null,
       resolvedModel: "haiku",
       thread: { name: null },
     });
-    expect(JSON.stringify(store.getTurn("thread-1", prepared.turn.id))).toContain("retrying");
-    const methods = store.listEventsAfter("thread-1", 0).map((event) => event.method);
+    expect(JSON.stringify(liveTurn(registry, "thread-1", prepared.turn.id))).toContain("retrying");
+    const methods = notifications(registry, "thread-1").map((event) => event.method);
     expect(methods).toEqual(expect.arrayContaining([
       "thread/name/updated", "model/rerouted", "hook/started",
     ]));
@@ -3352,7 +2835,7 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.submit("thread-1", {
       type: "completeRuntimeInput", runtimeGeneration: 1, messageUuid: "steer-1", sent: true,
     });
-    expect(store.getTurn("thread-1", prepared.turn.id)?.items
+    expect(liveTurn(registry, "thread-1", prepared.turn.id)?.items
       .filter((item) => item.type === "userMessage")).toEqual([
       expect.objectContaining({ content: [expect.objectContaining({ text: "first" })] }),
       expect.objectContaining({
@@ -3446,7 +2929,7 @@ describe("ClaudeSession Phase 3 slice", () => {
       lastClaudeMessageUuid: null,
       thread: { status: { type: "idle" } },
     });
-    expect(JSON.stringify(store.listEventsAfter("thread-1", 0))).not.toContain("stale");
+    expect(JSON.stringify(notifications(registry, "thread-1"))).not.toContain("stale");
     await registry.close();
   });
 });

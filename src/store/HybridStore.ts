@@ -2,7 +2,6 @@ import type { Thread } from "../codex/generated/v2/Thread.js";
 import type { ThreadListParams } from "../codex/generated/v2/ThreadListParams.js";
 import type { Turn } from "../codex/generated/v2/Turn.js";
 import type { ThreadGoal } from "../codex/generated/v2/ThreadGoal.js";
-import type { QueuedSubmission } from "../codex/generated/v2/QueuedSubmission.js";
 import type { TokenUsageBreakdown } from "../codex/generated/v2/TokenUsageBreakdown.js";
 import type { ApprovalsReviewer } from "../codex/generated/v2/ApprovalsReviewer.js";
 import type { ThreadSection } from "../codex/generated/v2/ThreadSection.js";
@@ -95,7 +94,9 @@ export function withSettingsFrom(
     reasoningSummary: settings.reasoningSummary,
     collaborationMode: settings.collaborationMode,
     outputSchema: settings.outputSchema,
-    settingsGeneration: settingsGeneration(settings),
+    ...(settings.settingsGeneration === undefined
+      ? {}
+      : { settingsGeneration: settings.settingsGeneration }),
   };
 }
 
@@ -112,13 +113,6 @@ export interface PendingRequestRecord {
   readonly resolvedAt: number | null;
 }
 
-export interface EventPersistence {
-  readonly turn?: Turn;
-  readonly providerEventType?: string | null;
-  readonly providerEventId?: string | null;
-  readonly dedupKey?: string | null;
-}
-
 export interface StateEvent {
   readonly turnId: string | null;
   readonly method: string;
@@ -127,22 +121,9 @@ export interface StateEvent {
   readonly providerEventId?: string | null;
 }
 
-export interface ThreadStateCommit {
-  readonly record: ClaudeThreadRecord;
-  readonly turn?: Turn;
-  readonly insertTurn?: boolean;
-  readonly providerBoundary?: ProviderBoundaryCommit;
-  readonly events: readonly StateEvent[];
-}
-
 export interface TurnProviderBoundary {
   readonly turnId: string;
   readonly messageUuid: string;
-}
-
-export interface ProviderBoundaryCommit extends TurnProviderBoundary {
-  readonly ownerThreadId: string;
-  readonly itemIds?: readonly string[];
 }
 
 export interface PendingThreadRemoval {
@@ -150,15 +131,6 @@ export interface PendingThreadRemoval {
   readonly claudeSessionId: string;
   readonly cwd: string;
   readonly kind: "delete" | "release" | "discard";
-}
-
-export interface StoredEvent {
-  readonly sequence: number;
-  readonly threadId: string;
-  readonly turnId: string | null;
-  readonly method: string;
-  readonly params: unknown;
-  readonly createdAt: number;
 }
 
 export type ProviderEventDisposition =
@@ -170,41 +142,11 @@ export type ProviderEventDisposition =
   | "unsupportedVisible"
   | "failed";
 
-export interface ProviderEventRecord {
-  readonly sequence: number;
-  readonly threadId: string;
-  readonly processEpoch: string;
-  readonly providerSequence: number;
-  readonly providerEventType: string;
-  readonly providerEventId: string | null;
-  readonly payload: unknown;
-  readonly disposition: ProviderEventDisposition;
-  readonly error: string | null;
-  readonly createdAt: number;
-  readonly projectedAt: number | null;
-}
-
 export interface ProviderItemCorrelation {
   readonly providerMessageId: string;
   readonly ownerThreadId: string;
   readonly turnId: string;
   readonly itemId: string;
-}
-
-export interface ProviderRetractionMutation {
-  readonly ownerThreadId: string;
-  readonly turn: Turn;
-  readonly clearBoundary: boolean;
-}
-
-export interface AppendProviderEvent {
-  readonly threadId: string;
-  readonly processEpoch: string;
-  readonly providerSequence: number;
-  readonly providerEventType: string;
-  readonly providerEventId: string | null;
-  readonly payload: unknown;
-  readonly createdAt: number;
 }
 
 export interface HybridStore {
@@ -215,7 +157,7 @@ export interface HybridStore {
   listThreads(params: ThreadListParams): Thread[];
   sessionFlags(): ReadonlyMap<string, ClaudeSessionFlags>;
   setSessionFlags(flags: ClaudeSessionFlags): void;
-  adoptTransient(record: ClaudeThreadRecord, turns: readonly Turn[]): void;
+  adoptTransient(record: ClaudeThreadRecord): void;
   /** Gateway-owned manual order of every section, keyed by section id (stock cannot order Claude threads). */
   sectionOrders(): Map<string, string[]>;
   setSectionOrder(sectionId: string, threadIds: readonly string[]): void;
@@ -228,55 +170,19 @@ export interface HybridStore {
   listPendingThreadRemovals(): PendingThreadRemoval[];
   commitThreadRemoval(rootThreadId: string, threadIds: readonly string[]): void;
   deleteThread(threadId: string): void;
-  createTurn(threadId: string, turn: Turn): void;
-  updateTurn(threadId: string, turn: Turn): void;
   getTurn(threadId: string, turnId: string): Turn | undefined;
   listTurns(threadId: string): Turn[];
-  setTurnClaudeMessageUuid(threadId: string, turnId: string, messageUuid: string): void;
-  getTurnClaudeMessageUuid(threadId: string, turnId: string): string | undefined;
-  truncateTurns(threadId: string, keepCount: number): void;
   commitForkedThread(
     record: ClaudeThreadRecord,
-    turns: readonly Turn[],
-    boundaries: readonly TurnProviderBoundary[],
     inheritedGoal?: InternalGoal,
   ): void;
   commitThreadRollback(
     record: ClaudeThreadRecord,
-    keepCount: number,
-    boundaries: readonly TurnProviderBoundary[],
     removedThreadIds?: readonly string[],
   ): void;
-  commitThreadState(commit: ThreadStateCommit): number[];
-  appendEvent(threadId: string, turnId: string | null, method: string, params: unknown, persistence?: EventPersistence): number;
-  eventHighWatermark(threadId: string): number;
-  listEventsAfter(threadId: string, sequence: number): StoredEvent[];
-  hasProcessedProviderEvent(threadId: string, providerEventId: string): boolean;
-  markProviderEventProcessed(threadId: string, providerEventType: string, providerEventId: string): void;
-  appendProviderEvent(event: AppendProviderEvent): { record: ProviderEventRecord; inserted: boolean };
-  completeProviderEvent(threadId: string, sequence: number, disposition: Exclude<ProviderEventDisposition, "pending">, error?: string | null): void;
-  listProviderEvents(threadId: string, disposition?: ProviderEventDisposition): ProviderEventRecord[];
-  pruneProviderEvents(threadId: string, maxEvents: number, maxBytes: number): number;
-  linkProviderItems(threadId: string, providerMessageId: string, ownerThreadId: string, turnId: string, itemIds: readonly string[]): void;
-  listProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): ProviderItemCorrelation[];
-  deleteProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): void;
-  commitProviderRetraction(
-    record: ClaudeThreadRecord,
-    providerMessageIds: readonly string[],
-    mutations: readonly ProviderRetractionMutation[],
-    removedThreadIds?: readonly string[],
-  ): void;
-  createPendingRequest(request: PendingRequestRecord): void;
-  getPendingRequest(requestId: string): PendingRequestRecord | undefined;
-  findPendingRequestByClaudeId(threadId: string, claudeRequestId: string): PendingRequestRecord | undefined;
-  listPendingRequests(threadId: string): PendingRequestRecord[];
-  resolvePendingRequest(requestId: string, status: "resolved" | "cancelled", response: unknown): void;
   getGoal(threadId: string): InternalGoal | undefined;
   setGoal(threadId: string, patch: GoalPatch): InternalGoal;
   clearGoal(threadId: string): boolean;
   accountGoalUsage(input: GoalUsageInput): InternalGoal | undefined;
-  listQueuedSubmissions(threadId: string): QueuedSubmission[];
-  /** Replaces the ordered submission queue; an empty list clears it. */
-  setQueuedSubmissions(threadId: string, items: readonly QueuedSubmission[]): void;
   close(): void;
 }

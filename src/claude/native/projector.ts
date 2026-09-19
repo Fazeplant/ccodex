@@ -5,6 +5,7 @@ import type { ThreadItem } from "../../codex/generated/v2/ThreadItem.js";
 import type { Turn } from "../../codex/generated/v2/Turn.js";
 import type { UserInput } from "../../codex/generated/v2/UserInput.js";
 import type { TokenUsageBreakdown } from "../../codex/generated/v2/TokenUsageBreakdown.js";
+import type { TurnProviderBoundary } from "../../store/HybridStore.js";
 import { normalizeClaudeModelIdentifier } from "../modelSelection.js";
 import {
   projectToolCompletion,
@@ -52,6 +53,7 @@ export interface TranscriptProjection {
   readonly tokenUsageTotal: TokenUsageBreakdown;
   readonly skippedLines: number;
   readonly compactionBoundaries: ReadonlySet<string>;
+  readonly turnBoundaries: readonly TurnProviderBoundary[];
 }
 
 function projectedUsage(records: readonly TranscriptChainRecord[]): TokenUsageBreakdown {
@@ -405,6 +407,20 @@ function projectTurns(
   });
 }
 
+function projectTurnBoundaries(
+  records: readonly TranscriptChainRecord[],
+  subagentPromptUuid: string | undefined,
+): TurnProviderBoundary[] {
+  const starts = records.flatMap((record, index) =>
+    record.type === "user" && startsTurn(record, subagentPromptUuid) ? [index] : []);
+  return starts.flatMap((start, turnIndex) => {
+    const prompt = records[start] as UserRecord;
+    const assistant = records.slice(start, starts[turnIndex + 1] ?? records.length)
+      .findLast((record): record is AssistantRecord => record.type === "assistant");
+    return assistant ? [{ turnId: prompt.uuid, messageUuid: assistant.uuid }] : [];
+  });
+}
+
 export async function projectTranscript(input: ProjectTranscriptInput): Promise<TranscriptProjection> {
   let skippedLines = 0;
   let rawRecords: readonly TranscriptRecord[];
@@ -468,5 +484,6 @@ export async function projectTranscript(input: ProjectTranscriptInput): Promise<
     tokenUsageTotal: projectedUsage(selected),
     skippedLines,
     compactionBoundaries: history.compactionBoundaries,
+    turnBoundaries: projectTurnBoundaries(selected, input.subagent?.promptRecordUuid),
   };
 }

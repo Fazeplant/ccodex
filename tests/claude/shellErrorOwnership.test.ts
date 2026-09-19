@@ -153,7 +153,7 @@ describe("Claude session shell/error ownership", () => {
     }
   });
 
-  it("persists interleaved stdout and stderr before publishing each delta", async () => {
+  it("updates live shell output before publishing each delta", async () => {
     const root = directory("shell-stream-order");
     const store = new SqliteHybridStore(join(root, "state.sqlite"));
     const hub = new SubscriptionHub();
@@ -165,8 +165,8 @@ describe("Claude session shell/error ownership", () => {
     hub.subscribe(started.thread.id, "shell-stream", (method, params) => {
       if (method !== "item/commandExecution/outputDelta") return;
       const delta = (params as { delta: string }).delta;
-      const persisted = store.listTurns(started.thread.id).at(-1)?.items[0];
-      expect(persisted).toMatchObject({
+      const live = service.readThread(started.thread.id, true).thread.turns.at(-1)?.items[0];
+      expect(live).toMatchObject({
         type: "commandExecution",
         aggregatedOutput: expect.stringContaining(delta),
       });
@@ -192,7 +192,7 @@ describe("Claude session shell/error ownership", () => {
     await service.close();
   });
 
-  it("persists a nonzero exit before publishing failed completion", async () => {
+  it("updates a nonzero live exit before publishing failed completion", async () => {
     const root = directory("shell-nonzero");
     const store = new SqliteHybridStore(join(root, "state.sqlite"));
     const hub = new SubscriptionHub();
@@ -203,7 +203,7 @@ describe("Claude session shell/error ownership", () => {
     const methods: string[] = [];
     hub.subscribe(started.thread.id, "shell-failure", (method) => {
       if (method === "item/completed" || method === "turn/completed") {
-        expect(store.listTurns(started.thread.id).at(-1)).toMatchObject({
+        expect(service.readThread(started.thread.id, true).thread.turns.at(-1)).toMatchObject({
           status: "failed",
           error: { message: "Shell command exited with code 7." },
           items: [{ status: "failed", exitCode: 7, aggregatedOutput: "bad\n" }],
@@ -249,7 +249,7 @@ describe("Claude session shell/error ownership", () => {
     await service.close();
   });
 
-  it("kills the command process group on gateway SIGKILL and recovers its durable turn", async () => {
+  it("kills the command process group on gateway SIGKILL without recovering synthetic history", async () => {
     const root = directory("shell-gateway-crash");
     const shellPidPath = join(root, "shell.pid");
     const childPidPath = join(root, "child.pid");
@@ -300,15 +300,9 @@ describe("Claude session shell/error ownership", () => {
         new SqliteHybridStore(join(root, "state.sqlite")), new FakeClaudeQuery().factory,
       );
       await restarted.ready();
-      const recovered = restarted.readThread(ready.threadId, true).thread.turns[0]!;
-      expect(recovered).toMatchObject({
-        status: "failed",
-        items: [{ type: "commandExecution", status: "failed" }],
-      });
-      const output = (recovered.items[0] as { aggregatedOutput?: string }).aggregatedOutput;
+      expect(restarted.readThread(ready.threadId, true).thread.turns).toEqual([]);
       await new Promise<void>((resolve) => setTimeout(resolve, 100));
-      expect(restarted.readThread(ready.threadId, true).thread.turns[0]?.items[0])
-        .toMatchObject({ aggregatedOutput: output });
+      expect(restarted.readThread(ready.threadId, true).thread.turns).toEqual([]);
       await restarted.close();
     } finally {
       if (processExists(gateway.pid!)) {
@@ -323,7 +317,7 @@ describe("Claude session shell/error ownership", () => {
     }
   });
 
-  it("guardian closes the cancel-before-kill crash gap without durable PID state", async () => {
+  it("guardian closes the cancel-before-kill crash gap without durable history", async () => {
     const root = directory("shell-cancel-gap");
     const shellPidPath = join(root, "shell.pid");
     const childPidPath = join(root, "child.pid");
@@ -373,10 +367,7 @@ describe("Claude session shell/error ownership", () => {
         new SqliteHybridStore(join(root, "state.sqlite")), new FakeClaudeQuery().factory,
       );
       await restarted.ready();
-      expect(restarted.readThread(ready.threadId, true).thread.turns[0]).toMatchObject({
-        status: "failed",
-        items: [{ type: "commandExecution", status: "failed" }],
-      });
+      expect(restarted.readThread(ready.threadId, true).thread.turns).toEqual([]);
       await restarted.close();
     } finally {
       if (processExists(gateway.pid!)) {
@@ -648,10 +639,7 @@ describe("Claude session shell/error ownership", () => {
         expect(service.listThreads({ archived: true, limit: 10 })).toContainEqual(
           expect.objectContaining({ id: started.thread.id }),
         );
-        expect(service.readThread(started.thread.id, true).thread.turns[0]?.items[0]).toMatchObject({
-          type: "commandExecution",
-          aggregatedOutput: "",
-        });
+        expect(service.readThread(started.thread.id, true).thread.turns).toEqual([]);
       } else {
         expect(service.ownsThread(started.thread.id)).toBe(false);
       }

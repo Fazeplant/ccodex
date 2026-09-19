@@ -481,12 +481,14 @@ describe("Claude goal lifecycle", () => {
     await paused.notify();
 
     release();
-    await waitFor(() => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed", "steered turn");
+    await waitFor(() => service.readThread(started.thread.id, true).thread.turns
+      .find((candidate) => candidate.id === turn.response.turn.id)?.status === "completed", "steered turn");
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
 
     expect(JSON.stringify(fake.prompts)).toContain("The active thread goal objective was edited by the user");
     expect(JSON.stringify(fake.prompts)).toContain("new &lt;objective&gt;");
-    const visible = service.readThread(started.thread.id, true).thread.turns[0]!;
+    const visible = service.readThread(started.thread.id, true).thread.turns
+      .find((candidate) => candidate.id === turn.response.turn.id)!;
     expect(visible.items.filter((item) => item.type === "userMessage")).toHaveLength(1);
     await service.close();
   });
@@ -981,7 +983,8 @@ describe("Claude goal lifecycle", () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
 
     expect(fake.prompts).toHaveLength(1);
-    expect(store.listTurns(started.thread.id)).toEqual([
+    await service.prepareReadThread(started.thread.id, true);
+    expect(service.turnHistory(started.thread.id)).toEqual([
       expect.objectContaining({ id: turn.response.turn.id, status: "completed" }),
     ]);
     expect(events
@@ -1037,8 +1040,9 @@ describe("Claude goal lifecycle", () => {
     await resumeA.notifyGoalSnapshot((method) => snapshotA.push(method));
     expect(fake.prompts).toHaveLength(0);
     await resumeB.notifyGoalSnapshot((method) => snapshotB.push(method));
-    await waitFor(() => service.readThread(started.thread.id, true).thread.turns.length === 2
-      && service.readThread(started.thread.id, true).thread.turns.every((turn) => turn.status === "completed"), "two serialized continuations");
+    await waitFor(() => clientA.filter((method) => method === "turn/completed").length === 2,
+      "two serialized continuations");
+    await service.prepareReadThread(started.thread.id, true);
 
     expect(snapshotA).toEqual(["thread/goal/updated"]);
     expect(snapshotB).toEqual(["thread/goal/updated"]);
@@ -1173,12 +1177,15 @@ describe("Claude goal lifecycle", () => {
 
     await waitFor(() => events.filter((event) => event.method === "turn/started").length === 2, "single goal continuation");
     await service.interruptTurn(started.thread.id);
-    await waitFor(() => service.readThread(started.thread.id, true).thread.turns[1]?.status === "interrupted", "continuation stop");
+    await waitFor(() => events.filter((event) => event.method === "turn/completed").length === 2,
+      "continuation stop");
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    await service.prepareReadThread(started.thread.id, true);
     expect(fake.prompts).toHaveLength(2);
     expect(events.filter((event) => event.method === "turn/started")).toHaveLength(2);
     expect((await service.getGoal(started.thread.id)).goal?.status).toBe("paused");
-    const turns = service.readThread(started.thread.id, true).thread.turns;
+    const turns = events.filter((event) => event.method === "turn/completed")
+      .map((event) => (event.params as { turn: import("../../src/codex/generated/v2/Turn.js").Turn }).turn);
     expect(turns).toHaveLength(2);
     expect(turns[0]?.id).toBe(turn.response.turn.id);
     expect(turns[1]?.items.some((item) => item.type === "userMessage")).toBe(false);

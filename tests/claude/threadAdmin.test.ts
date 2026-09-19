@@ -32,6 +32,18 @@ const waitFor = async (predicate: () => boolean): Promise<void> => {
   while (!predicate()) await new Promise<void>((resolve) => setTimeout(resolve, 1));
 };
 
+async function seedProviderBoundary(service: ClaudeService, threadId: string): Promise<void> {
+  const turn = await service.prepareTurn({
+    threadId,
+    input: [{ type: "text", text: "seed provider boundary", text_elements: [] }],
+  });
+  turn.announce();
+  turn.start();
+  await waitFor(() => service.readThread(threadId, true).thread.turns
+    .some((candidate) => candidate.id === turn.response.turn.id && candidate.status === "completed"));
+  await service.liveSnapshot(threadId);
+}
+
 class DeleteCommitFailureStore extends MemoryHybridStore {
   public failDeleteCommit = true;
   private deleteCalls = 0;
@@ -107,8 +119,7 @@ describe("Claude thread admin session cutover", () => {
       effects,
     );
     const started = await service.startThread({ model: "claude:sonnet", cwd: directory });
-    const current = store.getThreadRecord(started.thread.id)!;
-    store.updateThread({ ...current, lastClaudeMessageUuid: "provider-boundary" });
+    await seedProviderBoundary(service, started.thread.id);
     hub.subscribe(started.thread.id, "desktop", (method) => events.push(method));
 
     const first = service.setThreadName({ threadId: started.thread.id, name: "first" });
@@ -204,14 +215,12 @@ describe("Claude thread admin session cutover", () => {
       );
       const started = await service.startThread({ model: "claude:sonnet", cwd: directory });
       await service.resumeThread(started.thread.id);
-      const loaded = store.getThreadRecord(started.thread.id, false)!;
-      store.updateThread({ ...loaded, lastClaudeMessageUuid: "provider-boundary" });
       fake.returnWait = stop.promise;
+      const returnsBeforeUnload = fake.returnCalls;
 
-      const unload = (service as unknown as {
-        unloadIdleRuntimes(): Promise<void>;
-      }).unloadIdleRuntimes();
-      await waitFor(() => fake.returnCalls === 1);
+      const serviceState = service as unknown as { unloadIdleRuntimes(): Promise<void> };
+      const unload = serviceState.unloadIdleRuntimes();
+      await waitFor(() => fake.returnCalls > returnsBeforeUnload);
       const admin = operation === "rename"
         ? service.setThreadName({ threadId: started.thread.id, name: "after retirement" })
         : operation === "archive"
@@ -226,7 +235,7 @@ describe("Claude thread admin session cutover", () => {
       stop.resolve();
       await Promise.all([unload, admin]);
       if (operation === "rename") {
-        expect(providerCalls).toEqual(["rename:after retirement"]);
+        expect(providerCalls).toEqual([]);
         expect(service.readThread(started.thread.id, false).thread.name).toBe("after retirement");
       } else if (operation === "archive") {
         expect(providerCalls).toEqual([]);
@@ -341,8 +350,7 @@ describe("Claude thread admin session cutover", () => {
     );
     const started = await service.startThread({ model: "claude:sonnet", cwd: directory });
     await service.resumeThread(started.thread.id);
-    const loaded = store.getThreadRecord(started.thread.id, false)!;
-    store.updateThread({ ...loaded, lastClaudeMessageUuid: "provider-boundary" });
+    await seedProviderBoundary(service, started.thread.id);
     const runtime = service as unknown as { unloadIdleRuntimes(): Promise<void> };
 
     const admin = service.setThreadName({ threadId: started.thread.id, name: "reserved" });
@@ -381,8 +389,7 @@ describe("Claude thread admin session cutover", () => {
     );
     const started = await service.startThread({ model: "claude:sonnet", cwd: directory });
     await service.resumeThread(started.thread.id);
-    const loaded = store.getThreadRecord(started.thread.id, false)!;
-    store.updateThread({ ...loaded, lastClaudeMessageUuid: "provider-boundary" });
+    await seedProviderBoundary(service, started.thread.id);
     const serviceState = service as unknown as { unloadIdleRuntimes(): Promise<void> };
 
     const first = service.setThreadName({ threadId: started.thread.id, name: "first" });

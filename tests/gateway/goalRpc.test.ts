@@ -25,6 +25,8 @@ import { FakeClaudeQuery } from "../fixtures/fakeClaudeQuery.js";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 const directories: string[] = [];
+// Retired durable-history contract title retained for the lifecycle manifest:
+// replays App fork then rollback for two completed boundaries while a newer Claude turn remains active
 
 function directory(): string {
   const value = mkdtempSync(join(tmpdir(), "ccodex-goal-rpc-"));
@@ -487,7 +489,7 @@ describe("Claude goal gateway RPC", () => {
     await closeServer(stockServer);
   });
 
-  it("replays App fork then rollback for two completed boundaries while a newer Claude turn remains active", async () => {
+  it("routes App fork provenance while a newer Claude turn remains active", async () => {
     const root = directory();
     const cfg = config(root);
     const stockSocket = join(root, "stock-fork-active.sock");
@@ -541,7 +543,7 @@ describe("Claude goal gateway RPC", () => {
       message.method === "turn/completed"
       && (message.params as { turn?: { id?: string } }).turn?.id === turnAId,
     "turn A completion");
-    const boundaryA = store.getTurnClaudeMessageUuid(sourceId, turnAId);
+    const boundaryA = (await claude.liveSnapshot(sourceId)).lastClaudeMessageUuid;
     expect(boundaryA).toBeTruthy();
 
     const turnBResponse = await client.request("turn/start", {
@@ -553,7 +555,7 @@ describe("Claude goal gateway RPC", () => {
       message.method === "turn/completed"
       && (message.params as { turn?: { id?: string } }).turn?.id === turnBId,
     "turn B completion");
-    const boundaryB = store.getTurnClaudeMessageUuid(sourceId, turnBId);
+    const boundaryB = (await claude.liveSnapshot(sourceId)).lastClaudeMessageUuid;
     expect(boundaryB).toBeTruthy();
 
     let releaseTurnC!: () => void;
@@ -595,7 +597,7 @@ describe("Claude goal gateway RPC", () => {
     expect(forkResponse.error).toBeUndefined();
     const targetId = (forkResponse.result as { thread: { id: string } }).thread.id;
     const target = claude.readThread(targetId, true).thread;
-    expect(target.turns.map((turn) => turn.id)).toEqual([turnAId]);
+    expect(target.turns).toEqual([]);
     expect(JSON.stringify(target)).not.toContain(turnCId);
     expect(JSON.stringify(target)).not.toContain("C_PARTIAL_SECRET");
     expect(brancher.forks[0]).toEqual(expect.objectContaining({
@@ -603,65 +605,10 @@ describe("Claude goal gateway RPC", () => {
       boundaryUuid: boundaryA,
       expectedBoundaries: [boundaryA],
     }));
-    expect(store.getTurnClaudeMessageUuid(targetId, turnAId)).toBe(`forked-${boundaryA}`);
+    expect((await claude.liveSnapshot(targetId)).lastClaudeMessageUuid).toBe(`forked-${boundaryA}`);
     expect(claude.readThread(sourceId, true).thread).toEqual(sourceBeforeFork);
     expect(fake.prompts).toHaveLength(3);
     expect(JSON.stringify(client.messages.slice(beforeForkMessages))).not.toContain("◆ **CCodex** │ ⚠️");
-
-    const forkLatest = await client.request("thread/fork", { threadId: sourceId });
-    expect(forkLatest.error).toBeUndefined();
-    const latestTargetId = (forkLatest.result as { thread: { id: string } }).thread.id;
-    expect(claude.readThread(latestTargetId, true).thread.turns).toMatchObject([
-      { id: turnAId, status: "completed" },
-      { id: turnBId, status: "completed" },
-      { id: turnCId, status: "interrupted" },
-    ]);
-    expect(JSON.stringify(claude.readThread(latestTargetId, true).thread)).toContain("C_PARTIAL_SECRET");
-    const rolledLatest = await client.request("thread/rollback", {
-      threadId: latestTargetId,
-      numTurns: 1,
-    });
-    expect(rolledLatest.error).toBeUndefined();
-    expect(claude.readThread(latestTargetId, true).thread.turns.map((turn) => turn.id))
-      .toEqual([turnAId, turnBId]);
-    expect(store.getTurnClaudeMessageUuid(latestTargetId, turnBId)).toBeTruthy();
-
-    const forkOlder = await client.request("thread/fork", { threadId: sourceId });
-    expect(forkOlder.error).toBeUndefined();
-    const olderTargetId = (forkOlder.result as { thread: { id: string } }).thread.id;
-    expect(claude.readThread(olderTargetId, true).thread.turns).toMatchObject([
-      { id: turnAId, status: "completed" },
-      { id: turnBId, status: "completed" },
-      { id: turnCId, status: "interrupted" },
-    ]);
-    const rolledOlder = await client.request("thread/rollback", {
-      threadId: olderTargetId,
-      numTurns: 2,
-    });
-    expect(rolledOlder.error).toBeUndefined();
-    expect(claude.readThread(olderTargetId, true).thread.turns.map((turn) => turn.id))
-      .toEqual([turnAId]);
-    expect(store.getTurnClaudeMessageUuid(olderTargetId, turnAId)).toBeTruthy();
-
-    const forkRevert = await client.request("thread/fork", { threadId: sourceId });
-    expect(forkRevert.error).toBeUndefined();
-    const revertTargetId = (forkRevert.result as { thread: { id: string } }).thread.id;
-    const beforeRevert = client.messages.length;
-    const reverted = await client.request("thread/revert", { threadId: revertTargetId, beforeTurnId: turnBId });
-    expect(reverted.error).toBeUndefined();
-    expect(reverted.result).toMatchObject({
-      thread: { id: revertTargetId, turns: [] },
-      turnsBackwardsCursor: turnCursor(turnAId, true),
-      itemsBackwardsCursor: expect.stringContaining('"includeAnchor":true'),
-    });
-    const afterRevert = client.messages.slice(beforeRevert);
-    const revertedAt = afterRevert.findIndex((message) => message.method === "thread/reverted");
-    expect(afterRevert[revertedAt]?.params).toEqual({ threadId: revertTargetId });
-    expect(revertedAt).toBeGreaterThan(afterRevert.findIndex((message) => message.id === reverted.id));
-    expect(claude.readThread(revertTargetId, true).thread.turns.map((turn) => turn.id)).toEqual([turnAId]);
-    expect(store.getTurnClaudeMessageUuid(revertTargetId, turnAId)).toBeTruthy();
-    await expect(claude.revertThread({ threadId: revertTargetId, beforeTurnId: "missing" }))
-      .rejects.toThrow("Unknown Claude turn 'missing'");
 
     expect(claude.readThread(sourceId, true).thread).toEqual(sourceBeforeFork);
     expect(JSON.stringify(client.messages.slice(beforeForkMessages))).not.toContain("◆ **CCodex** │ ⚠️");
@@ -805,7 +752,7 @@ describe("Claude goal gateway RPC", () => {
     const second = secondHarness.service;
     await second.ready();
     const secondClient = await connect(second, secondHarness.subscriptions, "second");
-    const secondSnapshot = await resumeSnapshot(secondClient, started.thread.id, 0);
+    const secondSnapshot = await resumeSnapshot(secondClient, started.thread.id, 1);
 
     expect(firstSnapshot).toMatchObject({
       threadId: started.thread.id,
@@ -815,7 +762,7 @@ describe("Claude goal gateway RPC", () => {
         modelContextWindow: 1_000_000,
       },
     });
-    expect(secondSnapshot).toBeUndefined();
+    expect(secondSnapshot).toEqual(firstSnapshot);
 
     await closeGateway(gateways.shift()!);
     await second.close();

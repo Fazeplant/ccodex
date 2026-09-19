@@ -1,13 +1,8 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Thread } from "../../../src/codex/generated/v2/Thread.js";
 import type { Turn } from "../../../src/codex/generated/v2/Turn.js";
 import type { ClaudeThreadRecord, HybridStore } from "../../../src/store/HybridStore.js";
 import { MemoryHybridStore } from "../../../src/store/memoryStore.js";
-import { SqliteHybridStore } from "../../../src/store/sqliteStore.js";
 import { SubscriptionHub } from "../../../src/gateway/subscriptions.js";
 import type {
   ClaudeSessionCommand,
@@ -21,11 +16,8 @@ import { ClaudeSession } from "../../../src/claude/session/session.js";
 import { ClaudeSessionRegistry } from "../../../src/claude/sessionRegistry.js";
 
 const source = { providerEventId: "provider-event", providerEventType: "compact_boundary" };
-const directories: string[] = [];
-
 afterEach(() => {
   vi.useRealTimers();
-  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
 function record(threadId: string): ClaudeThreadRecord {
@@ -108,6 +100,15 @@ function harness(
   return { store, registry, events, threadId };
 }
 
+function liveTurn(state: ReturnType<typeof harness>): Turn | undefined {
+  return state.registry.resolvedSession(state.threadId)?.liveSnapshot().activeTurn;
+}
+
+function notifications(state: ReturnType<typeof harness>): string[] {
+  return state.registry.resolvedSession(state.threadId)?.notificationsAfter(0)
+    .map((notification) => notification.method) ?? [];
+}
+
 async function startCompact(
   state: ReturnType<typeof harness>,
   generation = 1,
@@ -137,24 +138,23 @@ async function boundary(
 }
 
 describe("ClaudeSession manual compaction", () => {
-  it("durably starts one lifecycle and acknowledges before any provider fact", async () => {
+  it("starts one live lifecycle and acknowledges before any provider fact", async () => {
     const lifecycle: SessionLifecycleUpdate[] = [];
     const state = harness("thread-1", (update) => lifecycle.push(update));
     const started = await startCompact(state);
-    const turn = state.store.getTurn(state.threadId, started.turnId);
+    const turn = liveTurn(state);
 
     expect(turn).toMatchObject({
       status: "inProgress",
       items: [{ type: "contextCompaction" }],
     });
-    expect(state.store.getThreadRecord(state.threadId)?.thread.status.type).toBe("active");
+    expect(state.registry.resolvedSession(state.threadId)?.liveSnapshot().status.type).toBe("active");
     expect(state.events).toEqual([
       "thread/status/changed",
       "turn/started",
       "item/started",
     ]);
-    expect(state.store.listEventsAfter(state.threadId, 0).map((event) => event.method))
-      .toEqual(state.events);
+    expect(notifications(state)).toEqual(state.events);
     expect(lifecycle.at(-1)?.quiescent).toBe(false);
     expect(lifecycle.flatMap((update) => update.compactionActions ?? [])).toEqual([
       expect.objectContaining({
@@ -166,11 +166,9 @@ describe("ClaudeSession manual compaction", () => {
     ]);
 
     await boundary(state);
-    expect(state.store.getTurnClaudeMessageUuid(state.threadId, started.turnId))
+    expect(state.registry.resolvedSession(state.threadId)?.liveSnapshot().lastClaudeMessageUuid)
       .toBe("summary-boundary");
-    expect(state.store.getThreadRecord(state.threadId, false)?.lastClaudeMessageUuid)
-      .toBe("summary-boundary");
-    expect(state.store.getTurn(state.threadId, started.turnId)?.status).toBe("completed");
+    expect(liveTurn(state)?.status).toBe("completed");
     expect(state.events).toEqual([
       "thread/status/changed",
       "turn/started",
@@ -235,7 +233,7 @@ describe("ClaudeSession manual compaction", () => {
     ]);
 
     await boundary(state);
-    expect(state.store.getTurn(state.threadId, started.turnId)).toMatchObject({
+    expect(liveTurn(state)).toMatchObject({
       status: "completed",
       items: [{ type: "contextCompaction" }],
     });
@@ -266,7 +264,7 @@ describe("ClaudeSession manual compaction", () => {
       messageUuid: cancel!.messageUuid,
       runtimeGeneration: cancel!.runtimeGeneration,
     });
-    expect(state.store.getTurn(state.threadId, started.turnId)).toMatchObject({
+    expect(liveTurn(state)).toMatchObject({
       status: "failed",
       error: { message: "Claude compaction did not reach a terminal provider boundary within 15 minutes." },
     });
@@ -295,88 +293,9 @@ describe("ClaudeSession manual compaction", () => {
       message: "late exit",
     });
 
-    expect(state.store.getTurn(state.threadId, started.turnId)?.status).toBe("completed");
+    expect(liveTurn(state)?.status).toBe("completed");
     expect(state.events.filter((event) => event === "turn/completed")).toHaveLength(1);
     await state.registry.close();
-  });
-
-  it("rolls back a manual boundary and its terminal lifecycle when SQLite event insertion fails", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-session-compact-atomic-"));
-    directories.push(directory);
-    const path = join(directory, "state.sqlite");
-    const sqlite = new SqliteHybridStore(path);
-    const state = harness("thread-1", () => undefined, sqlite);
-    const started = await startCompact(state);
-    const injector = new DatabaseSync(path);
-    injector.exec(`
-      CREATE TRIGGER fail_compact_terminal BEFORE INSERT ON events
-      WHEN NEW.method = 'turn/completed'
-      BEGIN SELECT RAISE(ABORT, 'injected compact terminal failure'); END;
-    `);
-    injector.close();
-
-    await expect(boundary(state)).rejects.toThrow("injected compact terminal failure");
-    await state.registry.close();
-    sqlite.close();
-
-    const reopened = new SqliteHybridStore(path);
-    expect(reopened.getThreadRecord(state.threadId, false)).toMatchObject({
-      lastClaudeMessageUuid: null,
-      lastCompletedTurnId: null,
-      thread: { status: { type: "active" } },
-    });
-    expect(reopened.getTurn(state.threadId, started.turnId)?.status).toBe("inProgress");
-    expect(reopened.getTurnClaudeMessageUuid(state.threadId, started.turnId)).toBeUndefined();
-    expect(reopened.listEventsAfter(state.threadId, 0).map((event) => event.method)).toEqual([
-      "thread/status/changed",
-      "turn/started",
-      "item/started",
-    ]);
-    reopened.close();
-  });
-
-  it("retains the live compaction owner when a failed SQLite terminal commit rolls back", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-session-compact-failed-retry-"));
-    directories.push(directory);
-    const path = join(directory, "state.sqlite");
-    const sqlite = new SqliteHybridStore(path);
-    const state = harness("thread-1", () => undefined, sqlite);
-    const started = await startCompact(state);
-    const injector = new DatabaseSync(path);
-    injector.exec(`
-      CREATE TRIGGER fail_compact_failure BEFORE INSERT ON events
-      WHEN NEW.method = 'turn/completed'
-      BEGIN SELECT RAISE(ABORT, 'injected compact failure commit'); END;
-    `);
-
-    await expect(state.registry.submit(state.threadId, {
-      type: "compactFailed",
-      runtimeGeneration: 1,
-      message: "provider rejected compact",
-      codexErrorInfo: "other",
-      source,
-    })).rejects.toThrow("injected compact failure commit");
-    expect(sqlite.getTurn(state.threadId, started.turnId)?.status).toBe("inProgress");
-
-    injector.exec("DROP TRIGGER fail_compact_failure");
-    injector.close();
-    const interrupted = await state.registry.submit<CompactionProjection>(state.threadId, {
-      type: "interruptCompaction",
-      turnId: started.turnId,
-    });
-    expect(interrupted.cancelOperationId).toBe(started.operationId);
-    await state.registry.submit(state.threadId, {
-      type: "compactTransportCancelled",
-      operationId: started.operationId,
-      messageUuid: interrupted.transportAction!.messageUuid,
-      runtimeGeneration: 1,
-    });
-
-    expect(sqlite.getTurn(state.threadId, started.turnId)?.status).toBe("interrupted");
-    expect(sqlite.listEventsAfter(state.threadId, 0)
-      .filter((event) => event.method === "turn/completed")).toHaveLength(1);
-    await state.registry.close();
-    sqlite.close();
   });
 
   it("lets Stop fence boundary and failure until cancellation terminalizes once", async () => {
@@ -410,8 +329,8 @@ describe("ClaudeSession manual compaction", () => {
     });
     await boundary(state);
 
-    expect(state.store.getTurn(state.threadId, started.turnId)?.status).toBe("interrupted");
-    expect(state.store.getThreadRecord(state.threadId)?.thread.status.type).toBe("idle");
+    expect(liveTurn(state)?.status).toBe("interrupted");
+    expect(state.registry.resolvedSession(state.threadId)?.liveSnapshot().status.type).toBe("idle");
     expect(state.events.filter((event) => event === "turn/completed")).toHaveLength(1);
     expect(state.events).not.toContain("thread/compacted");
     expect(state.events).not.toContain("error");
@@ -430,7 +349,7 @@ describe("ClaudeSession manual compaction", () => {
       type: "compactWatchdogFired",
       operationId: exitStarted.operationId,
     })).resolves.toBeUndefined();
-    expect(exited.store.getTurn(exited.threadId, exitStarted.turnId)).toMatchObject({
+    expect(liveTurn(exited)).toMatchObject({
       status: "failed",
       error: { message: "runtime exited" },
     });
@@ -454,7 +373,7 @@ describe("ClaudeSession manual compaction", () => {
       messageUuid: cancellation.transportAction!.messageUuid,
       runtimeGeneration: 7,
     });
-    expect(watchdog.store.getTurn(watchdog.threadId, watched.turnId)).toMatchObject({
+    expect(liveTurn(watchdog)).toMatchObject({
       status: "failed",
       error: { message: "Claude compaction did not reach a terminal provider boundary within 15 minutes." },
     });
@@ -490,7 +409,7 @@ describe("ClaudeSession manual compaction", () => {
       source: { providerEventId: "compact-status-duplicate", providerEventType: "system/status" },
     });
 
-    expect(state.store.getTurn(state.threadId, prepared.turn.id)?.items)
+    expect(liveTurn(state)?.items)
       .toContainEqual(expect.objectContaining({ type: "contextCompaction" }));
     expect(state.events.filter((event) => event === "item/started")).toHaveLength(1);
 
@@ -504,11 +423,9 @@ describe("ClaudeSession manual compaction", () => {
       turnId: prepared.turn.id,
       terminal: false,
     });
-    expect(state.store.getTurnClaudeMessageUuid(state.threadId, prepared.turn.id))
+    expect(state.registry.resolvedSession(state.threadId)?.liveSnapshot().lastClaudeMessageUuid)
       .toBe("auto-boundary");
-    expect(state.store.getThreadRecord(state.threadId, false)?.lastClaudeMessageUuid)
-      .toBe("auto-boundary");
-    expect(state.store.listTurns(state.threadId).flatMap((turn) => turn.items))
+    expect(liveTurn(state)?.items)
       .toContainEqual(expect.objectContaining({ type: "contextCompaction" }));
     expect(state.events.filter((event) => event === "item/completed")).toHaveLength(1);
     expect(state.events.filter((event) => event === "thread/compacted")).toHaveLength(1);
@@ -550,7 +467,7 @@ describe("ClaudeSession manual compaction", () => {
       source,
     });
 
-    const methods = state.store.listEventsAfter(state.threadId, 0).map((event) => event.method);
+    const methods = notifications(state);
     expect(methods.filter((method) => method === "item/started")).toHaveLength(1);
     expect(methods.filter((method) => method === "item/completed")).toHaveLength(1);
     expect(methods.indexOf("item/completed")).toBeLessThan(methods.indexOf("turn/completed"));
@@ -582,13 +499,13 @@ describe("ClaudeSession manual compaction", () => {
       source: { providerEventId: "compact-failed", providerEventType: "system/status" },
     });
 
-    expect(state.store.getTurn(state.threadId, prepared.turn.id)?.status).toBe("inProgress");
+    expect(liveTurn(state)?.status).toBe("inProgress");
     expect(state.events.filter((method) => method === "item/completed")).toHaveLength(1);
     expect(state.events).not.toContain("thread/compacted");
     await state.registry.close();
   });
 
-  it("admits only session-owned durable idle state", async () => {
+  it("admits only session-owned live idle state", async () => {
     const active = harness("active");
     await active.registry.submit(active.threadId, {
       type: "createThread",
@@ -631,42 +548,7 @@ describe("ClaudeSession manual compaction", () => {
     await expect(pending.registry.submit(pending.threadId, { type: "startCompact" }))
       .rejects.toThrow("another lifecycle is active");
 
-    const background = harness("background");
-    await background.registry.submit(background.threadId, {
-      type: "createThread",
-      record: record(background.threadId),
-    });
-    await background.registry.submit(background.threadId, {
-      type: "attachRuntime",
-      runtimeGeneration: 1,
-    });
-    const busy = record(background.threadId);
-    background.store.updateThread({
-      ...busy,
-      thread: { ...busy.thread, status: { type: "active", activeFlags: [] } },
-    });
-    await expect(background.registry.submit(background.threadId, { type: "startCompact" }))
-      .rejects.toThrow("another lifecycle is active");
-
-    const child = harness("child");
-    await child.registry.submit(child.threadId, {
-      type: "createThread",
-      record: record(child.threadId),
-    });
-    await child.registry.submit(child.threadId, {
-      type: "attachRuntime",
-      runtimeGeneration: 1,
-    });
-    const childBusy = record(child.threadId);
-    child.store.updateThread({
-      ...childBusy,
-      thread: { ...childBusy.thread, status: { type: "active", activeFlags: [] } },
-    });
-    await expect(child.registry.submit(child.threadId, { type: "startCompact" }))
-      .rejects.toThrow("another lifecycle is active");
     await active.registry.close();
     await pending.registry.close();
-    await background.registry.close();
-    await child.registry.close();
   });
 });

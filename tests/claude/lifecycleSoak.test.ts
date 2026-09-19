@@ -31,7 +31,9 @@ describe("Claude lifecycle accelerated soak", () => {
     const hub = new SubscriptionHub();
     const store = new MemoryHybridStore();
     const metrics = new MetricsRegistry();
-    const service = new ClaudeService(config, hub, new Logger("error"), store, new FakeClaudeQuery().factory, undefined, metrics);
+    const fake = new FakeClaudeQuery();
+    fake.transcriptProjectsDir = config.claudeProjectsDir;
+    const service = new ClaudeService(config, hub, new Logger("error"), store, fake.factory, undefined, metrics);
     const started = await service.startThread({ model: "claude:haiku", cwd: process.cwd() });
     let completed = 0;
     hub.subscribe(started.thread.id, "soak", (method) => {
@@ -52,7 +54,6 @@ describe("Claude lifecycle accelerated soak", () => {
     expect(turns).toHaveLength(250);
     expect(turns.every((turn) => turn.status === "completed")).toBe(true);
     expect(turns.every((turn) => turn.items.filter((item) => item.type === "agentMessage" && item.phase === "final_answer").length === 1)).toBe(true);
-    expect(store.listProviderEvents(started.thread.id).every((event) => event.disposition !== "pending" && event.disposition !== "failed")).toBe(true);
     expect(metrics.snapshot()).toMatchObject({
       gauges: { loadedClaudeRuntimes: 1, pendingApprovals: 0 },
       counters: { turnsByTerminalStatus: { completed: 250, failed: 0, interrupted: 0 } },

@@ -8,11 +8,9 @@ import type { Thread } from "../codex/generated/v2/Thread.js";
 import type { ThreadListParams } from "../codex/generated/v2/ThreadListParams.js";
 import type { Turn } from "../codex/generated/v2/Turn.js";
 import type { ApprovalsReviewer } from "../codex/generated/v2/ApprovalsReviewer.js";
-import type { QueuedSubmission } from "../codex/generated/v2/QueuedSubmission.js";
 import type {
-  AppendProviderEvent, ClaudeSessionFlags, ClaudeThreadRecord, EventPersistence, GoalPatch, GoalUsageInput, HybridStore, InternalGoal,
-  PendingRequestRecord, PendingThreadRemoval, ProviderEventDisposition, ProviderEventRecord, ProviderItemCorrelation,
-  ProviderRetractionMutation, StoredEvent, ThreadStateCommit, TurnProviderBoundary,
+  ClaudeSessionFlags, ClaudeThreadRecord, GoalPatch, GoalUsageInput, HybridStore, InternalGoal,
+  PendingThreadRemoval,
 } from "./HybridStore.js";
 import { settingsGeneration, withSettingsFrom } from "./HybridStore.js";
 import { filterSortThreads } from "./threadFilter.js";
@@ -41,41 +39,6 @@ interface TurnRow {
   last_claude_message_uuid?: string | null;
 }
 
-interface PendingRequestRow {
-  request_id: string;
-  thread_id: string;
-  turn_id: string | null;
-  claude_request_id: string | null;
-  method: string;
-  params_json: string;
-  status: PendingRequestRecord["status"];
-  response_json: string | null;
-  created_at: number;
-  resolved_at: number | null;
-}
-
-interface ProviderEventRow {
-  sequence: number;
-  thread_id: string;
-  process_epoch: string;
-  provider_sequence: number;
-  provider_event_type: string;
-  provider_event_id: string | null;
-  payload_json: string;
-  disposition: ProviderEventDisposition;
-  error: string | null;
-  created_at: number;
-  projected_at: number | null;
-}
-
-interface EventRow {
-  sequence: number;
-  thread_id: string;
-  turn_id: string | null;
-  method: string;
-  params_json: string;
-  created_at: number;
-}
 
 function json(value: unknown): string {
   return JSON.stringify(value);
@@ -169,37 +132,6 @@ function parseRecord(row: ThreadRow, turns: Turn[]): ClaudeThreadRecord {
   };
 }
 
-function parsePending(row: PendingRequestRow): PendingRequestRecord {
-  return {
-    requestId: row.request_id,
-    threadId: row.thread_id,
-    turnId: row.turn_id,
-    claudeRequestId: row.claude_request_id,
-    method: row.method,
-    params: JSON.parse(row.params_json) as unknown,
-    status: row.status,
-    response: row.response_json === null ? null : JSON.parse(row.response_json) as unknown,
-    createdAt: row.created_at,
-    resolvedAt: row.resolved_at,
-  };
-}
-
-function parseProviderEvent(row: ProviderEventRow): ProviderEventRecord {
-  return {
-    sequence: row.sequence,
-    threadId: row.thread_id,
-    processEpoch: row.process_epoch,
-    providerSequence: row.provider_sequence,
-    providerEventType: row.provider_event_type,
-    providerEventId: row.provider_event_id,
-    payload: JSON.parse(row.payload_json) as unknown,
-    disposition: row.disposition,
-    error: row.error,
-    createdAt: row.created_at,
-    projectedAt: row.projected_at,
-  };
-}
-
 export class SqliteHybridStore implements HybridStore {
   private readonly database: DatabaseSync;
   private readonly path: string;
@@ -212,7 +144,6 @@ export class SqliteHybridStore implements HybridStore {
     this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;");
     if (existed) this.backup();
     this.migrate();
-    this.recoverColdThreadStatuses();
     chmodSync(path, 0o600);
   }
 
@@ -347,7 +278,7 @@ export class SqliteHybridStore implements HybridStore {
     );
   }
 
-  public adoptTransient(_record: ClaudeThreadRecord, _turns: readonly Turn[]): void {
+  public adoptTransient(_record: ClaudeThreadRecord): void {
     throw new Error("SqliteHybridStore cannot adopt transient Claude sessions");
   }
 
@@ -356,14 +287,20 @@ export class SqliteHybridStore implements HybridStore {
     const merged = current && settingsGeneration(current) > settingsGeneration(record)
       ? withSettingsFrom(record, current)
       : record;
+    const persistedThread = {
+      ...merged.thread,
+      status: current?.thread.status ?? merged.thread.status,
+      preview: current?.thread.preview ?? merged.thread.preview,
+      recencyAt: current?.thread.recencyAt ?? merged.thread.recencyAt,
+      cliVersion: current?.thread.cliVersion ?? merged.thread.cliVersion,
+      turns: [],
+    };
     this.database.prepare(`
       UPDATE threads SET
         claude_session_id = ?, model_picker_id = ?, claude_model_value = ?,
         service_tier = ?, cwd = ?, updated_at = ?, thread_json = ?,
         approval_policy_json = ?, sandbox_policy_json = ?, base_instructions = ?,
-        developer_instructions = ?, personality = ?, resolved_model = ?,
-        last_claude_message_uuid = ?, last_completed_turn_id = ?, claude_code_version = ?,
-        runtime_settings_json = ?
+        developer_instructions = ?, personality = ?, runtime_settings_json = ?
       WHERE id = ?
     `).run(
       merged.claudeSessionId,
@@ -372,16 +309,12 @@ export class SqliteHybridStore implements HybridStore {
       merged.serviceTier,
       merged.thread.cwd,
       merged.thread.updatedAt,
-      json({ ...merged.thread, turns: [] }),
+      json(persistedThread),
       json(merged.approvalPolicy),
       json(merged.sandboxPolicy),
       merged.baseInstructions,
       merged.developerInstructions,
       merged.personality,
-      merged.resolvedModel,
-      merged.lastClaudeMessageUuid,
-      merged.lastCompletedTurnId,
-      merged.claudeCodeVersion,
       json({
         runtimeWorkspaceRoots: merged.runtimeWorkspaceRoots ?? [merged.thread.cwd],
         approvalsReviewer: merged.approvalsReviewer,
@@ -389,10 +322,10 @@ export class SqliteHybridStore implements HybridStore {
         reasoningSummary: merged.reasoningSummary,
         collaborationMode: merged.collaborationMode,
         outputSchema: merged.outputSchema,
-        tokenUsageTotal: merged.tokenUsageTotal,
-        tokenUsageLast: merged.tokenUsageLast,
-        modelContextWindow: merged.modelContextWindow,
-        providerCostUsdTotal: merged.providerCostUsdTotal ?? 0,
+        tokenUsageTotal: current?.tokenUsageTotal ?? merged.tokenUsageTotal,
+        tokenUsageLast: current?.tokenUsageLast ?? merged.tokenUsageLast,
+        modelContextWindow: current?.modelContextWindow ?? merged.modelContextWindow,
+        providerCostUsdTotal: current?.providerCostUsdTotal ?? merged.providerCostUsdTotal ?? 0,
         settingsGeneration: settingsGeneration(merged),
       }),
       merged.thread.id,
@@ -411,12 +344,8 @@ export class SqliteHybridStore implements HybridStore {
   }
 
   public commitThreadsArchived(threadIds: readonly string[], archived: boolean): void {
-    const method = archived ? "thread/archived" : "thread/unarchived";
     this.transaction(() => {
-      for (const threadId of threadIds) {
-        this.setThreadArchived(threadId, archived);
-        this.insertEvent(threadId, null, method, { threadId });
-      }
+      for (const threadId of threadIds) this.setThreadArchived(threadId, archived);
     });
   }
 
@@ -463,14 +392,6 @@ export class SqliteHybridStore implements HybridStore {
     this.transaction(() => this.deleteThreadRows(threadId));
   }
 
-  public createTurn(threadId: string, turn: Turn): void {
-    this.transaction(() => this.insertTurn(threadId, turn));
-  }
-
-  public updateTurn(threadId: string, turn: Turn): void {
-    this.transaction(() => this.writeTurn(threadId, turn));
-  }
-
   public getTurn(threadId: string, turnId: string): Turn | undefined {
     const row = this.database.prepare("SELECT turn_json FROM turns WHERE id = ? AND thread_id = ?")
       .get(turnId, threadId) as unknown as TurnRow | undefined;
@@ -483,33 +404,12 @@ export class SqliteHybridStore implements HybridStore {
     return rows.map((row) => JSON.parse(row.turn_json) as Turn);
   }
 
-  public setTurnClaudeMessageUuid(threadId: string, turnId: string, messageUuid: string): void {
-    this.database.prepare("UPDATE turns SET last_claude_message_uuid = ? WHERE id = ? AND thread_id = ?")
-      .run(messageUuid, turnId, threadId);
-  }
-
-  public getTurnClaudeMessageUuid(threadId: string, turnId: string): string | undefined {
-    const row = this.database.prepare("SELECT last_claude_message_uuid FROM turns WHERE id = ? AND thread_id = ?")
-      .get(turnId, threadId) as unknown as { last_claude_message_uuid: string | null } | undefined;
-    return row?.last_claude_message_uuid ?? undefined;
-  }
-
-  public truncateTurns(threadId: string, keepCount: number): void {
-    this.database.prepare("DELETE FROM turns WHERE thread_id = ? AND ordinal >= ?").run(threadId, keepCount);
-  }
-
   public commitForkedThread(
     record: ClaudeThreadRecord,
-    turns: readonly Turn[],
-    boundaries: readonly TurnProviderBoundary[],
     inheritedGoal?: InternalGoal,
   ): void {
     this.transaction(() => {
       this.createThread(record);
-      for (const turn of turns) this.insertTurn(record.thread.id, turn);
-      for (const boundary of boundaries) {
-        this.setTurnClaudeMessageUuid(record.thread.id, boundary.turnId, boundary.messageUuid);
-      }
       if (inheritedGoal) {
         this.database.prepare("INSERT INTO goals (thread_id, goal_json) VALUES (?, ?)")
           .run(record.thread.id, json(inheritedGoal));
@@ -519,266 +419,12 @@ export class SqliteHybridStore implements HybridStore {
 
   public commitThreadRollback(
     record: ClaudeThreadRecord,
-    keepCount: number,
-    boundaries: readonly TurnProviderBoundary[],
     removedThreadIds: readonly string[] = [],
   ): void {
     this.transaction(() => {
       for (const threadId of removedThreadIds) this.deleteThreadRows(threadId);
-      this.truncateTurns(record.thread.id, keepCount);
-      for (const boundary of boundaries) {
-        this.setTurnClaudeMessageUuid(record.thread.id, boundary.turnId, boundary.messageUuid);
-      }
       this.updateThread(record);
     });
-  }
-
-  public commitThreadState(commit: ThreadStateCommit): number[] {
-    return this.transaction(() => {
-      this.updateThread(commit.record);
-      if (commit.turn) {
-        if (commit.insertTurn) this.insertTurn(commit.record.thread.id, commit.turn);
-        else this.writeTurn(commit.record.thread.id, commit.turn);
-      }
-      if (commit.providerBoundary) {
-        const boundary = commit.providerBoundary;
-        this.setTurnClaudeMessageUuid(boundary.ownerThreadId, boundary.turnId, boundary.messageUuid);
-        this.insertProviderItems(
-          commit.record.thread.id,
-          boundary.messageUuid,
-          boundary.ownerThreadId,
-          boundary.turnId,
-          boundary.itemIds ?? [],
-        );
-      }
-      return commit.events.map((event) => this.insertEvent(
-        commit.record.thread.id,
-        event.turnId,
-        event.method,
-        event.params,
-        event,
-      ));
-    });
-  }
-
-  public appendEvent(
-    threadId: string,
-    turnId: string | null,
-    method: string,
-    params: unknown,
-    persistence?: EventPersistence,
-  ): number {
-    return this.transaction(() => this.insertEvent(threadId, turnId, method, params, persistence));
-  }
-
-  public eventHighWatermark(threadId: string): number {
-    const row = this.database.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events WHERE thread_id = ?")
-      .get(threadId) as unknown as { sequence: number };
-    return row.sequence;
-  }
-
-  public listEventsAfter(threadId: string, sequence: number): StoredEvent[] {
-    const rows = this.database.prepare(`
-      SELECT sequence, thread_id, turn_id, method, params_json, created_at
-      FROM events
-      WHERE thread_id = ? AND sequence > ? AND method NOT LIKE 'hybrid/%'
-      ORDER BY sequence ASC
-    `).all(threadId, sequence) as unknown as EventRow[];
-    return rows.map((row) => ({
-      sequence: row.sequence,
-      threadId: row.thread_id,
-      turnId: row.turn_id,
-      method: row.method,
-      params: JSON.parse(row.params_json) as unknown,
-      createdAt: row.created_at,
-    }));
-  }
-
-  public hasProcessedProviderEvent(threadId: string, providerEventId: string): boolean {
-    return this.database.prepare(`
-      SELECT 1 FROM processed_provider_events
-      WHERE thread_id = ? AND provider_event_id = ?
-    `).get(threadId, providerEventId) !== undefined;
-  }
-
-  public markProviderEventProcessed(threadId: string, providerEventType: string, providerEventId: string): void {
-    this.database.prepare(`
-      INSERT OR IGNORE INTO processed_provider_events(
-        thread_id, provider_event_id, provider_event_type, processed_at
-      ) VALUES (?, ?, ?, ?)
-    `).run(threadId, providerEventId, providerEventType, Date.now());
-  }
-
-  public appendProviderEvent(event: AppendProviderEvent): { record: ProviderEventRecord; inserted: boolean } {
-    return this.transaction(() => {
-      const existing = event.providerEventId === null ? undefined : this.database.prepare(`
-        SELECT * FROM provider_events WHERE thread_id = ? AND provider_event_id = ?
-      `).get(event.threadId, event.providerEventId) as unknown as ProviderEventRow | undefined;
-      if (existing) return { record: parseProviderEvent(existing), inserted: false };
-      const result = this.database.prepare(`
-        INSERT INTO provider_events (
-          thread_id, process_epoch, provider_sequence, provider_event_type,
-          provider_event_id, payload_json, disposition, error, created_at, projected_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)
-      `).run(
-        event.threadId, event.processEpoch, event.providerSequence, event.providerEventType,
-        event.providerEventId, json(event.payload), event.createdAt,
-      );
-      const row = this.database.prepare("SELECT * FROM provider_events WHERE sequence = ?")
-        .get(Number(result.lastInsertRowid)) as unknown as ProviderEventRow;
-      return { record: parseProviderEvent(row), inserted: true };
-    });
-  }
-
-  public completeProviderEvent(
-    threadId: string,
-    sequence: number,
-    disposition: Exclude<ProviderEventDisposition, "pending">,
-    error: string | null = null,
-  ): void {
-    this.database.prepare(`
-      UPDATE provider_events SET disposition = ?, error = ?, projected_at = ? WHERE thread_id = ? AND sequence = ?
-    `).run(disposition, error, Date.now(), threadId, sequence);
-  }
-
-  public listProviderEvents(threadId: string, disposition?: ProviderEventDisposition): ProviderEventRecord[] {
-    const rows = (disposition
-      ? this.database.prepare("SELECT * FROM provider_events WHERE thread_id = ? AND disposition = ? ORDER BY sequence")
-        .all(threadId, disposition)
-      : this.database.prepare("SELECT * FROM provider_events WHERE thread_id = ? ORDER BY sequence").all(threadId)
-    ) as unknown as ProviderEventRow[];
-    return rows.map(parseProviderEvent);
-  }
-
-  public pruneProviderEvents(threadId: string, maxEvents: number, maxBytes: number): number {
-    if (maxEvents < 1) throw new Error("Provider event retention must keep at least one event.");
-    const result = this.database.prepare(`
-      DELETE FROM provider_events
-      WHERE thread_id = ?
-        AND disposition IN ('projected', 'stateOnly', 'retainedOnly', 'unsupportedVisible')
-        AND sequence IN (
-          SELECT sequence FROM (
-            SELECT sequence,
-                   ROW_NUMBER() OVER (ORDER BY sequence DESC) AS ordinal,
-                   SUM(LENGTH(CAST(payload_json AS BLOB))) OVER (ORDER BY sequence DESC) AS retained_bytes
-            FROM provider_events
-            WHERE thread_id = ?
-              AND disposition IN ('projected', 'stateOnly', 'retainedOnly', 'unsupportedVisible')
-              AND (provider_event_id IS NULL OR NOT EXISTS (
-                SELECT 1 FROM turns
-                WHERE last_claude_message_uuid = provider_events.provider_event_id
-              ))
-          )
-          WHERE ordinal > ? OR (ordinal > 1 AND retained_bytes > ?)
-        )
-    `).run(threadId, threadId, maxEvents, maxBytes);
-    return Number(result.changes);
-  }
-
-  public linkProviderItems(threadId: string, providerMessageId: string, ownerThreadId: string, turnId: string, itemIds: readonly string[]): void {
-    this.transaction(() => this.insertProviderItems(threadId, providerMessageId, ownerThreadId, turnId, itemIds));
-  }
-
-  private insertProviderItems(
-    threadId: string,
-    providerMessageId: string,
-    ownerThreadId: string,
-    turnId: string,
-    itemIds: readonly string[],
-  ): void {
-    const insert = this.database.prepare(`
-      INSERT OR IGNORE INTO provider_item_correlations (
-        thread_id, provider_message_id, owner_thread_id, turn_id, item_id
-      ) VALUES (?, ?, ?, ?, ?)
-    `);
-    for (const itemId of itemIds) insert.run(threadId, providerMessageId, ownerThreadId, turnId, itemId);
-  }
-
-  public listProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): ProviderItemCorrelation[] {
-    if (providerMessageIds.length === 0) return [];
-    const placeholders = providerMessageIds.map(() => "?").join(", ");
-    const rows = this.database.prepare(`
-      SELECT provider_message_id, owner_thread_id, turn_id, item_id
-      FROM provider_item_correlations
-      WHERE thread_id = ? AND provider_message_id IN (${placeholders})
-    `).all(threadId, ...providerMessageIds) as unknown as Array<{
-      provider_message_id: string; owner_thread_id: string; turn_id: string; item_id: string;
-    }>;
-    return rows.map((row) => ({
-      providerMessageId: row.provider_message_id,
-      ownerThreadId: row.owner_thread_id,
-      turnId: row.turn_id,
-      itemId: row.item_id,
-    }));
-  }
-
-  public deleteProviderItemCorrelations(threadId: string, providerMessageIds: readonly string[]): void {
-    if (providerMessageIds.length === 0) return;
-    const placeholders = providerMessageIds.map(() => "?").join(", ");
-    this.database.prepare(`
-      DELETE FROM provider_item_correlations
-      WHERE thread_id = ? AND provider_message_id IN (${placeholders})
-    `).run(threadId, ...providerMessageIds);
-  }
-
-  public commitProviderRetraction(
-    record: ClaudeThreadRecord,
-    providerMessageIds: readonly string[],
-    mutations: readonly ProviderRetractionMutation[],
-    removedThreadIds: readonly string[] = [],
-  ): void {
-    this.transaction(() => {
-      for (const threadId of removedThreadIds) this.deleteThreadRows(threadId);
-      for (const mutation of mutations) {
-        this.writeTurn(mutation.ownerThreadId, mutation.turn);
-        if (mutation.clearBoundary) {
-          this.database.prepare(`
-            UPDATE turns SET last_claude_message_uuid = NULL
-            WHERE id = ? AND thread_id = ?
-          `).run(mutation.turn.id, mutation.ownerThreadId);
-        }
-      }
-      this.deleteProviderItemCorrelations(record.thread.id, providerMessageIds);
-      this.updateThread(record);
-    });
-  }
-
-  public createPendingRequest(request: PendingRequestRecord): void {
-    this.database.prepare(`
-      INSERT INTO pending_requests (
-        request_id, thread_id, turn_id, claude_request_id, method, params_json,
-        status, response_json, created_at, resolved_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      request.requestId, request.threadId, request.turnId, request.claudeRequestId,
-      request.method, json(request.params), request.status,
-      request.response === null ? null : json(request.response), request.createdAt, request.resolvedAt,
-    );
-  }
-
-  public getPendingRequest(requestId: string): PendingRequestRecord | undefined {
-    const row = this.database.prepare("SELECT * FROM pending_requests WHERE request_id = ?").get(requestId) as unknown as PendingRequestRow | undefined;
-    return row ? parsePending(row) : undefined;
-  }
-
-  public findPendingRequestByClaudeId(threadId: string, claudeRequestId: string): PendingRequestRecord | undefined {
-    const row = this.database.prepare(`
-      SELECT * FROM pending_requests
-      WHERE thread_id = ? AND claude_request_id = ?
-      ORDER BY created_at DESC LIMIT 1
-    `).get(threadId, claudeRequestId) as unknown as PendingRequestRow | undefined;
-    return row ? parsePending(row) : undefined;
-  }
-
-  public listPendingRequests(threadId: string): PendingRequestRecord[] {
-    const rows = this.database.prepare("SELECT * FROM pending_requests WHERE thread_id = ? AND status = 'pending' ORDER BY created_at ASC")
-      .all(threadId) as unknown as PendingRequestRow[];
-    return rows.map(parsePending);
-  }
-
-  public resolvePendingRequest(requestId: string, status: "resolved" | "cancelled", response: unknown): void {
-    this.database.prepare("UPDATE pending_requests SET status = ?, response_json = ?, resolved_at = ? WHERE request_id = ? AND status = 'pending'")
-      .run(status, json(response), Date.now(), requestId);
   }
 
   public getGoal(threadId: string): InternalGoal | undefined {
@@ -843,24 +489,6 @@ export class SqliteHybridStore implements HybridStore {
     `).run(sectionId, json(threadIds));
   }
 
-  public listQueuedSubmissions(threadId: string): QueuedSubmission[] {
-    const row = this.database.prepare("SELECT queue_json FROM thread_queues WHERE thread_id = ?").get(threadId) as unknown as
-      | { queue_json: string }
-      | undefined;
-    return row ? JSON.parse(row.queue_json) as QueuedSubmission[] : [];
-  }
-
-  public setQueuedSubmissions(threadId: string, items: readonly QueuedSubmission[]): void {
-    if (items.length === 0) {
-      this.database.prepare("DELETE FROM thread_queues WHERE thread_id = ?").run(threadId);
-      return;
-    }
-    this.database.prepare(`
-      INSERT INTO thread_queues (thread_id, queue_json) VALUES (?, ?)
-      ON CONFLICT(thread_id) DO UPDATE SET queue_json = excluded.queue_json
-    `).run(threadId, json(items));
-  }
-
   public accountGoalUsage(input: GoalUsageInput): InternalGoal | undefined {
     return this.transaction(() => {
       if (input.checkpointKey) {
@@ -905,56 +533,10 @@ export class SqliteHybridStore implements HybridStore {
     }
   }
 
-  private insertEvent(
-    threadId: string,
-    turnId: string | null,
-    method: string,
-    params: unknown,
-    persistence?: EventPersistence,
-  ): number {
-    if (persistence?.dedupKey) {
-      const found = this.database.prepare("SELECT 1 FROM events WHERE thread_id = ? AND dedup_key = ?")
-        .get(threadId, persistence.dedupKey);
-      if (found) return 0;
-    }
-    if (persistence?.turn) this.writeTurn(threadId, persistence.turn);
-    const result = this.database.prepare(`
-      INSERT INTO events (
-        event_id, thread_id, turn_id, method, params_json, provider_event_type,
-        provider_event_id, dedup_key, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      uuidv7(), threadId, turnId, method, json(params), persistence?.providerEventType ?? null,
-      persistence?.providerEventId ?? null, persistence?.dedupKey ?? null, Date.now(),
-    );
-    this.database.prepare(`
-      DELETE FROM events WHERE thread_id = ? AND sequence < COALESCE((
-        SELECT sequence FROM events WHERE thread_id = ? ORDER BY sequence DESC LIMIT 1 OFFSET 4095
-      ), 0)
-    `).run(threadId, threadId);
-    return Number(result.lastInsertRowid);
-  }
-
   private deleteThreadRows(threadId: string): void {
-    this.database.prepare("DELETE FROM provider_item_correlations WHERE owner_thread_id = ?").run(threadId);
     this.database.prepare("DELETE FROM goals WHERE thread_id = ?").run(threadId);
-    this.database.prepare("DELETE FROM thread_queues WHERE thread_id = ?").run(threadId);
-    this.database.prepare("DELETE FROM pending_requests WHERE thread_id = ?").run(threadId);
-    this.database.prepare("DELETE FROM events WHERE thread_id = ?").run(threadId);
     this.database.prepare("DELETE FROM turns WHERE thread_id = ?").run(threadId);
     this.database.prepare("DELETE FROM threads WHERE id = ?").run(threadId);
-  }
-
-  private writeTurn(threadId: string, turn: Turn): void {
-    this.database.prepare("UPDATE turns SET status = ?, turn_json = ? WHERE id = ? AND thread_id = ?")
-      .run(turn.status, json(turn), turn.id, threadId);
-  }
-
-  private insertTurn(threadId: string, turn: Turn): void {
-    const ordinalRow = this.database.prepare("SELECT COALESCE(MAX(ordinal), -1) + 1 AS ordinal FROM turns WHERE thread_id = ?")
-      .get(threadId) as unknown as { ordinal: number };
-    this.database.prepare("INSERT INTO turns (id, thread_id, ordinal, status, turn_json) VALUES (?, ?, ?, ?, ?)")
-      .run(turn.id, threadId, ordinalRow.ordinal, turn.status, json(turn));
   }
 
   private backup(): void {
@@ -1004,8 +586,6 @@ export class SqliteHybridStore implements HybridStore {
         last_claude_message_uuid TEXT,
         UNIQUE(thread_id, ordinal)
       );
-      CREATE INDEX IF NOT EXISTS turns_last_claude_message_uuid
-        ON turns (last_claude_message_uuid) WHERE last_claude_message_uuid IS NOT NULL;
       CREATE TABLE IF NOT EXISTS events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id TEXT,
@@ -1119,7 +699,10 @@ export class SqliteHybridStore implements HybridStore {
           SELECT id, claude_session_id, cwd, 'delete' FROM threads WHERE deletion_pending = 1
         `);
       }
-      this.ensureColumn("turns", "last_claude_message_uuid", "TEXT");
+      const nativeHistoryApplied = this.database.prepare(
+        "SELECT 1 FROM schema_migrations WHERE version = 14",
+      ).get();
+      if (!nativeHistoryApplied) this.ensureColumn("turns", "last_claude_message_uuid", "TEXT");
       this.ensureColumn("events", "event_id", "TEXT");
       this.ensureColumn("events", "provider_event_type", "TEXT");
       this.ensureColumn("events", "provider_event_id", "TEXT");
@@ -1263,21 +846,42 @@ export class SqliteHybridStore implements HybridStore {
         }
         this.database.exec("INSERT INTO schema_migrations(version) VALUES (13)");
       }
-      this.database.exec("DROP TABLE IF EXISTS items");
+      const nativeHistory = this.database.prepare("SELECT 1 FROM schema_migrations WHERE version = 14").get();
+      if (!nativeHistory) {
+        this.database.exec(`
+          DROP TABLE IF EXISTS provider_item_correlations;
+          DROP TABLE IF EXISTS provider_events;
+          DROP TABLE IF EXISTS processed_provider_events;
+          DROP TABLE IF EXISTS events;
+          DROP TABLE IF EXISTS pending_requests;
+          DROP TABLE IF EXISTS thread_queues;
+          DROP INDEX IF EXISTS turns_last_claude_message_uuid;
+          CREATE TABLE turns_v14 (
+            id TEXT NOT NULL,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            turn_json TEXT NOT NULL,
+            PRIMARY KEY(thread_id, id),
+            UNIQUE(thread_id, ordinal)
+          );
+          INSERT INTO turns_v14 (id, thread_id, ordinal, status, turn_json)
+          SELECT id, thread_id, ordinal, status, turn_json FROM turns;
+          DROP TABLE turns;
+          ALTER TABLE turns_v14 RENAME TO turns;
+          INSERT INTO schema_migrations(version) VALUES (14);
+        `);
+      }
+      this.database.exec(`
+        DROP TABLE IF EXISTS items;
+        DROP TABLE IF EXISTS provider_item_correlations;
+        DROP TABLE IF EXISTS provider_events;
+        DROP TABLE IF EXISTS processed_provider_events;
+        DROP TABLE IF EXISTS events;
+        DROP TABLE IF EXISTS pending_requests;
+        DROP TABLE IF EXISTS thread_queues;
+      `);
     });
-  }
-
-  private recoverColdThreadStatuses(): void {
-    const columns = new Set((this.database.prepare("PRAGMA table_info(threads)").all() as Array<{ name: string }>)
-      .map((column) => column.name));
-    if (!["thread_json", "ephemeral"].every((column) => columns.has(column))) return;
-    this.database.exec(`
-      UPDATE threads
-      SET thread_json = json_set(thread_json, '$.status.type', 'notLoaded')
-      WHERE ephemeral = 0
-        AND json_extract(thread_json, '$.parentThreadId') IS NULL
-        AND json_extract(thread_json, '$.status.type') = 'idle';
-    `);
   }
 
   private migrateThreadScopedIds(): void {

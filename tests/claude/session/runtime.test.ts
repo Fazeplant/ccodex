@@ -22,7 +22,7 @@ describe("ClaudeRuntime", () => {
     const facts: ClaudeRuntimeFact[] = [];
     const runtime = new ClaudeRuntime(
       7,
-      { cwd: "/workspace", model: "haiku" },
+      { cwd: "/workspace", model: "haiku", persistSession: false },
       query.factory,
       async (fact) => { facts.push(fact); },
     );
@@ -49,7 +49,7 @@ describe("ClaudeRuntime", () => {
     const query = new FakeClaudeQuery();
     const runtime = new ClaudeRuntime(
       1,
-      { cwd: "/workspace", model: "haiku" },
+      { cwd: "/workspace", model: "haiku", persistSession: false },
       query.factory,
       async (fact) => {
         if (fact.kind === "exit" || fact.kind === "inputPending") return;
@@ -76,7 +76,7 @@ describe("ClaudeRuntime", () => {
     const delivered: SDKMessage[] = [];
     const runtime = new ClaudeRuntime(
       1,
-      { cwd: "/workspace", model: "haiku" },
+      { cwd: "/workspace", model: "haiku", persistSession: false },
       query.factory,
       async (fact) => {
         if (fact.kind !== "message") return;
@@ -108,6 +108,7 @@ describe("ClaudeRuntime", () => {
       3,
       {
         cwd: "/workspace",
+        persistSession: false,
         model: "haiku",
         stderr: () => undefined,
       },

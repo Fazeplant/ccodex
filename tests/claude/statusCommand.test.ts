@@ -7,6 +7,7 @@ import type { HybridConfig } from "../../src/config/config.js";
 import { SubscriptionHub } from "../../src/gateway/subscriptions.js";
 import { Logger } from "../../src/observability/logger.js";
 import { SqliteHybridStore } from "../../src/store/sqliteStore.js";
+import { seedLegacyTurn } from "../fixtures/legacyStore.js";
 import { FakeClaudeQuery } from "../fixtures/fakeClaudeQuery.js";
 import { formatCCodexStatus } from "../../src/claude/statusCommand.js";
 import { formatCCodexState } from "../../src/state/stateCommand.js";
@@ -178,7 +179,7 @@ describe("persisted CCodex status turn", () => {
       config(directory), new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(database), resumedFake.factory,
     );
     const snapshot = await resumed.resumeThread({ threadId: started.thread.id, excludeTurns: false });
-    expect(snapshot.thread.turns).toEqual([turn]);
+    expect(snapshot.thread.turns).toEqual([]);
     expect(resumed.eventsAfter(started.thread.id, 0)
       .filter((event) => event.method !== "thread/status/changed")).toEqual([]);
     expect(resumedFake.prompts).toHaveLength(0);
@@ -268,13 +269,7 @@ describe("persisted CCodex status turn", () => {
     prepared.start();
     await waitFor(() => fake.experimentalUsageCalls === 1);
     await service.archiveThread(started.thread.id);
-    expect(service.readThread(started.thread.id, true).thread.turns[0]).toMatchObject({
-      status: "failed",
-      items: [
-        { type: "userMessage" },
-        { type: "agentMessage", text: "◆ **CCodex** │ ⚠️ Claude thread archived during an active turn." },
-      ],
-    });
+    expect(service.readThread(started.thread.id, true).thread.turns).toEqual([]);
     expect(methods.indexOf("turn/completed")).toBeLessThan(methods.indexOf("thread/archived"));
     release();
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -314,7 +309,7 @@ describe("persisted CCodex status turn", () => {
     await service.close();
   });
 
-  it("recovers a hard-crashed status turn through the session with a precise visible failure", async () => {
+  it("leaves a legacy hard-crashed status turn unchanged without restart repair", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ccodex-status-crash-"));
     directories.push(directory);
     const database = join(directory, "state.sqlite");
@@ -327,7 +322,7 @@ describe("persisted CCodex status turn", () => {
 
     const store = new SqliteHybridStore(database);
     const record = store.getThreadRecord(started.thread.id, false)!;
-    store.createTurn(started.thread.id, {
+    seedLegacyTurn(store, started.thread.id, {
       id: "crashed-status",
       items: [{
         type: "userMessage", id: "status-user", clientId: null,
@@ -349,14 +344,8 @@ describe("persisted CCodex status turn", () => {
     await recovered.ready();
     const turn = recovered.readThread(started.thread.id, true).thread.turns[0]!;
     expect(turn).toMatchObject({
-      status: "failed",
-      items: [
-        { type: "userMessage" },
-        {
-          type: "agentMessage",
-          text: "◆ **CCodex** │ ⚠️ Gateway restarted while the CCodex status request was active.",
-        },
-      ],
+      status: "inProgress",
+      items: [{ type: "userMessage" }],
     });
     const lifecycle = recovered.eventsAfter(started.thread.id, 0)
       .filter((event) => event.turnId === turn.id)
