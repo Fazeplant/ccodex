@@ -142,7 +142,7 @@ describe("Phase 3 ownership boundary", () => {
     expect(backgroundOutput).not.toContain("ClaudeSession");
   });
 
-  it("keeps desired-settings persistence and publication session-owned", () => {
+  it("keeps desired-settings overlay mutation and publication session-owned", () => {
     const settings = section(service, "private async applySettings", "private async resolveModelSettings");
     expect(settings).toContain('type: "updateDesiredSettings"');
     expect(settings).not.toContain("this.store.updateThread");
@@ -150,7 +150,7 @@ describe("Phase 3 ownership boundary", () => {
     expect(session).toContain('case "updateDesiredSettings"');
     const sessionSettings = section(session, 'case "updateDesiredSettings"', 'case "announceThread"');
     expect(sessionSettings).toContain("this.commitState(updated");
-    expect(sessionSettings).toContain("this.repository.update(updated)");
+    expect(sessionSettings).not.toContain("this.repository.update(updated)");
     expect(sessionSettings).not.toContain('this.publish(null, "thread/settings/updated"');
     expect(runtimeFactory).toContain("startup: RuntimeStartup");
     expect(runtimeFactory).not.toContain("appliedRecord");

@@ -5,7 +5,6 @@ import type {
   ClaudeSessionFlags, ClaudeThreadRecord, GoalPatch, GoalUsageInput, HybridStore, InternalGoal,
   PendingThreadRemoval,
 } from "./HybridStore.js";
-import { settingsGeneration, withSettingsFrom } from "./HybridStore.js";
 import { filterSortThreads } from "./threadFilter.js";
 
 function copy<T>(value: T): T {
@@ -79,11 +78,7 @@ export class MemoryHybridStore implements HybridStore {
   }
 
   public updateThread(record: ClaudeThreadRecord): void {
-    const current = this.records.get(record.thread.id);
-    const merged = current && settingsGeneration(current) > settingsGeneration(record)
-      ? withSettingsFrom(record, current)
-      : record;
-    this.records.set(record.thread.id, copy({ ...merged, thread: { ...merged.thread, turns: [] } }));
+    this.records.set(record.thread.id, copy({ ...record, thread: { ...record.thread, turns: [] } }));
   }
 
   public isThreadArchived(threadId: string): boolean { return this.archived.has(threadId); }

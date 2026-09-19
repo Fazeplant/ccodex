@@ -68,7 +68,7 @@ import type { Logger } from "../observability/logger.js";
 import type {
   ClaudeSessionFlags, ClaudeThreadRecord, HybridStore, InternalGoal, PendingThreadRemoval, TurnProviderBoundary,
 } from "../store/HybridStore.js";
-import { runtimeWorkspaceRoots as storedWorkspaceRoots, settingsGeneration, withSettingsFrom } from "../store/HybridStore.js";
+import { runtimeWorkspaceRoots as storedWorkspaceRoots, withSettingsFrom } from "../store/HybridStore.js";
 import { SqliteHybridStore } from "../store/sqliteStore.js";
 import { LayeredHybridStore } from "../store/memoryStore.js";
 import { createClaudeQuery, type ClaudeQueryFactory } from "./queryFactory.js";
@@ -132,7 +132,14 @@ import {
   stateModelName,
   type ThreadStateSnapshot,
 } from "../state/stateCommand.js";
-import { syncedCollaborationMode, threadSettings } from "./threadSettings.js";
+import {
+  type ClaudeSettingsOverlay,
+  nativePermissions,
+  nativeThreadSettings,
+  syncedCollaborationMode,
+  threadSettings,
+} from "./threadSettings.js";
+import { providerPermissionMode } from "./session/providerRuntimeFactory.js";
 import { claudeDeveloperInstructions } from "./developerInstructions.js";
 import { NativeSessionCatalog, type SessionSummary } from "./native/catalog.js";
 import type { TranscriptProjection } from "./native/projector.js";
@@ -210,6 +217,88 @@ type WorkspaceParams = {
   }[] | null;
 };
 type ClaudeSettingsParams = ThreadSettingsUpdateParams & WorkspaceParams;
+
+function settingsOverlay(record: ClaudeThreadRecord): ClaudeSettingsOverlay {
+  return {
+    modelPickerId: record.modelPickerId,
+    reasoningEffort: record.reasoningEffort,
+    serviceTier: record.serviceTier,
+    permissionMode: providerPermissionMode(record),
+    reasoningSummary: record.reasoningSummary,
+    personality: record.personality,
+    collaborationMode: record.collaborationMode,
+    outputSchema: record.outputSchema,
+    runtimeWorkspaceRoots: storedWorkspaceRoots(record),
+    baseInstructions: record.baseInstructions,
+    developerInstructions: record.developerInstructions,
+  };
+}
+
+function settingsOverlayPatch(
+  params: ClaudeSettingsParams,
+  candidate: ClaudeThreadRecord,
+  outputSchema: unknown | undefined,
+): ClaudeSettingsOverlay {
+  const permissionsChanged = params.approvalPolicy != null
+    || params.approvalsReviewer != null
+    || params.permissions != null
+    || params.sandboxPolicy != null;
+  return {
+    ...(params.model != null ? { modelPickerId: candidate.modelPickerId } : {}),
+    ...(params.effort !== undefined ? { reasoningEffort: candidate.reasoningEffort } : {}),
+    ...(params.serviceTier !== undefined ? { serviceTier: candidate.serviceTier } : {}),
+    ...(permissionsChanged ? { permissionMode: providerPermissionMode(candidate) } : {}),
+    ...(params.summary !== undefined ? { reasoningSummary: candidate.reasoningSummary } : {}),
+    ...(params.personality !== undefined ? { personality: candidate.personality } : {}),
+    ...(params.collaborationMode !== undefined ? { collaborationMode: candidate.collaborationMode } : {}),
+    ...(outputSchema !== undefined ? { outputSchema: candidate.outputSchema } : {}),
+    ...(params.cwd != null || params.runtimeWorkspaceRoots != null
+      ? { runtimeWorkspaceRoots: storedWorkspaceRoots(candidate) }
+      : {}),
+  };
+}
+
+function overlaySettings(
+  record: ClaudeThreadRecord,
+  overlay: ClaudeSettingsOverlay,
+  config: HybridConfig,
+): ClaudeThreadRecord {
+  const modelPickerId = overlay.modelPickerId ?? record.modelPickerId;
+  const reasoningEffort = overlay.reasoningEffort === undefined
+    ? record.reasoningEffort
+    : overlay.reasoningEffort;
+  const permissions = overlay.permissionMode === undefined
+    ? {
+        approvalPolicy: record.approvalPolicy,
+        approvalsReviewer: record.approvalsReviewer,
+        sandboxPolicy: record.sandboxPolicy,
+      }
+    : nativePermissions(overlay.permissionMode, record.thread.cwd);
+  return {
+    ...record,
+    thread: { ...record.thread, model: modelPickerId, reasoningEffort },
+    modelPickerId,
+    claudeModelValue: overlay.modelPickerId === undefined
+      ? record.claudeModelValue
+      : resolveClaudeModel(config, modelPickerId)!,
+    reasoningEffort,
+    serviceTier: overlay.serviceTier === undefined ? record.serviceTier : overlay.serviceTier,
+    ...permissions,
+    reasoningSummary: overlay.reasoningSummary === undefined
+      ? record.reasoningSummary
+      : overlay.reasoningSummary,
+    personality: overlay.personality === undefined ? record.personality : overlay.personality,
+    collaborationMode: overlay.collaborationMode === undefined
+      ? record.collaborationMode
+      : overlay.collaborationMode,
+    outputSchema: overlay.outputSchema === undefined ? record.outputSchema : overlay.outputSchema,
+    runtimeWorkspaceRoots: overlay.runtimeWorkspaceRoots ?? storedWorkspaceRoots(record),
+    baseInstructions: overlay.baseInstructions === undefined ? record.baseInstructions : overlay.baseInstructions,
+    developerInstructions: overlay.developerInstructions === undefined
+      ? record.developerInstructions
+      : overlay.developerInstructions,
+  };
+}
 
 function workspaceRoots(value: readonly string[]): string[] {
   const roots: string[] = [];
@@ -299,23 +388,6 @@ function inheritedSandboxPolicy(
 
 function approvalsReviewer(value: ApprovalsReviewer | null | undefined, fallback: ApprovalsReviewer = "user"): ApprovalsReviewer {
   return value ?? fallback;
-}
-
-function nativePermissions(permissionMode: string | null, cwd: string): Pick<
-  ClaudeThreadRecord,
-  "approvalPolicy" | "approvalsReviewer" | "sandboxPolicy"
-> {
-  if (permissionMode === "bypassPermissions") {
-    return { approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: { type: "dangerFullAccess" } };
-  }
-  const workspace = sandboxPolicy("workspace-write", cwd);
-  if (permissionMode === "dontAsk") {
-    return { approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: workspace };
-  }
-  if (permissionMode === "auto") {
-    return { approvalPolicy: "on-request", approvalsReviewer: "auto_review", sandboxPolicy: workspace };
-  }
-  return { approvalPolicy: "on-request", approvalsReviewer: "user", sandboxPolicy: workspace };
 }
 
 function defaultFlags(sessionId: string, threadId = sessionId): ClaudeSessionFlags {
@@ -716,8 +788,7 @@ export class ClaudeService {
 
   public currentThreadSettings(threadId: string): ThreadSettings {
     const record = this.liveChildProjection(threadId)?.record
-      ?? this.store.getThreadRecord(threadId, false)
-      ?? (this.catalogSession(threadId) ? this.catalogRecord(this.catalogSession(threadId)!) : undefined);
+      ?? this.historyRecord(threadId, false);
     if (!record) throw invalidParams(`Unknown Claude thread '${threadId}'.`);
     return threadSettings(this.withCatalogModel(record));
   }
@@ -744,7 +815,16 @@ export class ClaudeService {
   private catalogRecord(summary: SessionSummary, projection?: TranscriptProjection): ClaudeThreadRecord {
     const flags = this.flags(summary.sessionId);
     const threadId = flags.threadId;
-    const model = this.nativeModel(summary.model);
+    const selected = this.nativeModel(summary.model);
+    const catalogModel = this.modelCatalog?.cachedModels?.()
+      .find((candidate) => candidate.id === selected.modelPickerId);
+    const native = nativeThreadSettings(summary, summary.cwd, {
+      modelPickerId: selected.modelPickerId,
+      claudeModelValue: selected.claudeModelValue,
+      reasoningEffort: catalogModel?.defaultReasoningEffort ?? null,
+      serviceTier: catalogModel?.defaultServiceTier ?? null,
+      modelPickerIdFor: (model) => this.nativeModel(model).modelPickerId,
+    });
     const turns = (projection?.turns ?? []).map((turn) => ({
       ...turn,
       items: turn.items.map((item) => item.type === "collabAgentToolCall" && item.senderThreadId === summary.sessionId
@@ -766,8 +846,8 @@ export class ClaudeService {
         projectId: null,
         historyMode: "paginated",
         modelProvider: "claude",
-        model: model.modelPickerId,
-        reasoningEffort: summary.reasoningEffort,
+        model: native.modelPickerId,
+        reasoningEffort: native.reasoningEffort,
         createdAt: summary.createdAt,
         updatedAt: summary.updatedAt,
         recencyAt: summary.updatedAt,
@@ -789,8 +869,8 @@ export class ClaudeService {
       ephemeral: flags.ephemeral,
       section: flags.section,
       sectionEnteredAt: flags.sectionEnteredAt,
-      model: model.modelPickerId,
-      reasoningEffort: summary.reasoningEffort,
+      model: native.modelPickerId,
+      reasoningEffort: native.reasoningEffort,
       name: summary.customTitle ?? summary.aiTitle,
       preview: summary.preview,
       cwd: summary.cwd,
@@ -799,26 +879,14 @@ export class ClaudeService {
       recencyAt: summary.updatedAt,
       turns,
     };
-    const permissions = nativePermissions(summary.permissionMode, summary.cwd);
     return {
       thread,
-      runtimeWorkspaceRoots: [summary.cwd],
+      ...native,
       claudeSessionId: summary.sessionId,
-      modelPickerId: model.modelPickerId,
-      claudeModelValue: model.claudeModelValue,
-      serviceTier: null,
-      ...permissions,
-      baseInstructions: null,
-      developerInstructions: null,
-      personality: null,
-      resolvedModel: model.resolvedModel,
+      resolvedModel: selected.resolvedModel,
       lastClaudeMessageUuid: projection?.lastAssistantUuid ?? null,
       lastCompletedTurnId: turns.findLast((turn) => turn.status === "completed")?.id ?? null,
       claudeCodeVersion: summary.cliVersion,
-      reasoningEffort: summary.reasoningEffort,
-      reasoningSummary: null,
-      collaborationMode: null,
-      outputSchema: null,
       tokenUsageTotal: projection?.tokenUsageTotal ?? {
         totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0,
         outputTokens: 0, reasoningOutputTokens: 0,
@@ -826,7 +894,6 @@ export class ClaudeService {
       tokenUsageLast: null,
       modelContextWindow: null,
       providerCostUsdTotal: 0,
-      settingsGeneration: 0,
     };
   }
 
@@ -856,7 +923,12 @@ export class ClaudeService {
       const projection = anchorUuid && !advanced
         ? await this.catalog.projection(summary.sessionId, anchorUuid)
         : natural;
-      this.projectedRecords.set(threadId, this.catalogRecord(summary, projection));
+      const record = this.catalogRecord(summary, projection);
+      this.projectedRecords.set(threadId, record);
+      await this.sessions.resolvedSession(threadId)?.submit({
+        type: "confirmSettingsOverlay",
+        settings: settingsOverlay(record),
+      });
       this.projectedBoundaries.set(threadId, projection.turnBoundaries);
       this.claim(summary.sessionId);
     }).finally(() => {
@@ -932,7 +1004,7 @@ export class ClaudeService {
     const stored = this.store.getThreadRecord(threadId, false);
     const projected = this.projectedRecords.get(threadId);
     const child = includeLive ? this.liveChildProjection(threadId) : undefined;
-    const base = child?.record ?? stored ?? projected;
+    const base = child?.record ?? projected ?? stored;
     if (!base) return undefined;
     if (base.thread.parentThreadId) {
       return includeTurns
@@ -945,13 +1017,14 @@ export class ClaudeService {
       : [...(projected?.thread.turns ?? this.store.listTurns(threadId))];
     const useLive = live?.status.type === "active" || live?.activeTurn?.status === "inProgress";
     const useProjectedHistory = projected && !useLive;
-    return {
+    const record = {
       ...base,
       thread: {
         ...base.thread,
         status: live?.status ?? projected?.thread.status
           ?? (this.missingNativeTranscript(threadId) ? base.thread.status : { type: "notLoaded" }),
         preview: live?.preview ?? projected?.thread.preview ?? base.thread.preview,
+        gitInfo: live?.gitInfo ?? projected?.thread.gitInfo ?? base.thread.gitInfo,
         turns: includeTurns ? turns : [],
       },
       lastCompletedTurnId: turns.findLast((turn) => turn.status === "completed")?.id ?? null,
@@ -967,6 +1040,7 @@ export class ClaudeService {
         ? projected.providerCostUsdTotal ?? 0
         : live?.usage.providerCostUsdTotal ?? base.providerCostUsdTotal ?? 0,
     };
+    return live ? overlaySettings(record, live.settingsOverlay, this.config) : record;
   }
 
   private withCatalogModel(record: ClaudeThreadRecord): ClaudeThreadRecord {
@@ -1002,8 +1076,8 @@ export class ClaudeService {
     return { modelPickerId: lookup.id, claudeModelValue: lookup.id.slice(prefix.length) };
   }
 
-  /** Persists a catalog migration for a stored thread so its runtime starts on a model the account still has. */
-  private async migrateStoredModel(threadId: string): Promise<void> {
+  /** Selects the current catalog model in the process-local overlay. */
+  private async selectCurrentCatalogModel(threadId: string): Promise<void> {
     if (!this.modelCatalog) return;
     const record = this.requireRecord(threadId, false);
     const models = await this.modelCatalog.list().catch(() => undefined);
@@ -1082,7 +1156,11 @@ export class ClaudeService {
 
   public async startThread(params: ThreadStartParams): Promise<ThreadStartResponse> {
     let record = await this.newThreadRecord(params);
-    record = await this.sessions.submit(record.thread.id, { type: "createThread", record });
+    record = await this.sessions.submit(record.thread.id, {
+      type: "createThread",
+      record,
+      settingsOverlay: settingsOverlay(record),
+    });
     if (record.thread.ephemeral) this.setFlags(record.claudeSessionId, { ephemeral: true });
     return threadResponse(record, false);
   }
@@ -1091,7 +1169,11 @@ export class ClaudeService {
     let record = await this.newThreadRecord(params);
     this.sessionOutput.suppress(record.thread.id);
     try {
-      record = await this.sessions.submit(record.thread.id, { type: "createThread", record });
+      record = await this.sessions.submit(record.thread.id, {
+        type: "createThread",
+        record,
+        settingsOverlay: settingsOverlay(record),
+      });
       if (record.thread.ephemeral) this.setFlags(record.claudeSessionId, { ephemeral: true });
       return threadResponse(record, false);
     } catch (error) {
@@ -1154,7 +1236,7 @@ export class ClaudeService {
           : {}),
       });
     }
-    if (!this.transientThreadIds.has(threadId)) await this.migrateStoredModel(threadId);
+    await this.selectCurrentCatalogModel(threadId);
     await (await this.sessions.getOrCreate(threadId)).materializeRuntime();
     await this.sessions.submit<ClaudeThreadRecord>(
       threadId,
@@ -2829,14 +2911,19 @@ export class ClaudeService {
         params.threadId,
         {
           type: "updateDesiredSettings",
-          expectedGeneration: settingsGeneration(before),
           candidate,
           threadSettings: threadSettings(candidate),
+          settingsOverlay: settingsOverlayPatch(params, candidate, outputSchema),
+          restartRuntime: workspaceChanged
+            || params.personality !== undefined
+            || params.collaborationMode !== undefined
+            || outputSchema !== undefined,
         },
       );
       if (!update.conflict) break;
       await update.retryAfter;
     }
+    if (update.applyRuntime) await session.applyDesiredRuntimeSettings();
     if (!update.changed) {
       if (syncCanonicalSettings) {
         await this.sessions.submit(params.threadId, {

@@ -507,9 +507,10 @@ describe("ClaudeSession Phase 3 slice", () => {
     const candidate = { ...initial, claudeModelValue: "claude-new" };
     await registry.submit("thread-1", {
       type: "updateDesiredSettings",
-      expectedGeneration: 0,
       candidate,
       threadSettings: { model: initial.modelPickerId } as ThreadSettings,
+      settingsOverlay: { modelPickerId: candidate.modelPickerId },
+      restartRuntime: false,
     });
     expect(await registry.submit("thread-1", {
       type: "stageRuntimeTurn",
@@ -672,9 +673,10 @@ describe("ClaudeSession Phase 3 slice", () => {
     };
     const plan = await registry.submit<DesiredSettingsUpdate>("thread-1", {
       type: "updateDesiredSettings",
-      expectedGeneration: 0,
       candidate: planCandidate,
       threadSettings: { model: initial.modelPickerId } as ThreadSettings,
+      settingsOverlay: { collaborationMode: planCandidate.collaborationMode },
+      restartRuntime: true,
     });
     expect(lifecycle.flatMap((update) => update.goalEffects ?? [])
       .filter((effect) => effect.kind === "continue")).toHaveLength(1);
@@ -695,9 +697,10 @@ describe("ClaudeSession Phase 3 slice", () => {
     };
     await registry.submit("thread-1", {
       type: "updateDesiredSettings",
-      expectedGeneration: 1,
       candidate: defaultCandidate,
       threadSettings: { model: initial.modelPickerId } as ThreadSettings,
+      settingsOverlay: { collaborationMode: defaultCandidate.collaborationMode },
+      restartRuntime: true,
     });
     expect(lifecycle.flatMap((update) => update.goalEffects ?? [])
       .filter((effect) => effect.kind === "ensureRuntime")).toHaveLength(1);
@@ -943,19 +946,19 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.close();
   });
 
-  it("owns validated settings commits with generation fencing and persistence-before-publication", async () => {
+  it("owns process-local settings updates and ordered publication", async () => {
     const { store, hub, registry } = harness();
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
+    const initial = record("thread-1");
+    await registry.submit("thread-1", { type: "createThread", record: initial });
     const advertised: string[] = [];
     hub.subscribe("thread-1", "settings", (method, params) => {
       if (method !== "thread/settings/updated") return;
       const model = (params as { threadSettings: { model: string } }).threadSettings.model;
-      expect(store.getThreadRecord("thread-1")?.modelPickerId).toBe(model);
+      expect(store.getThreadRecord("thread-1")?.modelPickerId).toBe(initial.modelPickerId);
       expect(notifications(registry, "thread-1").at(-1)?.method).toBe(method);
       advertised.push(model);
     });
 
-    const initial = record("thread-1");
     const opusCandidate = {
       ...initial,
       modelPickerId: "claude:claude-opus-4-8",
@@ -976,15 +979,15 @@ describe("ClaudeSession Phase 3 slice", () => {
       conflict: boolean;
     }>("thread-1", {
       type: "updateDesiredSettings",
-      expectedGeneration: 0,
       candidate: opusCandidate,
       threadSettings: { model: opusCandidate.modelPickerId } as ThreadSettings,
+      settingsOverlay: { modelPickerId: opusCandidate.modelPickerId, reasoningEffort: "high" },
+      restartRuntime: false,
     });
     expect(opus).toMatchObject({
       changed: true,
       conflict: false,
       record: {
-        settingsGeneration: 1,
         modelPickerId: "claude:claude-opus-4-8",
         reasoningEffort: "high",
         collaborationMode: {
@@ -993,16 +996,9 @@ describe("ClaudeSession Phase 3 slice", () => {
       },
     });
 
-    await expect(registry.submit("thread-1", {
-      type: "updateDesiredSettings",
-      expectedGeneration: 0,
-      candidate: { ...initial, reasoningEffort: "low" },
-      threadSettings: { model: initial.modelPickerId } as ThreadSettings,
-    })).resolves.toMatchObject({ changed: false, conflict: true });
     expect(await registry.submit<ClaudeThreadRecord>("thread-1", {
       type: "readThread", includeTurns: false,
     })).toMatchObject({
-      settingsGeneration: 1,
       modelPickerId: "claude:claude-opus-4-8",
       reasoningEffort: "high",
     });
@@ -1023,13 +1019,14 @@ describe("ClaudeSession Phase 3 slice", () => {
     };
     await expect(registry.submit("thread-1", {
       type: "updateDesiredSettings",
-      expectedGeneration: 1,
       candidate: sonnetCandidate,
       threadSettings: { model: sonnetCandidate.modelPickerId } as ThreadSettings,
+      settingsOverlay: { modelPickerId: sonnetCandidate.modelPickerId, reasoningEffort: "low" },
+      restartRuntime: false,
     })).resolves.toMatchObject({
       changed: true,
       conflict: false,
-      record: { settingsGeneration: 2, modelPickerId: "claude:sonnet", reasoningEffort: "low" },
+      record: { modelPickerId: "claude:sonnet", reasoningEffort: "low" },
     });
     expect(advertised).toEqual(["claude:claude-opus-4-8", "claude:sonnet"]);
     await registry.close();
@@ -2421,9 +2418,10 @@ describe("ClaudeSession Phase 3 slice", () => {
     });
     await registry.submit("thread-1", {
       type: "updateDesiredSettings",
-      expectedGeneration: 0,
       candidate: staleCandidate,
       threadSettings: { model: "claude:sonnet", effort: "high" } as ThreadSettings,
+      settingsOverlay: { reasoningEffort: "high" },
+      restartRuntime: false,
     });
     await expect(registry.submit("thread-1", {
       type: "threadAdmin",

@@ -1093,7 +1093,7 @@ You are in a side conversation.`,
     await service.close();
   });
 
-  it("cleans persisted App context when the Claude service starts", async () => {
+  it("ignores obsolete persisted developer instructions when the Claude service starts", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-legacy-app-instructions-"));
     directories.push(directory);
     const database = join(directory, "state.sqlite");
@@ -1122,9 +1122,7 @@ Keep this summary.
     const migratedService = new ClaudeService(
       config(directory), new SubscriptionHub(), new Logger("error"), migratedStore, new FakeClaudeQuery().factory,
     );
-    expect(migratedStore.getThreadRecord(started.thread.id)?.developerInstructions).toBe(
-      "[Cross-provider compact handoff]\nKeep this summary.\n[End cross-provider compact handoff]",
-    );
+    expect(migratedStore.getThreadRecord(started.thread.id)?.developerInstructions).toBeNull();
     await migratedService.close();
   });
 
@@ -1311,13 +1309,13 @@ Keep this summary.
       ...fullAccessProjection.resume,
     });
     expect(response).toMatchObject({
-      approvalPolicy: "never",
-      sandbox: { type: "dangerFullAccess" },
-      activePermissionProfile: expected,
-      reasoningEffort: "high",
+      approvalPolicy: "on-request",
+      sandbox: { type: "readOnly", networkAccess: false },
+      activePermissionProfile: { id: ":read-only", extends: null },
+      reasoningEffort: null,
     });
     expect(resumedFake.inputs[0]?.options).toMatchObject({
-      permissionMode: "bypassPermissions",
+      permissionMode: "default",
       allowDangerouslySkipPermissions: true,
     });
     await resumed.close();
@@ -2112,7 +2110,7 @@ Keep this summary.
   });
 
 
-  it("balances pending no-query operations before replaying an ephemeral prelude after settings replacement", async () => {
+  it("applies settings after pending no-query operations drain without replaying the ephemeral prelude", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-prelude-restart-"));
     directories.push(directory);
     let release!: () => void;
@@ -2144,9 +2142,12 @@ Keep this summary.
     expect(fake.prompts).toHaveLength(1);
     release();
     await injecting;
-    await waitFor(() => fake.prompts.length === 2, "replayed prelude send");
     await updating;
     const prepared = await preparing;
+    expect(fake.prompts.filter((message) => message.shouldQuery === false)).toHaveLength(1);
+    expect(fake.controls).toContainEqual({
+      method: "applyFlagSettings", value: { effortLevel: "high", fastMode: false },
+    });
     prepared.announce();
     prepared.start();
     await waitFor(
@@ -2507,14 +2508,11 @@ You are in a side conversation, not the main thread.`,
       threadId: source.thread.id,
       input: [{ type: "text", text: "use deferred Flow A settings", text_elements: [] }],
     });
-    const applied = [...parent.inputs, ...initialSide.inputs, ...side.inputs]
-      .find((input) => input.options.model === "claude-opus-4-8");
-    expect(applied?.options).toMatchObject({
-      model: "claude-opus-4-8",
-      effort: "low",
-      settings: { fastMode: true },
-      permissionMode: "bypassPermissions",
-    });
+    expect(parent.controls).toEqual(expect.arrayContaining([
+      { method: "setModel", value: "claude-opus-4-8" },
+      { method: "applyFlagSettings", value: { effortLevel: "low", fastMode: true } },
+      { method: "setPermissionMode", value: "bypassPermissions" },
+    ]));
     next.announce();
     next.start();
     await waitFor(
@@ -2966,7 +2964,7 @@ You are in a side conversation, not the main thread.`,
     }]);
     expect(service.readThread(started.thread.id, false).thread.status).toEqual({ type: "idle" });
     expect((service as unknown as { store: HybridStore }).store.getThreadRecord(started.thread.id, false))
-      .toMatchObject({ approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } });
+      .toMatchObject({ approvalPolicy: "on-request", sandboxPolicy: { type: "readOnly" } });
     await service.close();
   });
 
@@ -4914,10 +4912,10 @@ You are in a side conversation, not the main thread.`,
 
     expect(store.getThreadRecord(started.thread.id)).toMatchObject({
       claudeSessionId: nextSessionId,
-      modelPickerId: "claude:sonnet",
-      claudeModelValue: "sonnet",
-      reasoningEffort: "high",
-      serviceTier: "fast",
+      modelPickerId: "claude:default",
+      claudeModelValue: "default",
+      reasoningEffort: null,
+      serviceTier: null,
       thread: {
         name: null,
         gitInfo: { branch: "concurrent", sha: "abc123" },
@@ -5506,8 +5504,8 @@ You are in a side conversation, not the main thread.`,
     const second = new ClaudeService(config(directory), secondHub, new Logger("error"), new SqliteHybridStore(database), secondFake.factory);
     await second.ready();
     await second.prepareReadThread(started.thread.id, true);
-    expect(second.readThread(started.thread.id, true).thread).toMatchObject({
-      gitInfo: { branch: "persisted", sha: "abc123" },
+    expect(second.readThread(started.thread.id, true).thread.gitInfo).toEqual({
+      branch: null, originUrl: null, sha: null,
     });
     expect(second.readThread(started.thread.id, true).thread.turns.flatMap((turn) => turn.items)
       .some((item) => item.type === "commandExecution")).toBe(false);
@@ -5529,7 +5527,7 @@ You are in a side conversation, not the main thread.`,
     await second.close();
   });
 
-  it("reconstructs the latest desired settings after restart without inventing a failed turn", async () => {
+  it("loses an unconfirmed overlay on restart and reconstructs confirmed settings from the transcript", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-settings-restart-"));
     directories.push(directory);
     const database = join(directory, "state.sqlite");
@@ -5568,15 +5566,48 @@ You are in a side conversation, not the main thread.`,
     ]);
     await second.resumeThread(started.thread.id);
     expect(secondFake.inputs[0]?.options).toMatchObject({
-      model: "claude-opus-4-8",
-      effort: "high",
-      settings: { fastMode: true },
+      model: "claude-fable-5",
     });
     expect(second.currentThreadSettings(started.thread.id)).toMatchObject({
-      model: "claude:claude-opus-4-8", effort: "high", serviceTier: "fast",
+      model: "claude:claude-fable-5", effort: null, serviceTier: null,
     });
+    await second.updateThreadSettings({
+      threadId: started.thread.id,
+      model: "claude:claude-opus-4-8",
+      serviceTier: "fast",
+      effort: "high",
+    });
+    const confirmed = await second.prepareTurn({
+      threadId: started.thread.id,
+      input: [{ type: "text", text: "confirm settings", text_elements: [] }],
+    });
+    confirmed.announce();
+    confirmed.start();
+    await waitFor(
+      () => second.readThread(started.thread.id, true).thread.turns.at(-1)?.status === "completed",
+      "settings confirmation turn",
+    );
+    await waitFor(
+      async () => Object.keys((await second.liveSnapshot(started.thread.id)).settingsOverlay).length === 0,
+      "confirmed overlay cleanup",
+    );
     expect(second.readThread(started.thread.id, true).thread.turns.some((turn) => turn.status === "failed")).toBe(false);
     await second.close();
+
+    const thirdFake = new FakeClaudeQuery();
+    const third = new ClaudeService(
+      config(directory), new SubscriptionHub(), new Logger("error"),
+      new SqliteHybridStore(database), thirdFake.factory,
+    );
+    await third.ready();
+    await third.resumeThread(started.thread.id);
+    expect(thirdFake.inputs[0]?.options).toMatchObject({
+      model: "claude-opus-4-8", effort: "high", settings: { fastMode: true },
+    });
+    expect(third.currentThreadSettings(started.thread.id)).toMatchObject({
+      model: "claude:claude-opus-4-8", effort: "high", serviceTier: "fast",
+    });
+    await third.close();
   });
 
   it("validates model-specific settings and projects SDK structured_output", async () => {
@@ -5654,7 +5685,11 @@ You are in a side conversation, not the main thread.`,
     await service.close();
   });
 
-  it("switches model, effort, and speed between ephemeral turns without replacing provider context", async () => {
+  // switches model, effort, and speed between ephemeral turns without replacing provider context
+  it.each([
+    { kind: "durable", ephemeral: false },
+    { kind: "ephemeral", ephemeral: true },
+  ])("switches model, effort, and speed between $kind thread turns without replacing provider context", async ({ ephemeral }) => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-ephemeral-controls-"));
     directories.push(directory);
     const fake = new FakeClaudeQuery();
@@ -5663,7 +5698,7 @@ You are in a side conversation, not the main thread.`,
       new SqliteHybridStore(join(directory, "state.sqlite")), fake.factory,
     );
     const started = await service.startThread({
-      model: "claude:sonnet", cwd: directory, ephemeral: true,
+      model: "claude:sonnet", cwd: directory, ephemeral,
     });
     const first = await service.prepareTurn({
       threadId: started.thread.id,
@@ -5683,6 +5718,14 @@ You are in a side conversation, not the main thread.`,
       effort: "high",
       serviceTier: "fast",
       summary: "detailed",
+    });
+    await expect(service.liveSnapshot(started.thread.id)).resolves.toMatchObject({
+      settingsOverlay: {
+        modelPickerId: "claude:claude-opus-4-8",
+        reasoningEffort: "high",
+        serviceTier: "fast",
+        reasoningSummary: "detailed",
+      },
     });
     const second = await service.prepareTurn({
       threadId: started.thread.id,
@@ -5754,7 +5797,12 @@ You are in a side conversation, not the main thread.`,
       () => service.readThread(started.thread.id, true).thread.status.type === "idle",
       "ephemeral lifecycle drain",
     );
-    expect(fake.controls).toEqual([]);
+    expect(fake.controls).toEqual([
+      { method: "setModel", value: "sonnet" },
+      { method: "applyFlagSettings", value: { effortLevel: "medium", fastMode: true } },
+      { method: "setMaxThinkingTokens", value: { tokens: null, display: null } },
+      { method: "setPermissionMode", value: "default" },
+    ]);
     const second = await service.prepareTurn({
       threadId: started.thread.id,
       input: [{ type: "text", text: "latest settings", text_elements: [] }],
@@ -5794,17 +5842,16 @@ You are in a side conversation, not the main thread.`,
       () => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed",
       "ephemeral context turn",
     );
-    await service.updateThreadSettings({
-      threadId: started.thread.id, model: "claude:claude-opus-4-8", effort: "high",
-    });
     fake.failControlOnce = "applyFlagSettings";
-    await expect(service.prepareTurn({
-      threadId: started.thread.id,
-      input: [{ type: "text", text: "must not send", text_elements: [] }],
+    await expect(service.updateThreadSettings({
+      threadId: started.thread.id, model: "claude:claude-opus-4-8", effort: "high",
     })).rejects.toThrow("fake applyFlagSettings failure");
     expect(fake.prompts).toHaveLength(1);
     expect(service.readThread(started.thread.id, true).thread.turns).toHaveLength(1);
 
+    await service.updateThreadSettings({
+      threadId: started.thread.id, model: "claude:claude-opus-4-8", effort: "high",
+    });
     const retry = await service.prepareTurn({
       threadId: started.thread.id,
       input: [{ type: "text", text: "retry safely", text_elements: [] }],
@@ -5846,7 +5893,9 @@ You are in a side conversation, not the main thread.`,
     await service.updateThreadSettings({
       threadId: started.thread.id, effort: "max",
     });
-    expect(fake.controls).toEqual([]);
+    expect(fake.controls).toContainEqual({
+      method: "applyFlagSettings", value: { effortLevel: "max", fastMode: false },
+    });
     const second = await service.prepareTurn({
       threadId: started.thread.id,
       input: [{ type: "text", text: "use max effort", text_elements: [] }],
@@ -6237,6 +6286,7 @@ You are in a side conversation, not the main thread.`,
     const updateStarted = performance.now();
     await service.updateThreadSettings({
       ...deferredSettingsUpdate,
+      personality: "friendly",
       threadId: started.thread.id,
     });
     await service.updateThreadSettings({
@@ -6351,16 +6401,14 @@ You are in a side conversation, not the main thread.`,
       poll();
     });
     expect(current.permissionResults[0]).toMatchObject({ behavior: "allow" });
-    await new Promise<void>((resolve) => {
-      const poll = () => current.returnCalls === 1 ? resolve() : setTimeout(poll, 5);
-      poll();
-    });
+    await waitFor(() => current.controls.some((control) =>
+      control.method === "setPermissionMode" && control.value === "bypassPermissions"), "deferred permission control");
 
     await service.prepareTurn({
       threadId: started.thread.id,
       input: [{ type: "text", text: "next policy", text_elements: [] }],
     });
-    expect(next.inputs[0]?.options.permissionMode).toBe("bypassPermissions");
+    expect(next.inputs).toHaveLength(0);
     await service.close();
   });
 
@@ -6397,7 +6445,7 @@ You are in a side conversation, not the main thread.`,
       input: [{ type: "text", text: "reserved generation", text_elements: [] }],
     });
     await staged;
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     expect(current.returnCalls).toBe(0);
     releaseStaging();
     const turn = await preparing;
@@ -6499,7 +6547,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(() => service.readThread(started.thread.id, true).thread.turns[0]?.items
       .some((item) => item.type === "commandExecution" && item.status === "inProgress") ?? false, "background command start");
 
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     expect(current.returnCalls).toBe(0);
     expect(events.filter((method) => method === "turn/completed")).toHaveLength(0);
     releaseBackground();
@@ -6578,7 +6626,7 @@ You are in a side conversation, not the main thread.`,
     await waitFor(() => service.readThread(started.thread.id, true).thread.turns[0]?.items
       .some((item) => item.type === "collabAgentToolCall" && item.status === "inProgress") ?? false, "subagent start");
 
-    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
+    await service.updateThreadSettings({ threadId: started.thread.id, effort: "high", personality: "friendly" });
     expect(current.returnCalls).toBe(0);
     releaseChild();
     await waitFor(
@@ -7060,8 +7108,8 @@ You are in a side conversation, not the main thread.`,
       new SqliteHybridStore(database), resumedQuery.factory,
     );
     const response = await resumed.resumeThread({ threadId: started.thread.id, excludeTurns: true });
-    expect(response.runtimeWorkspaceRoots).toEqual([directory, extra]);
-    expect(resumedQuery.inputs[0]?.options.additionalDirectories).toEqual([extra]);
+    expect(response.runtimeWorkspaceRoots).toEqual([directory]);
+    expect(resumedQuery.inputs[0]?.options.additionalDirectories).toBeUndefined();
     await resumed.close();
   });
 
@@ -7159,7 +7207,7 @@ You are in a side conversation, not the main thread.`,
     const started = await service.startThread({ model: "claude:claude-fable-5", cwd: directory });
     expect(started.model).toBe("claude:claude-fable-5-1");
     expect(store.getThreadRecord(started.thread.id)).toMatchObject({
-      modelPickerId: "claude:claude-fable-5-1", claudeModelValue: "claude-fable-5-1",
+      modelPickerId: "claude:default", claudeModelValue: "default",
     });
     await expect(service.updateThreadSettings({ threadId: started.thread.id, effort: "xhigh" }))
       .rejects.toThrow("does not support effort");
@@ -7191,12 +7239,12 @@ You are in a side conversation, not the main thread.`,
     hub.subscribe(started.thread.id, "test", (method, params) => {
       if (method === "thread/settings/updated") settingsEvents.push(params);
     });
-    await expect(second.resumeThread(started.thread.id)).resolves.toMatchObject({ model: "claude:claude-fable-5-1" });
-    expect(secondFake.inputs[0]?.options).toMatchObject({ model: "claude-fable-5-1", effort: "high" });
-    expect(store.getThreadRecord(started.thread.id)).toMatchObject({
-      modelPickerId: "claude:claude-fable-5-1", claudeModelValue: "claude-fable-5-1", reasoningEffort: "high",
-    });
-    expect(settingsEvents).toMatchObject([{ threadSettings: { model: "claude:claude-fable-5-1", effort: "high" } }]);
+    const durableBefore = store.getThreadRecord(started.thread.id);
+    await expect(second.resumeThread(started.thread.id)).resolves.toMatchObject({ model: "claude:default" });
+    expect(secondFake.inputs[0]?.options).toMatchObject({ model: "default" });
+    expect(secondFake.inputs[0]?.options.effort).toBeUndefined();
+    expect(store.getThreadRecord(started.thread.id)).toEqual(durableBefore);
+    expect(settingsEvents).toEqual([]);
     await second.close();
   });
 

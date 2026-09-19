@@ -48,8 +48,8 @@ afterEach(() => {
 });
 
 describe("SqliteHybridStore retained contracts", () => {
-  it("keeps settings and metadata writes without updating history mirrors", () => {
-    const { store } = setup();
+  it("keeps metadata writes without retaining settings or updating history mirrors", () => {
+    const { path, store } = setup();
     const original = record();
     store.createThread(original);
     store.updateThread({
@@ -62,7 +62,7 @@ describe("SqliteHybridStore retained contracts", () => {
       thread: { ...original.thread, name: "Renamed", status: { type: "active", activeFlags: [] }, preview: "live" },
     });
     const stored = store.getThreadRecord("thread-1")!;
-    expect(stored.modelPickerId).toBe("claude:opus");
+    expect(stored.modelPickerId).toBe("claude:default");
     expect(stored.thread.name).toBe("Renamed");
     expect(stored.thread.status).toEqual({ type: "idle" });
     expect(stored.thread.preview).toBe("hello");
@@ -70,6 +70,17 @@ describe("SqliteHybridStore retained contracts", () => {
     expect(stored.lastClaudeMessageUuid).toBeNull();
     expect(stored.tokenUsageTotal.totalTokens).toBe(0);
     store.close();
+    const database = new DatabaseSync(path, { readOnly: true });
+    expect(database.prepare(`
+      SELECT model_picker_id, claude_model_value, service_tier, runtime_settings_json
+      FROM threads WHERE id = ?
+    `).get("thread-1")).toEqual({
+      model_picker_id: "claude:default",
+      claude_model_value: "default",
+      service_tier: null,
+      runtime_settings_json: null,
+    });
+    database.close();
   });
 
   it("retains legacy turn reads while exposing no live-history tables", () => {

@@ -70,7 +70,7 @@ function effort(value: string | null | undefined): Options["effort"] {
 }
 
 export function providerPermissionMode(
-  settings: RuntimeTransportSettings,
+  settings: Pick<RuntimeTransportSettings, "approvalPolicy" | "approvalsReviewer" | "sandboxPolicy">,
 ): NonNullable<Options["permissionMode"]> {
   if (settings.approvalsReviewer !== "user") return "auto";
   const sandbox = settings.sandboxPolicy && typeof settings.sandboxPolicy === "object" && "type" in settings.sandboxPolicy
@@ -193,9 +193,7 @@ export function createProviderRuntime(
         ...(goalEvents ? { mcpServers: { ccodex_goal: goalEvents.mcpServer } } : {}),
         systemPrompt: { type: "preset", preset: "claude_code", ...(append ? { append } : {}) },
         permissionMode: selectedPermissionMode,
-        ...(startup.ephemeral || selectedPermissionMode === "bypassPermissions"
-          ? { allowDangerouslySkipPermissions: true }
-          : {}),
+        allowDangerouslySkipPermissions: true,
         ...(!startup.interactiveQuestions && selectedPermissionMode === "auto" && !startup.ephemeral
           ? {}
           : {

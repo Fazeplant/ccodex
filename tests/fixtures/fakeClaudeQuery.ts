@@ -75,6 +75,12 @@ export class FakeClaudeQuery {
   private readonly responseIds: Array<string | undefined> = [];
   private readonly transcriptTails = new Map<string, string>();
   private readonly transcriptBlockIndices = new Map<string, number>();
+  private readonly runtimeSettings: Array<{
+    model: string | undefined;
+    effort: string | null;
+    fastMode: boolean;
+    permissionMode: string;
+  }> = [];
 
   public constructor(
     public toolRequest?: { name: string; input: Record<string, unknown> },
@@ -107,6 +113,12 @@ export class FakeClaudeQuery {
     const queryIndex = this.outputs.length;
     this.outputs.push(output);
     this.responseIds.push(undefined);
+    this.runtimeSettings.push({
+      model: input.options.model,
+      effort: input.options.effort ?? null,
+      fastMode: typeof input.options.settings === "object" && input.options.settings.fastMode === true,
+      permissionMode: input.options.permissionMode ?? "default",
+    });
     const iterator = output[Symbol.asyncIterator]();
     output.push({
       type: "system", subtype: "init", model: input.options.model ?? "haiku",
@@ -121,6 +133,7 @@ export class FakeClaudeQuery {
       output,
       iterator,
       input.options.allowDangerouslySkipPermissions === true,
+      queryIndex,
     );
   };
 
@@ -186,6 +199,8 @@ export class FakeClaudeQuery {
   }
 
   private appendAssistantRecords(queryIndex: number, message: Extract<SDKMessage, { type: "assistant" }>): void {
+    const runtimeSettings = this.runtimeSettings[queryIndex]!;
+    const effort = (message as unknown as { effort?: string | null }).effort ?? runtimeSettings.effort;
     const messageId = message.message.id!;
     const key = `${queryIndex}:${messageId}`;
     let apiBlockIndex = this.transcriptBlockIndices.get(key) ?? 0;
@@ -194,8 +209,14 @@ export class FakeClaudeQuery {
       this.appendTranscriptRecord(queryIndex, offset === 0 ? message.uuid! : `${message.uuid}:${offset}`, {
         type: "assistant",
         apiBlockIndex,
+        effort,
         message: {
           ...message.message,
+          model: message.message.model ?? runtimeSettings.model,
+          usage: {
+            ...message.message.usage,
+            service_tier: runtimeSettings.fastMode ? "priority" : "standard",
+          },
           content: [block],
           stop_reason: message.message.stop_reason ?? "end_turn",
         },
@@ -239,6 +260,7 @@ export class FakeClaudeQuery {
       this.appendTranscriptRecord(queryIndex, _message.uuid!, {
         type: "user",
         origin: _message.origin,
+        permissionMode: this.runtimeSettings[queryIndex]!.permissionMode,
         message: _message.message,
       });
       if (_message.shouldQuery === false) {
@@ -578,6 +600,7 @@ export class FakeClaudeQuery {
     output: AsyncQueue<SDKMessage>,
     iterator: AsyncIterator<SDKMessage>,
     allowDangerouslySkipPermissions: boolean,
+    queryIndex: number,
   ): Query {
     const control = async (method: string, value: unknown): Promise<void> => {
       this.controls.push({ method, value });
@@ -613,9 +636,15 @@ export class FakeClaudeQuery {
         this.onReinitialize?.();
         return {};
       },
-      setModel: async (model: Parameters<Query["setModel"]>[0]) => control("setModel", model),
-      applyFlagSettings: async (settings: Parameters<Query["applyFlagSettings"]>[0]) =>
-        control("applyFlagSettings", settings),
+      setModel: async (model: Parameters<Query["setModel"]>[0]) => {
+        await control("setModel", model);
+        this.runtimeSettings[queryIndex]!.model = model;
+      },
+      applyFlagSettings: async (settings: Parameters<Query["applyFlagSettings"]>[0]) => {
+        await control("applyFlagSettings", settings);
+        if (settings.effortLevel !== undefined) this.runtimeSettings[queryIndex]!.effort = settings.effortLevel;
+        if (settings.fastMode != null) this.runtimeSettings[queryIndex]!.fastMode = settings.fastMode;
+      },
       setMaxThinkingTokens: async (
         tokens: Parameters<Query["setMaxThinkingTokens"]>[0],
         display: Parameters<Query["setMaxThinkingTokens"]>[1],
@@ -626,6 +655,7 @@ export class FakeClaudeQuery {
           throw new Error("fake bypassPermissions requires allowDangerouslySkipPermissions");
         }
         await control("setPermissionMode", mode);
+        this.runtimeSettings[queryIndex]!.permissionMode = mode;
       },
       stopTask: async (taskId: string) => { this.stoppedTaskIds.push(taskId); },
       interrupt: async () => {

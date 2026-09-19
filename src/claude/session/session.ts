@@ -67,7 +67,8 @@ import type {
   ThreadRemovalKind,
   SessionInteractionRequest,
 } from "./commands.js";
-import { runtimeWorkspaceRoots, settingsGeneration, withSettingsFrom } from "../../store/HybridStore.js";
+import { runtimeWorkspaceRoots, withSettingsFrom } from "../../store/HybridStore.js";
+import type { ClaudeSettingsOverlay } from "../threadSettings.js";
 import { addUsage } from "./usage.js";
 import {
   ClaudeMailbox,
@@ -579,6 +580,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   private readonly notificationRing: ClaudeLiveNotification[] = [];
   private runtimeGeneration: number | undefined;
   private rollbackResume: { readonly anchorUuid: string; readonly dropsTurnUuid: string } | undefined;
+  private settingsOverlay: ClaudeSettingsOverlay = {};
+  private settingsRevision = 0;
+  private runtimeRestartRequired = false;
   private readonly scopes = new Map<string, MainStreamState>();
   private readonly tasks = new Map<string, ScopeTask>();
   private readonly codexMcpTailers = new Map<string, CodexMcpTailer>();
@@ -778,13 +782,22 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         };
       } catch (error) {
         if (!(error instanceof StaleClaudeRuntimeSettingsError)) throw error;
-        if (owner.ephemeral && error.reason === "settings") {
+        if (error.reason === "settings") {
           await this.applyRuntimeSettings(owner, error.settings);
           continue;
         }
         await this.retireRuntimeOwner(owner, "stale");
       }
     }
+  }
+
+  public async applyDesiredRuntimeSettings(): Promise<void> {
+    const owner = await this.currentRuntimeOwner();
+    if (!owner) return;
+    const settings = runtimeTransportSettings(this.runtimeStartup(owner.generation, owner.resume));
+    if (settings.settingsGeneration <= owner.appliedSettingsGeneration) return;
+    if (!(await this.runtimeInspectionFor(owner)).quiescent || this.runtimeRestartRequired) return;
+    await this.applyRuntimeSettings(owner, settings);
   }
 
   public async interruptRuntime(expectedTurnId?: string): Promise<void> {
@@ -1099,7 +1112,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       ),
       claudeBinary: this.runtimeDependencies!.claudeBinary,
       model: record.claudeModelValue,
-      settingsGeneration: settingsGeneration(record),
+      settingsGeneration: this.settingsRevision,
       lastCompletedTurnId: record.lastCompletedTurnId,
       modelContextWindow: record.modelContextWindow,
       approvalPolicy: record.approvalPolicy,
@@ -3891,6 +3904,10 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   }
 
   private async retireStaleRuntime(): Promise<void> {
+    if (!this.runtimeRestartRequired) {
+      await this.applyDesiredRuntimeSettings();
+      return;
+    }
     const claim = await this.submitLineage<RuntimeRetireClaim>({
       type: "runtimeLineage",
       action: "claimRetire",
@@ -3898,6 +3915,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     });
     if (claim.kind === "retire") {
       await this.executeRetirement(claim.owner, "stale");
+      this.runtimeRestartRequired = false;
     } else if (claim.kind === "retireStarting") {
       try {
         await this.retireProviderRuntimeSilently(claim.candidate);
@@ -3907,6 +3925,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           action: "startupRetired",
           runtimeGeneration: claim.startup.runtimeGeneration,
         });
+        this.runtimeRestartRequired = false;
       }
     }
   }
@@ -4017,7 +4036,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
             if (lineage.state !== "starting"
               || lineage.generation !== command.runtimeGeneration) return false;
             const desired = this.requireRecord(false);
-            if (settingsGeneration(desired) !== lineage.startup.settingsGeneration) return false;
+            if (this.settingsRevision !== lineage.startup.settingsGeneration) return false;
             this.runtimeLineage = { ...lineage, candidate: command.candidate };
             lineage.settleCandidate({ ok: true, candidate: command.candidate });
             return true;
@@ -4078,7 +4097,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
               if (command.staleOnly) {
                 const desired = this.requireRecord(false);
                 if (desired.thread.ephemeral
-                  || settingsGeneration(desired) <= lineage.startup.settingsGeneration
+                  || this.settingsRevision <= lineage.startup.settingsGeneration
                   || !this.isQuiescent()) {
                   return { kind: "absent" } satisfies RuntimeRetireClaim;
                 }
@@ -4116,7 +4135,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
             if (command.staleOnly) {
               const desired = this.requireRecord(false);
               if (desired.thread.ephemeral
-                || settingsGeneration(desired) <= lineage.owner.appliedSettingsGeneration
+                || this.settingsRevision <= lineage.owner.appliedSettingsGeneration
                 || !this.isQuiescent()) {
                 return { kind: "absent" } satisfies RuntimeRetireClaim;
               }
@@ -4445,6 +4464,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         }
         this.repository.create(command.record);
         this.record = command.record;
+        this.settingsOverlay = command.settingsOverlay ?? {};
         this.lastPublishedUsage = this.usageKey(command.record);
         return command.record;
       }
@@ -4452,6 +4472,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         return this.requireRecord(command.includeTurns);
       case "liveSnapshot":
         return this.liveSnapshot();
+      case "confirmSettingsOverlay": {
+        this.settingsOverlay = Object.fromEntries(Object.entries(this.settingsOverlay).filter(([key, value]) =>
+          JSON.stringify(command.settings[key as keyof ClaudeSettingsOverlay]) !== JSON.stringify(value)));
+        return undefined;
+      }
       case "notificationsAfter":
         return this.notificationsAfter(command.seq);
       case "commitForkTarget": {
@@ -4576,9 +4601,6 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       }
       case "updateDesiredSettings": {
         const record = this.requireRecord(false);
-        if (settingsGeneration(record) !== command.expectedGeneration) {
-          return { record, changed: false, conflict: true } satisfies DesiredSettingsUpdate;
-        }
         if (this.runtimeAdminOperations > 0) {
           return {
             record,
@@ -4588,8 +4610,6 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           } satisfies DesiredSettingsUpdate;
         }
         const candidate = withSettingsFrom(record, command.candidate);
-        if (JSON.stringify(candidate) === JSON.stringify(record))
-          return { record, changed: false, conflict: false } satisfies DesiredSettingsUpdate;
         const lineage = this.runtimeLineage;
         const owner = lineage.state === "ready"
           ? lineage.owner
@@ -4597,7 +4617,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
             ? lineage.candidate
             : undefined;
         const runtimeLoaded = lineage.state !== "absent";
-        const canRestartEphemeral = Boolean(record.thread.ephemeral && owner
+        if (runtimeLoaded && command.restartRuntime) this.runtimeRestartRequired = true;
+        const canRestartEphemeral = Boolean(command.restartRuntime && record.thread.ephemeral && owner
           && this.inspectRuntime({
             type: "inspectRuntime",
             runtimeGeneration: owner.generation,
@@ -4613,6 +4634,13 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         if (record.thread.ephemeral && runtimeLoaded && !canRestartEphemeral) {
           this.validateLiveEphemeralSettings(record, candidate);
         }
+        this.settingsOverlay = { ...this.settingsOverlay, ...command.settingsOverlay };
+        if (JSON.stringify(candidate) === JSON.stringify(record)) return {
+          record,
+          changed: false,
+          conflict: false,
+          applyRuntime: runtimeLoaded && !command.restartRuntime,
+        } satisfies DesiredSettingsUpdate;
         const replacementId = canRestartEphemeral ? uuidv7() : undefined;
         if (replacementId && this.runtimeReplacement) {
           throw invalidParams(`Claude runtime '${this.threadId}' already has a settings replacement in progress.`);
@@ -4621,13 +4649,12 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           resume: owner.resume,
           batches: owner.ephemeralPreludeBatches.map((batch) => [...batch]),
         } : undefined;
+        this.settingsRevision += 1;
         const updated = {
           ...candidate,
-          settingsGeneration: settingsGeneration(record) + 1,
           thread: { ...candidate.thread, updatedAt: Math.floor(Date.now() / 1_000) },
         };
         const params = { threadId: this.threadId, threadSettings: command.threadSettings };
-        this.repository.update(updated);
         this.commitState(updated, [{ turnId: null, method: "thread/settings/updated", params }]);
         if (replacementId) this.beginRuntimeReplacement(replacementId);
         runtimeSettingsChanged(this.goal);
@@ -4636,6 +4663,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           record: updated,
           changed: true,
           conflict: false,
+          applyRuntime: runtimeLoaded && !command.restartRuntime,
           ...(replacementId && replay ? { replacementId, replay } : {}),
         } satisfies DesiredSettingsUpdate;
       }
@@ -5171,7 +5199,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           } satisfies RuntimeTurnStage;
         }
         if (command.runtimeGeneration !== this.runtimeGeneration
-          || command.settingsGeneration !== settingsGeneration(record)) {
+          || command.settingsGeneration !== this.settingsRevision) {
           return {
             kind: "stale",
             reason: command.runtimeGeneration === this.runtimeGeneration ? "settings" : "runtime",
@@ -5179,7 +5207,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
               cwd: record.thread.cwd,
               runtimeWorkspaceRoots: runtimeWorkspaceRoots(record),
               model: record.claudeModelValue,
-              settingsGeneration: settingsGeneration(record),
+              settingsGeneration: this.settingsRevision,
               approvalPolicy: record.approvalPolicy,
               approvalsReviewer: record.approvalsReviewer,
               sandboxPolicy: record.sandboxPolicy,
@@ -8340,6 +8368,8 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       }),
       status: structuredClone(record.thread.status),
       name: record.thread.name,
+      gitInfo: structuredClone(record.thread.gitInfo),
+      settingsOverlay: structuredClone(this.settingsOverlay),
       preview: record.thread.preview,
       lastClaudeMessageUuid: record.lastClaudeMessageUuid,
       seq: this.notificationSequence,

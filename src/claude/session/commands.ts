@@ -21,6 +21,7 @@ import type {
 import type { TurnProviderBoundary } from "../../store/HybridStore.js";
 import type { ActiveTool } from "../toolMapper.js";
 import type { ClaudeResultInput } from "../resultClassifier.js";
+import type { ClaudeSettingsOverlay } from "../threadSettings.js";
 
 export interface SessionBranchSnapshot {
   readonly record: ClaudeThreadRecord;
@@ -53,6 +54,8 @@ export interface ClaudeLiveSnapshot {
   };
   readonly status: Thread["status"];
   readonly name: string | null;
+  readonly gitInfo: Thread["gitInfo"];
+  readonly settingsOverlay: ClaudeSettingsOverlay;
   readonly preview: string;
   readonly lastClaudeMessageUuid: string | null;
   readonly seq: number;
@@ -65,6 +68,7 @@ export interface DesiredSettingsUpdate {
   readonly replacementId?: string;
   readonly replay?: { readonly resume: boolean; readonly batches: JsonValue[][] };
   readonly retryAfter?: Promise<void>;
+  readonly applyRuntime?: boolean;
 }
 
 export interface PreparedSessionTurn {
@@ -405,12 +409,14 @@ export type ClaudeSessionCommand =
   | {
     readonly type: "createThread";
     readonly record: ClaudeThreadRecord;
+    readonly settingsOverlay?: ClaudeSettingsOverlay;
   }
   | {
     readonly type: "readThread";
     readonly includeTurns: boolean;
   }
   | { readonly type: "liveSnapshot" }
+  | { readonly type: "confirmSettingsOverlay"; readonly settings: ClaudeSettingsOverlay }
   | { readonly type: "notificationsAfter"; readonly seq: number }
   | { readonly type: "purgeStartupProjection" }
   | {
@@ -439,9 +445,10 @@ export type ClaudeSessionCommand =
   }
   | {
     readonly type: "updateDesiredSettings";
-    readonly expectedGeneration: number;
     readonly candidate: ClaudeThreadRecord;
     readonly threadSettings: ThreadSettings;
+    readonly settingsOverlay: ClaudeSettingsOverlay;
+    readonly restartRuntime: boolean;
   }
   | {
     readonly type: "publishThreadSettings";
