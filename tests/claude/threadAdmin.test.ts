@@ -32,16 +32,26 @@ const waitFor = async (predicate: () => boolean): Promise<void> => {
   while (!predicate()) await new Promise<void>((resolve) => setTimeout(resolve, 1));
 };
 
-async function seedProviderBoundary(service: ClaudeService, threadId: string): Promise<void> {
+async function seedProviderBoundary(
+  service: ClaudeService,
+  hub: SubscriptionHub,
+  threadId: string,
+): Promise<void> {
   const turn = await service.prepareTurn({
     threadId,
     input: [{ type: "text", text: "seed provider boundary", text_elements: [] }],
   });
-  turn.announce();
+  const connectionId = `seed-${turn.response.turn.id}`;
+  const completed = new Promise<void>((resolve) => {
+    hub.subscribe(threadId, connectionId, (method, params) => {
+      if (method === "turn/completed"
+        && (params as { turn: { id: string } }).turn.id === turn.response.turn.id) resolve();
+    });
+  });
+  await turn.announce();
   turn.start();
-  await waitFor(() => service.readThread(threadId, true).thread.turns
-    .some((candidate) => candidate.id === turn.response.turn.id && candidate.status === "completed"));
-  await service.liveSnapshot(threadId);
+  await completed;
+  hub.unsubscribe(threadId, connectionId);
 }
 
 class DeleteCommitFailureStore extends MemoryHybridStore {
@@ -97,10 +107,13 @@ describe("Claude thread admin session cutover", () => {
     directories.push(directory);
     const store = new MemoryHybridStore();
     const calls: Array<{ name: string; operation: ReturnType<typeof deferred> }> = [];
+    const callStarted = [deferred(), deferred(), deferred()];
     const effects: ClaudeThreadAdminEffects = {
       rename: async (_sessionId, name) => {
         const operation = deferred();
+        const index = calls.length;
         calls.push({ name, operation });
+        callStarted[index]!.resolve();
         return operation.promise;
       },
       delete: async () => undefined,
@@ -119,17 +132,18 @@ describe("Claude thread admin session cutover", () => {
       effects,
     );
     const started = await service.startThread({ model: "claude:sonnet", cwd: directory });
-    await seedProviderBoundary(service, started.thread.id);
+    await seedProviderBoundary(service, hub, started.thread.id);
+    await service.prepareReadThread(started.thread.id, true);
     hub.subscribe(started.thread.id, "desktop", (method) => events.push(method));
 
     const first = service.setThreadName({ threadId: started.thread.id, name: "first" });
-    await waitFor(() => calls.length === 1);
+    await callStarted[0]!.promise;
     await service.updateThreadMetadata({
       threadId: started.thread.id,
       gitInfo: { branch: "main", sha: "abc123" },
     });
     const second = service.setThreadName({ threadId: started.thread.id, name: "second" });
-    await waitFor(() => calls.length === 2);
+    await callStarted[1]!.promise;
     calls[1]!.operation.resolve();
     await second;
     calls[0]!.operation.resolve();
@@ -142,7 +156,7 @@ describe("Claude thread admin session cutover", () => {
     expect(events.filter((method) => method === "thread/name/updated")).toHaveLength(1);
 
     const failed = service.setThreadName({ threadId: started.thread.id, name: "failed" });
-    await waitFor(() => calls.length === 3);
+    await callStarted[2]!.promise;
     calls[2]!.operation.reject(new Error("provider rename failed"));
     await expect(failed).rejects.toThrow("provider rename failed");
     expect(service.readThread(started.thread.id, false).thread.name).toBe("second");
@@ -331,9 +345,10 @@ describe("Claude thread admin session cutover", () => {
     let renameCalls = 0;
     const store = new MemoryHybridStore();
     const fake = new FakeClaudeQuery();
+    const hub = new SubscriptionHub();
     const service = new ClaudeService(
       { ...config(directory), idleTimeoutSeconds: -1 },
-      new SubscriptionHub(),
+      hub,
       new Logger("error"),
       store,
       fake.factory,
@@ -350,7 +365,7 @@ describe("Claude thread admin session cutover", () => {
     );
     const started = await service.startThread({ model: "claude:sonnet", cwd: directory });
     await service.resumeThread(started.thread.id);
-    await seedProviderBoundary(service, started.thread.id);
+    await seedProviderBoundary(service, hub, started.thread.id);
     const runtime = service as unknown as { unloadIdleRuntimes(): Promise<void> };
 
     const admin = service.setThreadName({ threadId: started.thread.id, name: "reserved" });
@@ -373,9 +388,10 @@ describe("Claude thread admin session cutover", () => {
     let renameCalls = 0;
     const store = new MemoryHybridStore();
     const fake = new FakeClaudeQuery();
+    const hub = new SubscriptionHub();
     const service = new ClaudeService(
       { ...config(directory), idleTimeoutSeconds: -1 },
-      new SubscriptionHub(),
+      hub,
       new Logger("error"),
       store,
       fake.factory,
@@ -389,7 +405,7 @@ describe("Claude thread admin session cutover", () => {
     );
     const started = await service.startThread({ model: "claude:sonnet", cwd: directory });
     await service.resumeThread(started.thread.id);
-    await seedProviderBoundary(service, started.thread.id);
+    await seedProviderBoundary(service, hub, started.thread.id);
     const serviceState = service as unknown as { unloadIdleRuntimes(): Promise<void> };
 
     const first = service.setThreadName({ threadId: started.thread.id, name: "first" });

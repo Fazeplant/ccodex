@@ -8339,6 +8339,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         providerCostUsdTotal: record.providerCostUsdTotal ?? 0,
       }),
       status: structuredClone(record.thread.status),
+      name: record.thread.name,
       preview: record.thread.preview,
       lastClaudeMessageUuid: record.lastClaudeMessageUuid,
       seq: this.notificationSequence,

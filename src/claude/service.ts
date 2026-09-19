@@ -1669,7 +1669,7 @@ export class ClaudeService {
 
   public async setThreadName(params: ThreadSetNameParams): Promise<Record<string, never>> {
     const summary = this.catalogSession(params.threadId);
-    if (summary) {
+    if (summary && !this.sessions.hasSession(params.threadId)) {
       await this.threadAdminEffects.rename(summary.sessionId, params.name, summary.cwd);
       await this.catalog.refresh();
       this.onCatalogChanged();
@@ -2583,6 +2583,7 @@ export class ClaudeService {
       canAcceptDirectInput: record.thread.parentThreadId ? false : true,
     };
     const native = this.catalogRecord(summary).thread;
+    const liveName = this.sessions.resolvedSession(record.thread.id)?.liveSnapshot().name;
     return {
       ...record.thread,
       ephemeral: native.ephemeral,
@@ -2590,7 +2591,7 @@ export class ClaudeService {
       sectionEnteredAt: native.sectionEnteredAt,
       projectId: record.thread.projectId ?? null,
       canAcceptDirectInput: record.thread.parentThreadId ? false : true,
-      name: native.name,
+      name: liveName ?? native.name,
       preview: native.preview,
       cwd: native.cwd,
       model: native.model,

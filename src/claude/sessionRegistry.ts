@@ -43,6 +43,10 @@ export class ClaudeSessionRegistry<
       .map(([threadId]) => threadId);
   }
 
+  public hasSession(threadId: string): boolean {
+    return this.entries.has(this.ownerOf(threadId));
+  }
+
   public loadedOwnerIds(): string[] {
     return [...this.entries].flatMap(([threadId, entry]) =>
       entry.state === "active" && entry.resolved?.isLoaded ? [threadId] : []);
