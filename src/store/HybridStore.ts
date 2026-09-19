@@ -56,7 +56,6 @@ export interface ClaudeThreadRecord {
   readonly tokenUsageLast: TokenUsageBreakdown | null;
   readonly modelContextWindow: number | null;
   readonly providerCostUsdTotal?: number;
-  readonly settingsGeneration?: number;
 }
 
 export interface ClaudeSessionFlags {
@@ -66,10 +65,6 @@ export interface ClaudeSessionFlags {
   readonly ephemeral: boolean;
   readonly section: ThreadSection | null;
   readonly sectionEnteredAt: number | null;
-}
-
-export function settingsGeneration(record: ClaudeThreadRecord): number {
-  return record.settingsGeneration ?? 0;
 }
 
 export function runtimeWorkspaceRoots(record: ClaudeThreadRecord): readonly string[] {
@@ -97,9 +92,6 @@ export function withSettingsFrom(
     reasoningSummary: settings.reasoningSummary,
     collaborationMode: settings.collaborationMode,
     outputSchema: settings.outputSchema,
-    ...(settings.settingsGeneration === undefined
-      ? {}
-      : { settingsGeneration: settings.settingsGeneration }),
   };
 }
 

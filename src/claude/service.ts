@@ -68,7 +68,7 @@ import type { Logger } from "../observability/logger.js";
 import type {
   ClaudeSessionFlags, ClaudeThreadRecord, HybridStore, InternalGoal, PendingThreadRemoval, TurnProviderBoundary,
 } from "../store/HybridStore.js";
-import { runtimeWorkspaceRoots as storedWorkspaceRoots, settingsGeneration, withSettingsFrom } from "../store/HybridStore.js";
+import { runtimeWorkspaceRoots as storedWorkspaceRoots, withSettingsFrom } from "../store/HybridStore.js";
 import { SqliteHybridStore } from "../store/sqliteStore.js";
 import { LayeredHybridStore } from "../store/memoryStore.js";
 import { createClaudeQuery, type ClaudeQueryFactory } from "./queryFactory.js";
@@ -894,7 +894,6 @@ export class ClaudeService {
       tokenUsageLast: null,
       modelContextWindow: null,
       providerCostUsdTotal: 0,
-      settingsGeneration: 0,
     };
   }
 
@@ -2913,7 +2912,6 @@ export class ClaudeService {
         params.threadId,
         {
           type: "updateDesiredSettings",
-          expectedGeneration: settingsGeneration(before),
           candidate,
           threadSettings: threadSettings(candidate),
           settingsOverlay: settingsOverlayPatch(params, candidate, outputSchema),

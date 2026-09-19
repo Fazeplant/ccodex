@@ -7,31 +7,18 @@ import { v7 as uuidv7 } from "uuid";
 import type { Thread } from "../codex/generated/v2/Thread.js";
 import type { ThreadListParams } from "../codex/generated/v2/ThreadListParams.js";
 import type { Turn } from "../codex/generated/v2/Turn.js";
-import type { ApprovalsReviewer } from "../codex/generated/v2/ApprovalsReviewer.js";
 import type {
   ClaudeSessionFlags, ClaudeThreadRecord, GoalPatch, GoalUsageInput, HybridStore, InternalGoal,
   PendingThreadRemoval,
 } from "./HybridStore.js";
-import { settingsGeneration, withSettingsFrom } from "./HybridStore.js";
 import { filterSortThreads } from "./threadFilter.js";
-import { withoutAppContext } from "../protocol/appContext.js";
 
 interface ThreadRow {
   thread_json: string;
   claude_session_id: string;
-  model_picker_id: string;
-  claude_model_value: string;
-  service_tier: string | null;
-  approval_policy_json: string;
-  sandbox_policy_json: string;
-  base_instructions: string | null;
-  developer_instructions: string | null;
-  personality: string | null;
-  resolved_model: string | null;
   last_claude_message_uuid: string | null;
   last_completed_turn_id: string | null;
   claude_code_version: string | null;
-  runtime_settings_json: string | null;
 }
 
 interface TurnRow {
@@ -78,18 +65,7 @@ function recoverableDatabase(path: string): DatabaseSync {
 
 function parseRecord(row: ThreadRow, turns: Turn[]): ClaudeThreadRecord {
   const thread = JSON.parse(row.thread_json) as Thread;
-  const runtime = row.runtime_settings_json ? JSON.parse(row.runtime_settings_json) as Record<string, unknown> : {};
-  const usage = (value: unknown): ClaudeThreadRecord["tokenUsageTotal"] => {
-    const stored = value && typeof value === "object" ? value as Partial<ClaudeThreadRecord["tokenUsageTotal"]> : {};
-    return {
-      totalTokens: stored.totalTokens ?? 0,
-      inputTokens: stored.inputTokens ?? 0,
-      cachedInputTokens: stored.cachedInputTokens ?? 0,
-      cacheWriteInputTokens: stored.cacheWriteInputTokens ?? 0,
-      outputTokens: stored.outputTokens ?? 0,
-      reasoningOutputTokens: stored.reasoningOutputTokens ?? 0,
-    };
-  };
+  const modelPickerId = thread.model || "claude:default";
   return {
     thread: {
       ...thread,
@@ -99,36 +75,32 @@ function parseRecord(row: ThreadRow, turns: Turn[]): ClaudeThreadRecord {
       canAcceptDirectInput: thread.parentThreadId ? false : true,
       turns,
     },
-    runtimeWorkspaceRoots: Array.isArray(runtime.runtimeWorkspaceRoots)
-      ? runtime.runtimeWorkspaceRoots as string[]
-      : [thread.cwd],
+    runtimeWorkspaceRoots: [thread.cwd],
     claudeSessionId: row.claude_session_id,
-    modelPickerId: row.model_picker_id,
-    claudeModelValue: row.claude_model_value,
-    serviceTier: row.service_tier,
-    approvalPolicy: JSON.parse(row.approval_policy_json) as unknown,
-    approvalsReviewer: (["user", "auto_review", "guardian_subagent"] as const).includes(
-      runtime.approvalsReviewer as ApprovalsReviewer,
-    ) ? runtime.approvalsReviewer as ApprovalsReviewer : "user",
-    sandboxPolicy: JSON.parse(row.sandbox_policy_json) as unknown,
-    baseInstructions: row.base_instructions,
-    developerInstructions: row.developer_instructions,
-    personality: row.personality,
-    resolvedModel: row.resolved_model,
+    modelPickerId,
+    claudeModelValue: modelPickerId.replace(/^claude:/u, ""),
+    serviceTier: null,
+    approvalPolicy: "on-request",
+    approvalsReviewer: "user",
+    sandboxPolicy: { type: "readOnly", networkAccess: false },
+    baseInstructions: null,
+    developerInstructions: null,
+    personality: null,
+    resolvedModel: null,
     lastClaudeMessageUuid: row.last_claude_message_uuid,
     lastCompletedTurnId: row.last_completed_turn_id,
     claudeCodeVersion: row.claude_code_version,
-    reasoningEffort: typeof runtime.reasoningEffort === "string" ? runtime.reasoningEffort : null,
-    reasoningSummary: typeof runtime.reasoningSummary === "string" ? runtime.reasoningSummary : null,
-    collaborationMode: runtime.collaborationMode ?? null,
-    outputSchema: runtime.outputSchema ?? null,
-    tokenUsageTotal: usage(runtime.tokenUsageTotal),
-    tokenUsageLast: runtime.tokenUsageLast && typeof runtime.tokenUsageLast === "object"
-      ? usage(runtime.tokenUsageLast)
-      : null,
-    modelContextWindow: typeof runtime.modelContextWindow === "number" ? runtime.modelContextWindow : null,
-    providerCostUsdTotal: typeof runtime.providerCostUsdTotal === "number" ? runtime.providerCostUsdTotal : 0,
-    settingsGeneration: typeof runtime.settingsGeneration === "number" ? runtime.settingsGeneration : 0,
+    reasoningEffort: null,
+    reasoningSummary: null,
+    collaborationMode: null,
+    outputSchema: null,
+    tokenUsageTotal: {
+      totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0,
+      outputTokens: 0, reasoningOutputTokens: 0,
+    },
+    tokenUsageLast: null,
+    modelContextWindow: null,
+    providerCostUsdTotal: 0,
   };
 }
 
@@ -154,43 +126,30 @@ export class SqliteHybridStore implements HybridStore {
         service_tier, cwd, archived, ephemeral, created_at, updated_at,
         thread_json, approval_policy_json, sandbox_policy_json,
         base_instructions, developer_instructions, personality, resolved_model,
-        last_claude_message_uuid, last_completed_turn_id, claude_code_version, runtime_settings_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_claude_message_uuid, last_completed_turn_id, claude_code_version
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.thread.id,
       record.thread.sessionId,
       record.claudeSessionId,
-      record.modelPickerId,
-      record.claudeModelValue,
-      record.serviceTier,
+      "claude:default",
+      "default",
+      null,
       record.thread.cwd,
       0,
       record.thread.ephemeral ? 1 : 0,
       record.thread.createdAt,
       record.thread.updatedAt,
-      json({ ...record.thread, turns: [] }),
-      json(record.approvalPolicy),
-      json(record.sandboxPolicy),
-      record.baseInstructions,
-      record.developerInstructions,
-      record.personality,
-      record.resolvedModel,
+      json({ ...record.thread, model: "claude:default", reasoningEffort: null, turns: [] }),
+      json("on-request"),
+      json({ type: "readOnly", networkAccess: false }),
+      null,
+      null,
+      null,
+      null,
       record.lastClaudeMessageUuid,
       record.lastCompletedTurnId,
       record.claudeCodeVersion,
-      json({
-        runtimeWorkspaceRoots: record.runtimeWorkspaceRoots ?? [record.thread.cwd],
-        approvalsReviewer: record.approvalsReviewer,
-        reasoningEffort: record.reasoningEffort,
-        reasoningSummary: record.reasoningSummary,
-        collaborationMode: record.collaborationMode,
-        outputSchema: record.outputSchema,
-        tokenUsageTotal: record.tokenUsageTotal,
-        tokenUsageLast: record.tokenUsageLast,
-        modelContextWindow: record.modelContextWindow,
-        providerCostUsdTotal: record.providerCostUsdTotal ?? 0,
-        settingsGeneration: settingsGeneration(record),
-      }),
     );
   }
 
@@ -200,10 +159,8 @@ export class SqliteHybridStore implements HybridStore {
 
   public getThreadRecord(threadId: string, includeTurns = false): ClaudeThreadRecord | undefined {
     const row = this.database.prepare(`
-      SELECT thread_json, claude_session_id, model_picker_id, claude_model_value,
-             service_tier, approval_policy_json, sandbox_policy_json,
-             base_instructions, developer_instructions, personality, resolved_model,
-             last_claude_message_uuid, last_completed_turn_id, claude_code_version, runtime_settings_json
+      SELECT thread_json, claude_session_id,
+             last_claude_message_uuid, last_completed_turn_id, claude_code_version
       FROM threads WHERE id = ?
     `).get(threadId) as unknown as ThreadRow | undefined;
     if (!row) return undefined;
@@ -212,10 +169,8 @@ export class SqliteHybridStore implements HybridStore {
 
   public allThreadRecords(): ClaudeThreadRecord[] {
     const rows = this.database.prepare(`
-      SELECT thread_json, claude_session_id, model_picker_id, claude_model_value,
-             service_tier, approval_policy_json, sandbox_policy_json,
-             base_instructions, developer_instructions, personality, resolved_model,
-             last_claude_message_uuid, last_completed_turn_id, claude_code_version, runtime_settings_json
+      SELECT thread_json, claude_session_id,
+             last_claude_message_uuid, last_completed_turn_id, claude_code_version
       FROM threads ORDER BY created_at ASC
     `).all() as unknown as ThreadRow[];
     return rows.map((row) => {
@@ -284,51 +239,26 @@ export class SqliteHybridStore implements HybridStore {
 
   public updateThread(record: ClaudeThreadRecord): void {
     const current = this.getThreadRecord(record.thread.id, false);
-    const merged = current && settingsGeneration(current) > settingsGeneration(record)
-      ? withSettingsFrom(record, current)
-      : record;
     const persistedThread = {
-      ...merged.thread,
-      status: current?.thread.status ?? merged.thread.status,
-      preview: current?.thread.preview ?? merged.thread.preview,
-      recencyAt: current?.thread.recencyAt ?? merged.thread.recencyAt,
-      cliVersion: current?.thread.cliVersion ?? merged.thread.cliVersion,
+      ...record.thread,
+      model: current?.thread.model ?? "claude:default",
+      reasoningEffort: null,
+      status: current?.thread.status ?? record.thread.status,
+      preview: current?.thread.preview ?? record.thread.preview,
+      recencyAt: current?.thread.recencyAt ?? record.thread.recencyAt,
+      cliVersion: current?.thread.cliVersion ?? record.thread.cliVersion,
       turns: [],
     };
     this.database.prepare(`
       UPDATE threads SET
-        claude_session_id = ?, model_picker_id = ?, claude_model_value = ?,
-        service_tier = ?, cwd = ?, updated_at = ?, thread_json = ?,
-        approval_policy_json = ?, sandbox_policy_json = ?, base_instructions = ?,
-        developer_instructions = ?, personality = ?, runtime_settings_json = ?
+        claude_session_id = ?, cwd = ?, updated_at = ?, thread_json = ?
       WHERE id = ?
     `).run(
-      merged.claudeSessionId,
-      merged.modelPickerId,
-      merged.claudeModelValue,
-      merged.serviceTier,
-      merged.thread.cwd,
-      merged.thread.updatedAt,
+      record.claudeSessionId,
+      record.thread.cwd,
+      record.thread.updatedAt,
       json(persistedThread),
-      json(merged.approvalPolicy),
-      json(merged.sandboxPolicy),
-      merged.baseInstructions,
-      merged.developerInstructions,
-      merged.personality,
-      json({
-        runtimeWorkspaceRoots: merged.runtimeWorkspaceRoots ?? [merged.thread.cwd],
-        approvalsReviewer: merged.approvalsReviewer,
-        reasoningEffort: merged.reasoningEffort,
-        reasoningSummary: merged.reasoningSummary,
-        collaborationMode: merged.collaborationMode,
-        outputSchema: merged.outputSchema,
-        tokenUsageTotal: current?.tokenUsageTotal ?? merged.tokenUsageTotal,
-        tokenUsageLast: current?.tokenUsageLast ?? merged.tokenUsageLast,
-        modelContextWindow: current?.modelContextWindow ?? merged.modelContextWindow,
-        providerCostUsdTotal: current?.providerCostUsdTotal ?? merged.providerCostUsdTotal ?? 0,
-        settingsGeneration: settingsGeneration(merged),
-      }),
-      merged.thread.id,
+      record.thread.id,
     );
   }
 
@@ -737,17 +667,6 @@ export class SqliteHybridStore implements HybridStore {
         "SELECT 1 FROM schema_migrations WHERE version = 9",
       ).get();
       if (!cleanDeveloperInstructions) {
-        const rows = this.database.prepare(`
-          SELECT id, developer_instructions
-          FROM threads
-          WHERE developer_instructions LIKE '%<app-context>%</app-context>%'
-        `).all() as unknown as Array<{ id: string; developer_instructions: string }>;
-        const update = this.database.prepare(
-          "UPDATE threads SET developer_instructions = ? WHERE id = ?",
-        );
-        for (const row of rows) {
-          update.run(withoutAppContext(row.developer_instructions), row.id);
-        }
         this.database.exec("INSERT INTO schema_migrations(version) VALUES (9)");
       }
       const textElements = this.database.prepare("SELECT 1 FROM schema_migrations WHERE version = 10").get();
@@ -772,12 +691,12 @@ export class SqliteHybridStore implements HybridStore {
       const threadModel = this.database.prepare("SELECT 1 FROM schema_migrations WHERE version = 11").get();
       if (!threadModel) {
         // Codex 0.153 made Thread.model / Thread.reasoningEffort required.
-        if (["thread_json", "model_picker_id", "runtime_settings_json"].every((column) => threadColumns.has(column))) this.database.exec(`
+        if (["thread_json", "model_picker_id"].every((column) => threadColumns.has(column))) this.database.exec(`
           UPDATE threads
           SET thread_json = json_set(
             thread_json,
             '$.model', model_picker_id,
-            '$.reasoningEffort', json_extract(coalesce(runtime_settings_json, '{}'), '$.reasoningEffort')
+            '$.reasoningEffort', NULL
           );
         `);
         this.database.exec("INSERT INTO schema_migrations(version) VALUES (11)");

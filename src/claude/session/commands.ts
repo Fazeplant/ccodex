@@ -445,7 +445,6 @@ export type ClaudeSessionCommand =
   }
   | {
     readonly type: "updateDesiredSettings";
-    readonly expectedGeneration: number;
     readonly candidate: ClaudeThreadRecord;
     readonly threadSettings: ThreadSettings;
     readonly settingsOverlay: ClaudeSettingsOverlay;

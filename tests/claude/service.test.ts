@@ -1093,7 +1093,7 @@ You are in a side conversation.`,
     await service.close();
   });
 
-  it("cleans persisted App context when the Claude service starts", async () => {
+  it("ignores obsolete persisted developer instructions when the Claude service starts", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-legacy-app-instructions-"));
     directories.push(directory);
     const database = join(directory, "state.sqlite");
@@ -1122,9 +1122,7 @@ Keep this summary.
     const migratedService = new ClaudeService(
       config(directory), new SubscriptionHub(), new Logger("error"), migratedStore, new FakeClaudeQuery().factory,
     );
-    expect(migratedStore.getThreadRecord(started.thread.id)?.developerInstructions).toBe(
-      "[Cross-provider compact handoff]\nKeep this summary.\n[End cross-provider compact handoff]",
-    );
+    expect(migratedStore.getThreadRecord(started.thread.id)?.developerInstructions).toBeNull();
     await migratedService.close();
   });
 
@@ -1311,13 +1309,13 @@ Keep this summary.
       ...fullAccessProjection.resume,
     });
     expect(response).toMatchObject({
-      approvalPolicy: "never",
-      sandbox: { type: "dangerFullAccess" },
-      activePermissionProfile: expected,
+      approvalPolicy: "on-request",
+      sandbox: { type: "readOnly", networkAccess: false },
+      activePermissionProfile: { id: ":read-only", extends: null },
       reasoningEffort: null,
     });
     expect(resumedFake.inputs[0]?.options).toMatchObject({
-      permissionMode: "bypassPermissions",
+      permissionMode: "default",
       allowDangerouslySkipPermissions: true,
     });
     await resumed.close();
@@ -2966,7 +2964,7 @@ You are in a side conversation, not the main thread.`,
     }]);
     expect(service.readThread(started.thread.id, false).thread.status).toEqual({ type: "idle" });
     expect((service as unknown as { store: HybridStore }).store.getThreadRecord(started.thread.id, false))
-      .toMatchObject({ approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } });
+      .toMatchObject({ approvalPolicy: "on-request", sandboxPolicy: { type: "readOnly" } });
     await service.close();
   });
 
@@ -4914,10 +4912,10 @@ You are in a side conversation, not the main thread.`,
 
     expect(store.getThreadRecord(started.thread.id)).toMatchObject({
       claudeSessionId: nextSessionId,
-      modelPickerId: "claude:sonnet",
-      claudeModelValue: "sonnet",
-      reasoningEffort: "high",
-      serviceTier: "fast",
+      modelPickerId: "claude:default",
+      claudeModelValue: "default",
+      reasoningEffort: null,
+      serviceTier: null,
       thread: {
         name: null,
         gitInfo: { branch: "concurrent", sha: "abc123" },
@@ -7110,8 +7108,8 @@ You are in a side conversation, not the main thread.`,
       new SqliteHybridStore(database), resumedQuery.factory,
     );
     const response = await resumed.resumeThread({ threadId: started.thread.id, excludeTurns: true });
-    expect(response.runtimeWorkspaceRoots).toEqual([directory, extra]);
-    expect(resumedQuery.inputs[0]?.options.additionalDirectories).toEqual([extra]);
+    expect(response.runtimeWorkspaceRoots).toEqual([directory]);
+    expect(resumedQuery.inputs[0]?.options.additionalDirectories).toBeUndefined();
     await resumed.close();
   });
 
@@ -7209,7 +7207,7 @@ You are in a side conversation, not the main thread.`,
     const started = await service.startThread({ model: "claude:claude-fable-5", cwd: directory });
     expect(started.model).toBe("claude:claude-fable-5-1");
     expect(store.getThreadRecord(started.thread.id)).toMatchObject({
-      modelPickerId: "claude:claude-fable-5-1", claudeModelValue: "claude-fable-5-1",
+      modelPickerId: "claude:default", claudeModelValue: "default",
     });
     await expect(service.updateThreadSettings({ threadId: started.thread.id, effort: "xhigh" }))
       .rejects.toThrow("does not support effort");
@@ -7242,11 +7240,11 @@ You are in a side conversation, not the main thread.`,
       if (method === "thread/settings/updated") settingsEvents.push(params);
     });
     const durableBefore = store.getThreadRecord(started.thread.id);
-    await expect(second.resumeThread(started.thread.id)).resolves.toMatchObject({ model: "claude:claude-fable-5-1" });
-    expect(secondFake.inputs[0]?.options).toMatchObject({ model: "claude-fable-5-1" });
+    await expect(second.resumeThread(started.thread.id)).resolves.toMatchObject({ model: "claude:default" });
+    expect(secondFake.inputs[0]?.options).toMatchObject({ model: "default" });
     expect(secondFake.inputs[0]?.options.effort).toBeUndefined();
     expect(store.getThreadRecord(started.thread.id)).toEqual(durableBefore);
-    expect(settingsEvents).toMatchObject([{ threadSettings: { model: "claude:claude-fable-5-1", effort: null } }]);
+    expect(settingsEvents).toEqual([]);
     await second.close();
   });
 
