@@ -1,5 +1,5 @@
 import { daemonLogEvidence, finish, rootTranscripts, safeError, stableRandom, startGateway,
-  stopGateway, truncateId } from "../lib/harness.mjs";
+  stopGateway, transcriptAssistantMessageIds, truncateId } from "../lib/harness.mjs";
 
 const scenario = "restart_determinism";
 const checks = [];
@@ -21,19 +21,39 @@ function identity(thread) {
   };
 }
 
+const assistantBlockId = /^msg_[A-Za-z0-9]+:\d+$/u;
+
+/* Stage 3 assistant text/reasoning IDs are `<message.id>:<apiBlockIndex>` and must
+ * remain deterministic across restart. Tool-use IDs intentionally follow a different native rule. */
+function assistantIdsOk(thread) {
+  return thread.turns.every((turn) => {
+    const ids = turn.items
+      .filter((item) => item.type === "agentMessage" || item.type === "reasoning")
+      .map((item) => item.id);
+    return ids.every((id) => assistantBlockId.test(id)) && new Set(ids).size === ids.length;
+  });
+}
+
 try {
-  const selected = stableRandom(rootTranscripts(), 5);
-  add("resume_sample_available", selected.length === 5, { count: selected.length });
+  const eligible = [];
+  for (const session of rootTranscripts()) {
+    const messageIds = await transcriptAssistantMessageIds(session.path);
+    if ([...messageIds].every((id) => /^msg_[A-Za-z0-9]+$/u.test(id))) eligible.push(session);
+  }
+  const selected = stableRandom(eligible, 5);
+  add("resume_sample_available", selected.length === 5, { count: selected.length, eligible: eligible.length });
   const startup = await startGateway();
   client = startup.client;
   timings.daemonStartMs = startup.start.durationMs;
   const before = new Map();
   const beforeFailures = [];
+  const assistantIdFailures = [];
   for (const session of selected) {
     const started = performance.now();
     try {
       const resumed = await client.request("thread/resume", { threadId: session.id, excludeTurns: false });
       before.set(session.id, identity(resumed.thread));
+      if (!assistantIdsOk(resumed.thread)) assistantIdFailures.push(truncateId(session.id));
     } catch (error) {
       beforeFailures.push(truncateId(session.id));
       evidence.push(safeError(error, "thread/resume", { threadId: "<id>", excludeTurns: false, phase: "before" }));
@@ -58,6 +78,7 @@ try {
     const started = performance.now();
     try {
       const resumed = await client.request("thread/resume", { threadId: session.id, excludeTurns: false });
+      if (!assistantIdsOk(resumed.thread)) assistantIdFailures.push(truncateId(session.id));
       if (!before.has(session.id) || JSON.stringify(before.get(session.id)) !== JSON.stringify(identity(resumed.thread))) {
         mismatches.push(truncateId(session.id));
       }
@@ -72,6 +93,11 @@ try {
     checked: selected.length,
     mismatchedIds: mismatches,
     blockedResumes: beforeFailures.length + afterFailures.length,
+  });
+  add("assistant_item_ids_native_shape_unique_per_turn", assistantIdFailures.length === 0, {
+    checked: selected.length,
+    failedIds: [...new Set(assistantIdFailures)],
+    pattern: "^msg_[A-Za-z0-9]+:\\d+$",
   });
 } catch (error) {
   add("scenario_completed", false, safeError(error, "scenario", {}));

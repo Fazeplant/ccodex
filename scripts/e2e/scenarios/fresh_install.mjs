@@ -1,15 +1,23 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { changedTables, sqliteSnapshots } from "../lib/sqlite.mjs";
 import { openReadonly } from "../lib/sqlite.mjs";
 import {
-  countRecordType, daemon, daemonLogEvidence, eventually, fileHash, finish, pagedThreads,
-  projectionOk, readOnlyGuard, rootTranscripts, safeError, setEqual, stableRandom, startGateway,
+  countRecordSubtype, countRecordType, daemon, daemonLogEvidence, eventually, fileHash, finish, pagedThreads,
+  projectionOk, readOnlyGuard, rootTranscripts, safeError, setEqual, startGateway,
   stateDir, stopGateway, truncateId,
 } from "../lib/harness.mjs";
 
 const scenario = "fresh_install";
 const checks = [];
-const timings = { firstListMs: null, daemonStartMs: null, reads: [], resumes: [] };
+const timings = {
+  firstListMs: null,
+  daemonStartMs: null,
+  largestTranscriptResumeMs: null,
+  rollbackMs: null,
+  stopStartMs: null,
+  reads: [],
+  resumes: [],
+};
 const evidence = [];
 let client;
 
@@ -20,6 +28,14 @@ function add(name, ok, details = {}) {
 function count(snapshot, table) {
   return snapshot["state.sqlite"]?.[table] ?? 0;
 }
+
+/*
+ * Stage 3 expectations exercised here:
+ * - read/resume are transcript projections and may not change SQLite row counts for any copied session;
+ * - non-empty rollback is a process-local anchor, so it leaves the transcript untouched and is lost on restart;
+ * - zero-prefix rollback deletes the copied native transcript instead of rewriting it.
+ * No model turn is sent by this scenario.
+ */
 
 try {
   const sessions = rootTranscripts();
@@ -60,15 +76,25 @@ try {
       && thread.createdAt <= thread.updatedAt
       && Boolean(thread.name || thread.preview)), { checked: active.length });
 
-  const largest = [...sessions].sort((left, right) => right.size - left.size).slice(0, 3);
-  const selected = [...largest, ...stableRandom(sessions, 3, new Set(largest.map(({ id }) => id)))];
+  const bySize = [...sessions].sort((left, right) => right.size - left.size);
+  const largest = bySize[0];
+  const selected = bySize;
+  let rollbackTarget;
+  for (const session of selected) {
+    if (await countRecordType(session.path, "user") >= 2
+      && await countRecordSubtype(session.path, "system", "compact_boundary") === 0) {
+      rollbackTarget = session;
+      break;
+    }
+  }
   const projectionFailures = [];
+  const projected = new Map();
   for (const session of selected) {
     let started = performance.now();
     try {
       const metadata = await guard.step(`thread/read false ${truncateId(session.id)}`, () =>
         client.request("thread/read", { threadId: session.id, includeTurns: false }));
-      if (metadata.thread.id !== session.id || metadata.thread.turns.length !== 0) projectionFailures.push(truncateId(session.id));
+      if (metadata.thread.id !== session.id) projectionFailures.push(truncateId(session.id));
     } catch (error) {
       projectionFailures.push(truncateId(session.id));
       evidence.push(safeError(error, "thread/read", { threadId: "<id>", includeTurns: false }));
@@ -79,6 +105,7 @@ try {
     try {
       const full = await guard.step(`thread/read true ${truncateId(session.id)}`, () =>
         client.request("thread/read", { threadId: session.id, includeTurns: true }));
+      projected.set(session.id, full.thread);
       if (full.thread.id !== session.id || !projectionOk(full.thread)) projectionFailures.push(truncateId(session.id));
     } catch (error) {
       projectionFailures.push(truncateId(session.id));
@@ -86,29 +113,115 @@ try {
     }
     timings.reads.push({ id: truncateId(session.id), includeTurns: true, ms: Math.round(performance.now() - started) });
 
-    started = performance.now();
-    try {
-      const resumed = await guard.step(`thread/resume ${truncateId(session.id)}`, () =>
-        client.request("thread/resume", { threadId: session.id, excludeTurns: false }));
-      if (resumed.thread.id !== session.id || !projectionOk(resumed.thread)) projectionFailures.push(truncateId(session.id));
-    } catch (error) {
-      projectionFailures.push(truncateId(session.id));
-      evidence.push(safeError(error, "thread/resume", { threadId: "<id>", excludeTurns: false }));
+    if (session.id !== rollbackTarget?.id) {
+      started = performance.now();
+      try {
+        const resumed = await guard.step(`thread/resume ${truncateId(session.id)}`, () =>
+          client.request("thread/resume", { threadId: session.id, excludeTurns: false }));
+        if (resumed.thread.id !== session.id) projectionFailures.push(truncateId(session.id));
+      } catch (error) {
+        projectionFailures.push(truncateId(session.id));
+        evidence.push(safeError(error, "thread/resume", { threadId: "<id>", excludeTurns: false }));
+      }
+      const resumeMs = Math.round(performance.now() - started);
+      timings.resumes.push({ id: truncateId(session.id), ms: resumeMs });
+      if (session.id === largest.id) timings.largestTranscriptResumeMs = resumeMs;
     }
-    timings.resumes.push({ id: truncateId(session.id), ms: Math.round(performance.now() - started) });
   }
+
+  let zeroPrefixTarget;
+  for (const session of selected) {
+    if (session.id !== rollbackTarget?.id && projected.get(session.id)?.turns.length >= 1
+      && await countRecordSubtype(session.path, "system", "compact_boundary") === 0) {
+      zeroPrefixTarget = session;
+      break;
+    }
+  }
+  add("rollback_samples_available", Boolean(rollbackTarget && zeroPrefixTarget), {
+    nonEmptyPrefix: Boolean(rollbackTarget),
+    zeroPrefix: Boolean(zeroPrefixTarget),
+    nonEmptyPrefixUncompacted: Boolean(rollbackTarget),
+  });
+  if (!rollbackTarget || !zeroPrefixTarget) throw new Error("rollback fixture sessions were not available");
+
+  const originalTurns = projected.get(rollbackTarget.id).turns;
+  const rollbackSizeBefore = statSync(rollbackTarget.path).size;
+  let started = performance.now();
+  const rolledBack = await client.request("thread/rollback", { threadId: rollbackTarget.id, numTurns: 1 });
+  timings.rollbackMs = Math.round(performance.now() - started);
+  const truncatedRead = await client.request("thread/read", { threadId: rollbackTarget.id, includeTurns: true });
+  const rollbackSizeAfter = statSync(rollbackTarget.path).size;
+  add("rollback_keeps_n_minus_one_in_memory", rolledBack.thread.turns.length === originalTurns.length - 1
+    && truncatedRead.thread.turns.length === originalTurns.length - 1, {
+    originalTurns: originalTurns.length,
+    rollbackTurns: rolledBack.thread.turns.length,
+    readTurns: truncatedRead.thread.turns.length,
+  });
+  add("rollback_non_empty_prefix_leaves_transcript_unchanged", rollbackSizeAfter === rollbackSizeBefore, {
+    bytesBefore: rollbackSizeBefore,
+    bytesAfter: rollbackSizeAfter,
+  });
+
+  started = performance.now();
+  const rollbackStop = await stopGateway(client);
+  client = undefined;
+  const rollbackRestart = await startGateway();
+  client = rollbackRestart.client;
+  timings.stopStartMs = Math.round(performance.now() - started);
+  const restoredRead = await client.request("thread/read", { threadId: rollbackTarget.id, includeTurns: true });
+  add("rollback_anchor_lost_after_restart", rollbackStop.ok && restoredRead.thread.turns.length === originalTurns.length, {
+    stopOk: rollbackStop.ok,
+    originalTurns: originalTurns.length,
+    restartedTurns: restoredRead.thread.turns.length,
+  });
+  started = performance.now();
+  try {
+    const resumed = await guard.step(`thread/resume ${truncateId(rollbackTarget.id)}`, () =>
+      client.request("thread/resume", { threadId: rollbackTarget.id, excludeTurns: false }));
+    if (resumed.thread.id !== rollbackTarget.id) {
+      projectionFailures.push(truncateId(rollbackTarget.id));
+    }
+  } catch (error) {
+    projectionFailures.push(truncateId(rollbackTarget.id));
+    evidence.push(safeError(error, "thread/resume", { threadId: "<id>", excludeTurns: false, phase: "after-restart" }));
+  }
+  const rollbackTargetResumeMs = Math.round(performance.now() - started);
+  timings.resumes.push({ id: truncateId(rollbackTarget.id), ms: rollbackTargetResumeMs });
+  if (rollbackTarget.id === largest.id) timings.largestTranscriptResumeMs = rollbackTargetResumeMs;
   add("read_resume_projection", projectionFailures.length === 0, {
     selected: selected.length,
-    failedIds: projectionFailures,
+    failedIds: [...new Set(projectionFailures)],
   });
   add("read_only_sqlite_counts", guard.observations.every(({ ok }) => ok), {
     steps: guard.observations.length,
     failedSteps: guard.observations.filter(({ ok }) => !ok).map(({ name }) => name.replace(/[0-9a-f]{8}…/gu, "<id>")),
   });
 
-  const [renameTarget, archiveTarget] = selected;
+  const restartIds = new Set((await pagedThreads(client, { limit: 100 })).map(({ id }) => id));
+  const postRestartZeroPrefixTarget = restartIds.has(zeroPrefixTarget.id) && existsSync(zeroPrefixTarget.path)
+    ? zeroPrefixTarget
+    : undefined;
+  if (!postRestartZeroPrefixTarget) throw new Error("post-restart zero-prefix fixture session was not available");
+  const hydratedZeroPrefix = await client.request("thread/read", {
+    threadId: postRestartZeroPrefixTarget.id,
+    includeTurns: true,
+  });
+  const zeroPrefixTurns = hydratedZeroPrefix.thread.turns.length;
+  const reset = await client.request("thread/rollback", {
+    threadId: postRestartZeroPrefixTarget.id,
+    numTurns: zeroPrefixTurns,
+  });
+  add("rollback_zero_prefix_removes_transcript", reset.thread.turns.length === 0 && !existsSync(postRestartZeroPrefixTarget.path), {
+    removedTurns: zeroPrefixTurns,
+    responseTurns: reset.thread.turns.length,
+    transcriptRemoved: !existsSync(postRestartZeroPrefixTarget.path),
+  });
+
+  const mutationTargets = selected.filter(({ id }) => id !== rollbackTarget.id && id !== postRestartZeroPrefixTarget.id);
+  const [renameTarget, archiveTarget] = mutationTargets;
   const sectionTarget = [...sessions].sort((left, right) => left.size - right.size)
-    .find(({ id }) => id !== renameTarget.id && id !== archiveTarget.id);
+    .find(({ id }) => id !== renameTarget.id && id !== archiveTarget.id
+      && id !== rollbackTarget.id && id !== postRestartZeroPrefixTarget.id);
   const title = "Isolated container title";
   try {
     const titleCountBefore = await countRecordType(renameTarget.path, "custom-title");

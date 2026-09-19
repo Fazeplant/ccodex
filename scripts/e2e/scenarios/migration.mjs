@@ -1,11 +1,11 @@
-import { existsSync } from "node:fs";
 import { countRecordType, daemonLogEvidence, finish, pagedThreads, rootTranscripts,
-  safeError, setEqual, startGateway, stateDir, stopGateway, truncateId } from "../lib/harness.mjs";
+  safeError, setEqual, startGateway, stateDir, stopGateway, transcriptAssistantMessageIds,
+  truncateId } from "../lib/harness.mjs";
 import { changedTables, openReadonly, sqliteSnapshots } from "../lib/sqlite.mjs";
 
 const scenario = "migration";
 const checks = [];
-const timings = { firstListMs: null, daemonStartMs: null, resumes: [], restartMs: null };
+const timings = { firstListMs: null, daemonStartMs: null, reads: [], resumes: [], restartMs: null };
 const evidence = [];
 let client;
 
@@ -13,10 +13,40 @@ function add(name, ok, details = {}) {
   checks.push({ name, ok: Boolean(ok), details });
 }
 
-function coreHistoryChanges(before, after) {
-  return changedTables(before, after).filter((name) => [
-    "state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items",
-  ].includes(name));
+const droppedHistoryTables = [
+  "events", "provider_events", "processed_provider_events", "provider_item_correlations",
+  "pending_requests", "thread_queues",
+];
+const allowedRowCountChanges = new Set([
+  "state.sqlite:threads",
+  "state.sqlite:claude_session_flags",
+  "state.sqlite:goals",
+  "state.sqlite:goal_checkpoints",
+  "state.sqlite:section_orders",
+  "state.sqlite:pending_thread_removals",
+  "handoffs.sqlite:lineage_tasks",
+  "handoffs.sqlite:lineage_epochs",
+  "handoffs.sqlite:lineage_segments",
+]);
+const userUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+/*
+ * Stage 3 expectations exercised here:
+ * - migration 14 exists and removes the event/provider/pending/queue tables;
+ * - every eligible legacy thread is read and resumed without changing history row counts;
+ *   only retained settings, flags, goals, or lineage tables are allowed to change;
+ * - transcript-backed legacy history uses projected IDs: user-record UUIDs for turns and
+ *   `<message.id>:<apiBlockIndex>` for assistant text/reasoning items.
+ */
+
+function projectedIdShape(thread, nativeMessageIds) {
+  return thread.turns.every((turn) => userUuid.test(turn.id)
+    && turn.items.filter((item) => item.type === "agentMessage" || item.type === "reasoning")
+      .every((item) => {
+        const separator = item.id.lastIndexOf(":");
+        return separator > 0 && /^\d+$/u.test(item.id.slice(separator + 1))
+          && nativeMessageIds.has(item.id.slice(0, separator));
+      }));
 }
 
 function backupThreads(path) {
@@ -89,10 +119,19 @@ try {
   client = startup.client;
   timings.daemonStartMs = startup.start.durationMs;
   const database = openReadonly(statePath);
-  const hasMigration13 = database.prepare("SELECT count(*) AS count FROM schema_migrations WHERE version = 13").get().count;
+  const hasMigration14 = database.prepare("SELECT count(*) AS count FROM schema_migrations WHERE version = 14").get().count;
+  const remainingDroppedTables = database.prepare(`
+    SELECT name FROM sqlite_schema
+    WHERE type = 'table' AND name IN (${droppedHistoryTables.map(() => "?").join(",")})
+    ORDER BY name
+  `).all(...droppedHistoryTables).map(({ name }) => name);
   const actualFlagCount = database.prepare("SELECT count(*) AS count FROM claude_session_flags").get().count;
   database.close();
-  add("schema_migration_13", Number(hasMigration13) === 1, { present: Number(hasMigration13) === 1 });
+  add("schema_migration_14", Number(hasMigration14) === 1, { present: Number(hasMigration14) === 1 });
+  add("stage3_history_tables_dropped", remainingDroppedTables.length === 0, {
+    expectedAbsent: droppedHistoryTables,
+    unexpectedlyPresent: remainingDroppedTables,
+  });
   add("migration_13_flag_backfill", Number(actualFlagCount) === expectedFlagCount, {
     expected: expectedFlagCount,
     actual: Number(actualFlagCount),
@@ -125,40 +164,72 @@ try {
     leaked: listedIds.filter((id) => aliasSessionIds.has(id)).map(truncateId),
   });
 
-  const withTranscript = rootRows.filter((thread) =>
-    !thread.ephemeral && !logicalBackendIds.has(thread.id) && transcriptById.has(thread.sessionId)).slice(0, 3);
-  const withoutTranscript = rootRows.filter((thread) =>
-    !thread.ephemeral && !logicalBackendIds.has(thread.id) && !transcriptById.has(thread.sessionId)).slice(0, 2);
-  add("legacy_resume_sample_available", withTranscript.length === 3 && withoutTranscript.length === 2, {
+  const eligible = rootRows.filter((thread) => !thread.ephemeral && !logicalBackendIds.has(thread.id));
+  const withTranscript = eligible.filter((thread) => transcriptById.has(thread.sessionId));
+  const withoutTranscript = eligible.filter((thread) => !transcriptById.has(thread.sessionId));
+  const assistantMessageIds = new Map();
+  for (const thread of withTranscript) {
+    if (!assistantMessageIds.has(thread.sessionId)) {
+      assistantMessageIds.set(thread.sessionId,
+        await transcriptAssistantMessageIds(transcriptById.get(thread.sessionId).path));
+    }
+  }
+  add("legacy_resume_sample_available", withTranscript.length >= 3 && withoutTranscript.length >= 2, {
     withTranscript: withTranscript.length,
     withoutTranscript: withoutTranscript.length,
   });
-  const countsBeforeResume = sqliteSnapshots(stateDir);
+  let rowCountBaseline = sqliteSnapshots(stateDir);
+  const unexpectedRowCountChanges = [];
+  const idShapeFailures = [];
   const resumeFailures = [];
-  for (const thread of [...withTranscript, ...withoutTranscript]) {
-    const started = performance.now();
+  const readFailures = [];
+  for (const thread of eligible) {
+    let started = performance.now();
+    try {
+      const read = await client.request("thread/read", { threadId: thread.id, includeTurns: true });
+      if (read.thread.id !== thread.id) readFailures.push(truncateId(thread.id));
+      if (transcriptById.has(thread.sessionId)
+        && !projectedIdShape(read.thread, assistantMessageIds.get(thread.sessionId))) idShapeFailures.push(truncateId(thread.id));
+    } catch (error) {
+      readFailures.push(truncateId(thread.id));
+      evidence.push(safeError(error, "thread/read", { threadId: "<id>", includeTurns: true }));
+    }
+    timings.reads.push({ id: truncateId(thread.id), transcript: transcriptById.has(thread.sessionId), ms: Math.round(performance.now() - started) });
+    let after = sqliteSnapshots(stateDir);
+    const readChanges = changedTables(rowCountBaseline, after).filter((name) => !allowedRowCountChanges.has(name));
+    if (readChanges.length > 0) unexpectedRowCountChanges.push({ operation: "read", id: truncateId(thread.id), tables: readChanges });
+    rowCountBaseline = after;
+
+    started = performance.now();
     try {
       const resumed = await client.request("thread/resume", { threadId: thread.id, excludeTurns: false });
       timings.resumes.push({ id: truncateId(thread.id), transcript: transcriptById.has(thread.sessionId), ms: Math.round(performance.now() - started) });
       if (resumed.thread.id !== thread.id) resumeFailures.push(truncateId(thread.id));
+      if (transcriptById.has(thread.sessionId)
+        && !projectedIdShape(resumed.thread, assistantMessageIds.get(thread.sessionId))) idShapeFailures.push(truncateId(thread.id));
     } catch (error) {
       resumeFailures.push(truncateId(thread.id));
       evidence.push(safeError(error, "thread/resume", { threadId: "<id>", excludeTurns: false }));
     }
+    after = sqliteSnapshots(stateDir);
+    const resumeChanges = changedTables(rowCountBaseline, after).filter((name) => !allowedRowCountChanges.has(name));
+    if (resumeChanges.length > 0) unexpectedRowCountChanges.push({ operation: "resume", id: truncateId(thread.id), tables: resumeChanges });
+    rowCountBaseline = after;
   }
-  const countsAfterResume = sqliteSnapshots(stateDir);
+  add("legacy_read", readFailures.length === 0, { attempted: eligible.length, failedIds: [...new Set(readFailures)] });
   add("legacy_resume", resumeFailures.length === 0, {
-    attempted: withTranscript.length + withoutTranscript.length,
+    attempted: eligible.length,
     failedIds: [...new Set(resumeFailures)],
   });
-  // Stage 3 removes the legacy event/provider journals. Stage 2 only promises that
-  // resuming a SQLite-owned thread does not rewrite its core stored history.
-  const resumeChanges = changedTables(countsBeforeResume, countsAfterResume);
-  const resumeCoreChanges = coreHistoryChanges(countsBeforeResume, countsAfterResume);
-  add("legacy_resume_core_history_read_only", resumeCoreChanges.length === 0, {
-    unchanged: resumeCoreChanges.length === 0,
-    changedTables: resumeChanges,
-    assertedTables: ["state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items"],
+  add("legacy_projected_id_shapes", idShapeFailures.length === 0, {
+    checked: withTranscript.length,
+    failedIds: [...new Set(idShapeFailures)],
+  });
+  add("all_legacy_read_resume_history_counts_unchanged", unexpectedRowCountChanges.length === 0, {
+    operations: eligible.length * 2,
+    failures: unexpectedRowCountChanges,
+    ignoredAbsentTables: droppedHistoryTables,
+    allowedClasses: ["settings", "flags", "goals", "lineage"],
   });
 
   const beforeRestartTitles = await customTitleTotal(titleCandidates, transcriptById);
@@ -178,12 +249,12 @@ try {
   add("title_backfill_idempotent", afterRestartTitles === beforeRestartTitles, {
     appendedOnRestart: afterRestartTitles - beforeRestartTitles,
   });
-  const restartChanges = changedTables(beforeRestartCounts, afterRestartCounts);
-  const restartCoreChanges = coreHistoryChanges(beforeRestartCounts, afterRestartCounts);
-  add("restart_core_history_counts_unchanged", restartCoreChanges.length === 0, {
-    unchanged: restartCoreChanges.length === 0,
-    changedTables: restartChanges,
-    assertedTables: ["state.sqlite:threads", "state.sqlite:turns", "state.sqlite:items"],
+  const restartChanges = changedTables(beforeRestartCounts, afterRestartCounts)
+    .filter((name) => !allowedRowCountChanges.has(name));
+  add("restart_history_counts_unchanged", restartChanges.length === 0, {
+    unchanged: restartChanges.length === 0,
+    unexpectedChangedTables: restartChanges,
+    ignoredAbsentTables: droppedHistoryTables,
     stopOk: stopped.ok,
   });
 } catch (error) {

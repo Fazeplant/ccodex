@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, extname, join } from "node:path";
 
 const [reportsDir, outputPath, version = "unknown"] = process.argv.slice(2);
 if (!reportsDir || !outputPath) throw new Error("Usage: node report.mjs REPORTS_DIR OUTPUT.md [VERSION]");
@@ -7,7 +7,8 @@ if (!reportsDir || !outputPath) throw new Error("Usage: node report.mjs REPORTS_
 const reports = readdirSync(reportsDir)
   .filter((name) => name.endsWith(".json"))
   .sort()
-  .map((name) => JSON.parse(readFileSync(join(reportsDir, name), "utf8")));
+  .map((name) => JSON.parse(readFileSync(join(reportsDir, name), "utf8")))
+  .filter((report) => typeof report.scenario === "string" && Array.isArray(report.checks));
 
 const escape = (value) => String(value).replaceAll("|", "\\|").replaceAll("\n", " ");
 const details = (value) => escape(JSON.stringify(value));
@@ -19,6 +20,14 @@ const lines = [
   "The image used `node:22-bookworm` with a non-root user. It installed the main and Linux x64 GNU relay tarballs together with `npm install --prefix <stage> --include=optional --ignore-scripts --save=false`, then invoked the staged `ccodex setup --staged <stage> --version <version>`. This is the same staged activation path used by `scripts/install.sh`; ordinary dependencies, including pinned `@openai/codex` 0.153.3, were resolved by npm during the image build.",
   "",
   "No credentials or live host sockets/state were mounted. Every scenario used an independent writable copy of the Claude projects directory and a fresh container HOME.",
+  "",
+  "## Stage 3 expectation changes",
+  "",
+  "- Migration 14 must be present; `events`, provider journal/correlation tables, pending requests, and thread queues must be absent.",
+  "- Read/resume row-count checks cover every copied root transcript and every eligible legacy root thread. Dropped tables are not asserted; only retained settings, flags, goals, and lineage tables may change.",
+  "- Transcript-backed legacy turns use the user-record UUID as the turn ID, and assistant text/reasoning items use `<message.id>:<apiBlockIndex>`.",
+  "- Restart determinism additionally requires assistant IDs to match `^msg_[A-Za-z0-9]+:\\d+$` and be unique within each turn.",
+  "- Non-empty rollback is visible as an in-memory N−1-turn view without changing transcript size; restart intentionally restores the full disk projection. Zero-prefix rollback removes the copied transcript.",
   "",
   "## Scenario matrix",
   "",
@@ -64,4 +73,6 @@ if (incomplete.length > 0) {
 lines.push("");
 
 writeFileSync(outputPath, lines.join("\n"), "utf8");
+const jsonPath = `${outputPath.slice(0, -extname(outputPath).length)}.json`;
+writeFileSync(jsonPath, `${JSON.stringify({ version, reports }, null, 2)}\n`, "utf8");
 process.stdout.write(`${basename(outputPath)}\n`);

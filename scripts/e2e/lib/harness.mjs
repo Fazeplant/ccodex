@@ -113,6 +113,32 @@ export async function countRecordType(path, wanted) {
   return count;
 }
 
+export async function countRecordSubtype(path, wantedType, wantedSubtype) {
+  let count = 0;
+  const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.includes(wantedSubtype)) continue;
+    try {
+      const record = JSON.parse(line);
+      if (record.type === wantedType && record.subtype === wantedSubtype) count += 1;
+    } catch {}
+  }
+  return count;
+}
+
+export async function transcriptAssistantMessageIds(path) {
+  const ids = new Set();
+  const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.includes('"type":"assistant"') && !line.includes('"type": "assistant"')) continue;
+    try {
+      const record = JSON.parse(line);
+      if (record.type === "assistant" && typeof record.message?.id === "string") ids.add(record.message.id);
+    } catch {}
+  }
+  return ids;
+}
+
 export async function fileHash(path) {
   const hash = createHash("sha256");
   for await (const bytes of createReadStream(path)) hash.update(bytes);
@@ -135,12 +161,12 @@ export function setEqual(left, right) {
 }
 
 export function projectionOk(thread) {
-  const itemIds = [];
-  const turnsOk = thread.turns.length > 0 && thread.turns.every((turn) => {
-    itemIds.push(...turn.items.map((item) => item.id));
-    return turn.items.length > 0 && turn.items[0].type === "userMessage";
+  const turnsOk = thread.turns.every((turn) => {
+    const itemIds = turn.items.map((item) => item.id);
+    return (turn.items.length === 0 || turn.items[0].type === "userMessage")
+      && new Set(itemIds).size === itemIds.length;
   });
-  return turnsOk && new Set(itemIds).size === itemIds.length;
+  return turnsOk;
 }
 
 export function readOnlyGuard() {
