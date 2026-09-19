@@ -4471,6 +4471,11 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
         return this.requireRecord(command.includeTurns);
       case "liveSnapshot":
         return this.liveSnapshot();
+      case "confirmSettingsOverlay": {
+        this.settingsOverlay = Object.fromEntries(Object.entries(this.settingsOverlay).filter(([key, value]) =>
+          JSON.stringify(command.settings[key as keyof ClaudeSettingsOverlay]) !== JSON.stringify(value)));
+        return undefined;
+      }
       case "notificationsAfter":
         return this.notificationsAfter(command.seq);
       case "commitForkTarget": {
@@ -4652,7 +4657,6 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           thread: { ...candidate.thread, updatedAt: Math.floor(Date.now() / 1_000) },
         };
         const params = { threadId: this.threadId, threadSettings: command.threadSettings };
-        this.repository.update(updated);
         this.commitState(updated, [{ turnId: null, method: "thread/settings/updated", params }]);
         if (replacementId) this.beginRuntimeReplacement(replacementId);
         runtimeSettingsChanged(this.goal);
@@ -8366,6 +8370,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       }),
       status: structuredClone(record.thread.status),
       name: record.thread.name,
+      gitInfo: structuredClone(record.thread.gitInfo),
       settingsOverlay: structuredClone(this.settingsOverlay),
       preview: record.thread.preview,
       lastClaudeMessageUuid: record.lastClaudeMessageUuid,

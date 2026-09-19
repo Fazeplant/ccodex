@@ -949,19 +949,19 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.close();
   });
 
-  it("owns validated settings commits with generation fencing and persistence-before-publication", async () => {
+  it("owns process-local settings updates with generation fencing and ordered publication", async () => {
     const { store, hub, registry } = harness();
-    await registry.submit("thread-1", { type: "createThread", record: record("thread-1") });
+    const initial = record("thread-1");
+    await registry.submit("thread-1", { type: "createThread", record: initial });
     const advertised: string[] = [];
     hub.subscribe("thread-1", "settings", (method, params) => {
       if (method !== "thread/settings/updated") return;
       const model = (params as { threadSettings: { model: string } }).threadSettings.model;
-      expect(store.getThreadRecord("thread-1")?.modelPickerId).toBe(model);
+      expect(store.getThreadRecord("thread-1")?.modelPickerId).toBe(initial.modelPickerId);
       expect(notifications(registry, "thread-1").at(-1)?.method).toBe(method);
       advertised.push(model);
     });
 
-    const initial = record("thread-1");
     const opusCandidate = {
       ...initial,
       modelPickerId: "claude:claude-opus-4-8",

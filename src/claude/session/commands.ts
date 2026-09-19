@@ -54,6 +54,7 @@ export interface ClaudeLiveSnapshot {
   };
   readonly status: Thread["status"];
   readonly name: string | null;
+  readonly gitInfo: Thread["gitInfo"];
   readonly settingsOverlay: ClaudeSettingsOverlay;
   readonly preview: string;
   readonly lastClaudeMessageUuid: string | null;
@@ -415,6 +416,7 @@ export type ClaudeSessionCommand =
     readonly includeTurns: boolean;
   }
   | { readonly type: "liveSnapshot" }
+  | { readonly type: "confirmSettingsOverlay"; readonly settings: ClaudeSettingsOverlay }
   | { readonly type: "notificationsAfter"; readonly seq: number }
   | { readonly type: "purgeStartupProjection" }
   | {

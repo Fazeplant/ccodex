@@ -1314,7 +1314,7 @@ Keep this summary.
       approvalPolicy: "never",
       sandbox: { type: "dangerFullAccess" },
       activePermissionProfile: expected,
-      reasoningEffort: "high",
+      reasoningEffort: null,
     });
     expect(resumedFake.inputs[0]?.options).toMatchObject({
       permissionMode: "bypassPermissions",
@@ -5506,8 +5506,8 @@ You are in a side conversation, not the main thread.`,
     const second = new ClaudeService(config(directory), secondHub, new Logger("error"), new SqliteHybridStore(database), secondFake.factory);
     await second.ready();
     await second.prepareReadThread(started.thread.id, true);
-    expect(second.readThread(started.thread.id, true).thread).toMatchObject({
-      gitInfo: { branch: "persisted", sha: "abc123" },
+    expect(second.readThread(started.thread.id, true).thread.gitInfo).toEqual({
+      branch: null, originUrl: null, sha: null,
     });
     expect(second.readThread(started.thread.id, true).thread.turns.flatMap((turn) => turn.items)
       .some((item) => item.type === "commandExecution")).toBe(false);
@@ -5529,7 +5529,7 @@ You are in a side conversation, not the main thread.`,
     await second.close();
   });
 
-  it("reconstructs the latest desired settings after restart without inventing a failed turn", async () => {
+  it("loses an unconfirmed overlay on restart and reconstructs confirmed settings from the transcript", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-settings-restart-"));
     directories.push(directory);
     const database = join(directory, "state.sqlite");
@@ -5568,15 +5568,48 @@ You are in a side conversation, not the main thread.`,
     ]);
     await second.resumeThread(started.thread.id);
     expect(secondFake.inputs[0]?.options).toMatchObject({
-      model: "claude-opus-4-8",
-      effort: "high",
-      settings: { fastMode: true },
+      model: "claude-fable-5",
     });
     expect(second.currentThreadSettings(started.thread.id)).toMatchObject({
-      model: "claude:claude-opus-4-8", effort: "high", serviceTier: "fast",
+      model: "claude:claude-fable-5", effort: null, serviceTier: null,
     });
+    await second.updateThreadSettings({
+      threadId: started.thread.id,
+      model: "claude:claude-opus-4-8",
+      serviceTier: "fast",
+      effort: "high",
+    });
+    const confirmed = await second.prepareTurn({
+      threadId: started.thread.id,
+      input: [{ type: "text", text: "confirm settings", text_elements: [] }],
+    });
+    confirmed.announce();
+    confirmed.start();
+    await waitFor(
+      () => second.readThread(started.thread.id, true).thread.turns.at(-1)?.status === "completed",
+      "settings confirmation turn",
+    );
+    await waitFor(
+      async () => Object.keys((await second.liveSnapshot(started.thread.id)).settingsOverlay).length === 0,
+      "confirmed overlay cleanup",
+    );
     expect(second.readThread(started.thread.id, true).thread.turns.some((turn) => turn.status === "failed")).toBe(false);
     await second.close();
+
+    const thirdFake = new FakeClaudeQuery();
+    const third = new ClaudeService(
+      config(directory), new SubscriptionHub(), new Logger("error"),
+      new SqliteHybridStore(database), thirdFake.factory,
+    );
+    await third.ready();
+    await third.resumeThread(started.thread.id);
+    expect(thirdFake.inputs[0]?.options).toMatchObject({
+      model: "claude-opus-4-8", effort: "high", settings: { fastMode: true },
+    });
+    expect(third.currentThreadSettings(started.thread.id)).toMatchObject({
+      model: "claude:claude-opus-4-8", effort: "high", serviceTier: "fast",
+    });
+    await third.close();
   });
 
   it("validates model-specific settings and projects SDK structured_output", async () => {
@@ -7208,12 +7241,12 @@ You are in a side conversation, not the main thread.`,
     hub.subscribe(started.thread.id, "test", (method, params) => {
       if (method === "thread/settings/updated") settingsEvents.push(params);
     });
+    const durableBefore = store.getThreadRecord(started.thread.id);
     await expect(second.resumeThread(started.thread.id)).resolves.toMatchObject({ model: "claude:claude-fable-5-1" });
-    expect(secondFake.inputs[0]?.options).toMatchObject({ model: "claude-fable-5-1", effort: "high" });
-    expect(store.getThreadRecord(started.thread.id)).toMatchObject({
-      modelPickerId: "claude:claude-fable-5-1", claudeModelValue: "claude-fable-5-1", reasoningEffort: "high",
-    });
-    expect(settingsEvents).toMatchObject([{ threadSettings: { model: "claude:claude-fable-5-1", effort: "high" } }]);
+    expect(secondFake.inputs[0]?.options).toMatchObject({ model: "claude-fable-5-1" });
+    expect(secondFake.inputs[0]?.options.effort).toBeUndefined();
+    expect(store.getThreadRecord(started.thread.id)).toEqual(durableBefore);
+    expect(settingsEvents).toMatchObject([{ threadSettings: { model: "claude:claude-fable-5-1", effort: null } }]);
     await second.close();
   });
 
