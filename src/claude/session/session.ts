@@ -589,6 +589,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
   } | undefined;
   private readonly compactionActions: CompactionTransportAction[] = [];
   private lastPublishedUsage: string | undefined;
+  private providerCostUsdLast = 0;
   private lifecycle: TurnLifecycle | undefined;
   private pendingNoQuery = 0;
   private pendingInputs = 0;
@@ -4833,6 +4834,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
           this.disposeRuntimeOperations();
         }
         this.runtimeGeneration = command.runtimeGeneration;
+        this.providerCostUsdLast = this.requireRecord(false).providerCostUsdTotal ?? 0;
         runtimeAttached(this.goal, command.runtimeGeneration);
         this.interruptFence = this.dropLateFacts = false;
         this.pendingNoQuery = this.pendingInputs = 0;
@@ -5401,24 +5403,19 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       case "disposeRuntimeOperations":
         this.disposeRuntimeOperations();
         return undefined;
-      case "accountUsage": {
-        if (command.runtimeGeneration !== this.runtimeGeneration) return undefined;
-        const record = this.requireRecord(false);
-        const updated = {
-          ...record,
-          tokenUsageTotal: addUsage(record.tokenUsageTotal, command.aggregate),
-          providerCostUsdTotal: (record.providerCostUsdTotal ?? 0) + (command.costUsd ?? 0),
-        };
-        this.repository.update(updated);
-        this.record = updated;
-        return updated;
-      }
+      case "accountUsage":
       case "accountCost": {
         if (command.runtimeGeneration !== this.runtimeGeneration) return undefined;
         const record = this.requireRecord(false);
+        const total = command.costUsd ?? this.providerCostUsdLast;
+        const delta = total - this.providerCostUsdLast;
+        this.providerCostUsdLast = total;
         const updated = {
           ...record,
-          providerCostUsdTotal: (record.providerCostUsdTotal ?? 0) + command.costUsd,
+          ...(command.type === "accountUsage"
+            ? { tokenUsageTotal: addUsage(record.tokenUsageTotal, command.aggregate) }
+            : {}),
+          providerCostUsdTotal: (record.providerCostUsdTotal ?? 0) + (delta < 0 ? total : delta),
         };
         this.repository.update(updated);
         this.record = updated;

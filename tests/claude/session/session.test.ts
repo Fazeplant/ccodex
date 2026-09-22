@@ -1963,6 +1963,34 @@ describe("ClaudeSession Phase 3 slice", () => {
     await registry.close();
   });
 
+  it("accounts cumulative provider cost as a per-runtime delta", async () => {
+    const { store, registry } = harness();
+    const initial = { ...record("thread-1"), providerCostUsdTotal: 1 };
+    const zeroUsage = {
+      totalTokens: 0, inputTokens: 0, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0,
+    };
+    await registry.submit("thread-1", { type: "createThread", record: initial });
+
+    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 1 });
+    await registry.submit("thread-1", {
+      type: "accountUsage", runtimeGeneration: 1, aggregate: zeroUsage, costUsd: 1.4,
+    });
+    await registry.submit("thread-1", { type: "accountCost", runtimeGeneration: 1, costUsd: 1.7 });
+    expect(store.getThreadRecord("thread-1")?.providerCostUsdTotal).toBeCloseTo(1.7);
+
+    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 2 });
+    await registry.submit("thread-1", {
+      type: "accountUsage", runtimeGeneration: 2, aggregate: zeroUsage, costUsd: 0.2,
+    });
+    expect(store.getThreadRecord("thread-1")?.providerCostUsdTotal).toBeCloseTo(1.9);
+
+    await registry.submit("thread-1", { type: "attachRuntime", runtimeGeneration: 3 });
+    await registry.submit("thread-1", { type: "accountCost", runtimeGeneration: 3, costUsd: 2.1 });
+    expect(store.getThreadRecord("thread-1")?.providerCostUsdTotal).toBeCloseTo(2.1);
+    await registry.close();
+  });
+
   it("commits usage state and its replayable event atomically before live publication", async () => {
     const store = new TerminalCommitFailureStore();
     const { hub, registry } = harness(undefined, store);
