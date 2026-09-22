@@ -5214,6 +5214,9 @@ You are in a side conversation, not the main thread.`,
     expect(text).toContain("SAFE REPLACEMENT");
     expect(text).toContain("◆ **CCodex** │ Switched to a safe fallback.");
     expect(record.resolvedModel).toBe("claude-sonnet-4-6");
+    await service.updateThreadSettings({ threadId: started.thread.id, model: "claude:opus" });
+    // A newly selected model must not keep reporting the previous runtime's resolved model.
+    expect(store.getThreadRecord(started.thread.id)!.resolvedModel).toBeNull();
     expect(store.listProviderItemCorrelations(started.thread.id, [refusedUuid])).toEqual([]);
     expect(store.listProviderItemCorrelations(started.thread.id, [replacementUuid])).toHaveLength(1);
     expect(events).toContainEqual({

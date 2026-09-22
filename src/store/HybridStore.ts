@@ -74,6 +74,8 @@ export function withSettingsFrom(
     runtimeWorkspaceRoots: runtimeWorkspaceRoots(settings),
     modelPickerId: settings.modelPickerId,
     claudeModelValue: settings.claudeModelValue,
+    // The previous runtime's resolved model no longer describes a newly selected model.
+    resolvedModel: settings.claudeModelValue === base.claudeModelValue ? base.resolvedModel : null,
     serviceTier: settings.serviceTier,
     approvalPolicy: settings.approvalPolicy,
     approvalsReviewer: settings.approvalsReviewer,
