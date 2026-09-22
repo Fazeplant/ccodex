@@ -55,3 +55,6 @@ tracing = { workspace = true, features = ["log"] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v7"] }
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = { workspace = true }
+

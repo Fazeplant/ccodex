@@ -17,10 +17,10 @@
     ]
   },
   "counts": {
-    "architecture-invariant": 143,
-    "external-contract": 381,
-    "provider-mapping": 72,
-    "old-implementation-detail": 32
+    "architecture-invariant": 145,
+    "external-contract": 388,
+    "provider-mapping": 73,
+    "old-implementation-detail": 34
   },
   "cases": [
     {
@@ -76,6 +76,18 @@
       "title": "round-trips MCP form elicitation with content intact",
       "classification": "provider-mapping",
       "rationale": "Freezes Claude SDK/control/tool input into normalized Codex semantics."
+    },
+    {
+      "path": "tests/claude/autonomousContinuation.test.ts",
+      "title": "reports a projection failure and stops the provider instead of expiring the side chat",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/claude/autonomousContinuation.test.ts",
+      "title": "keeps a notification arriving before the first token for the next request (ephemeral=%s)",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
     {
       "path": "tests/claude/autonomousContinuation.test.ts",
@@ -367,6 +379,18 @@
     },
     {
       "path": "tests/claude/goalLifecycle.test.ts",
+      "title": "auto-allows genuine SDK goal provenance in the canUseTool path",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/claude/goalLifecycle.test.ts",
+      "title": "does not trust %s goal-tool provenance",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/claude/goalLifecycle.test.ts",
       "title": "trusts goal MCP locally without replacing user/project tool policy in $name mode",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
@@ -564,6 +588,12 @@
       "rationale": "Freezes Claude SDK/control/tool input into normalized Codex semantics."
     },
     {
+      "path": "tests/claude/modelCatalog.test.ts",
+      "title": "uses the effort Claude applies after selecting each model",
+      "classification": "provider-mapping",
+      "rationale": "Freezes Claude SDK/control/tool input into normalized Codex semantics."
+    },
+    {
       "path": "tests/claude/modelSelection.test.ts",
       "title": "removes real and serialized ANSI style residue",
       "classification": "provider-mapping",
@@ -620,6 +650,12 @@
     {
       "path": "tests/claude/permissionUpdates.test.ts",
       "title": "rejects session persistence when a configured ask rule forced the prompt",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/claude/permissionUpdates.test.ts",
+      "title": "rejects session persistence when Claude suppresses the always-allow rule",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
@@ -1063,7 +1099,7 @@
     },
     {
       "path": "tests/claude/service.test.ts",
-      "title": "projects title, cwd, and timestamps from native Claude session metadata",
+      "title": "projects native metadata consistently through list, read, and resume (%s)",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
@@ -1363,7 +1399,7 @@
     },
     {
       "path": "tests/claude/service.test.ts",
-      "title": "unloads an idle user side runtime without deleting the conversation",
+      "title": "keeps a user side resumable after more than 24 hours and runtime unload",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
@@ -1718,6 +1754,12 @@
     {
       "path": "tests/claude/service.test.ts",
       "title": "maps captured mobile fast/priority and reasoning envelopes for direct Opus",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/claude/service.test.ts",
+      "title": "omits SDK effort when thread/start has no explicit effort",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
@@ -2269,6 +2311,12 @@
     },
     {
       "path": "tests/claude/session/runtime.test.ts",
+      "title": "yields to the event loop between buffered SDK messages",
+      "classification": "architecture-invariant",
+      "rationale": "Freezes bounded mailbox, single-owner session routing, ordering, backpressure, and shutdown invariants required by the lifecycle rewrite."
+    },
+    {
+      "path": "tests/claude/session/runtime.test.ts",
       "title": "preserves bounded stderr and classifies an output-free early exit as retryable",
       "classification": "architecture-invariant",
       "rationale": "Freezes bounded mailbox, single-owner session routing, ordering, backpressure, and shutdown invariants required by the lifecycle rewrite."
@@ -2528,6 +2576,12 @@
     {
       "path": "tests/claude/session/session.test.ts",
       "title": "owns usage, exact terminal state, and visible error ordering",
+      "classification": "architecture-invariant",
+      "rationale": "Freezes bounded mailbox, single-owner session routing, ordering, backpressure, and shutdown invariants required by the lifecycle rewrite."
+    },
+    {
+      "path": "tests/claude/session/session.test.ts",
+      "title": "accounts cumulative provider cost as a per-runtime delta",
       "classification": "architecture-invariant",
       "rationale": "Freezes bounded mailbox, single-owner session routing, ordering, backpressure, and shutdown invariants required by the lifecycle rewrite."
     },
@@ -3475,6 +3529,12 @@
     },
     {
       "path": "tests/gateway/providerRateLimits.test.ts",
+      "title": "persists a completed title before clearing its worker state without blocking delivery",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/gateway/providerRateLimits.test.ts",
       "title": "returns the provider-owned title without fabricating a rename event",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
@@ -3668,6 +3728,18 @@
     {
       "path": "tests/store/sqliteStore.test.ts",
       "title": "backfills Thread.model and Thread.reasoningEffort from the record when migration 11 runs",
+      "classification": "old-implementation-detail",
+      "rationale": "Freezes the current broad-record/SQLite implementation; retain as migration evidence, not reducer parity."
+    },
+    {
+      "path": "tests/store/sqliteStore.test.ts",
+      "title": "persists gateway-owned section orders",
+      "classification": "old-implementation-detail",
+      "rationale": "Freezes the current broad-record/SQLite implementation; retain as migration evidence, not reducer parity."
+    },
+    {
+      "path": "tests/store/sqliteStore.test.ts",
+      "title": "relabels appServer Claude threads as vscode when migration 12 runs",
       "classification": "old-implementation-detail",
       "rationale": "Freezes the current broad-record/SQLite implementation; retain as migration evidence, not reducer parity."
     },

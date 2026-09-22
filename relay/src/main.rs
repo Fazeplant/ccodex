@@ -346,6 +346,12 @@ async fn run(args: Args) -> Result<()> {
                         }
                         info!(%connection_id, "remote client disconnected from hybrid gateway");
                     }
+                    // Only the managed-daemon unix socket emits this; the relay runs the
+                    // remote-control transport, so treat it like the shutdown signal.
+                    TransportEvent::DaemonShutdown => {
+                        info!("transport requested daemon shutdown");
+                        break;
+                    }
                 }
             }
         }
