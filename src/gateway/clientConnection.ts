@@ -243,7 +243,8 @@ export function attachClientConnection(
     sendJson({ id, result });
   };
   // Stock sends these before the response, on every qualifying call.
-  const deprecationNotice = (summary: string) => sendJson({ method: "deprecationNotice", params: { summary, details: null } });
+  const deprecationNotice = (summary: string, details: string | null = null) =>
+    sendJson({ method: "deprecationNotice", params: { summary, details } });
   const rollbackDeprecated = () => {
     if (clientName !== "codex-tui") deprecationNotice("thread/rollback is deprecated and will be removed soon");
   };
@@ -1488,7 +1489,14 @@ export function attachClientConnection(
             return;
           }
           if (message.method === "review/start") {
-            const prepared = await claude.prepareReview((message.params ?? {}) as ReviewStartParams);
+            const reviewParams = (message.params ?? {}) as ReviewStartParams;
+            if (reviewParams.delivery === "detached") {
+              deprecationNotice(
+                "review/start with delivery \"detached\" is deprecated and will be removed in a future release.",
+                "Use thread/start followed by review/start with delivery \"inline\" for a separate review thread, or thread/fork followed by turn/start with your own review instructions.",
+              );
+            }
+            const prepared = await claude.prepareReview(reviewParams);
             if (prepared.forkedThread) {
               subscribeClaude(prepared.forkedThread.id);
               await claude.announceThread(prepared.forkedThread);

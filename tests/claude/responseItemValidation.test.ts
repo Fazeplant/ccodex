@@ -78,3 +78,12 @@ describe("pinned ResponseItem validation", () => {
     }])).not.toThrow();
   });
 });
+
+describe("client-authored configuration updates", () => {
+  it("rejects configuration_update items like stock's inject and resume guards", () => {
+    expect(() => validateResponseItems([
+      { type: "message", role: "user", content: [] },
+      { type: "configuration_update", reasoning: { effort: "high" } },
+    ])).toThrow("items[1] configuration_update items cannot be supplied by clients");
+  });
+});

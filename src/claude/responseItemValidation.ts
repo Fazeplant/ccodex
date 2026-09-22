@@ -36,6 +36,10 @@ function hasRemoteImage(item: Record<string, unknown>): boolean {
 export function validateResponseItems(items: JsonValue[]): void {
   if (items.length === 0) throw invalidRequest("items must not be empty");
   for (const [index, item] of items.entries()) {
+    // Stock refuses client-authored configuration updates on inject and resume alike.
+    if (record(item) && item.type === "configuration_update") {
+      throw invalidRequest(`items[${index}] configuration_update items cannot be supplied by clients`);
+    }
     if (record(item) && typeof item.type === "string" && !knownTypes.has(item.type)) continue;
     const parsed = responseItem.safeParse(normalized(item));
     if (!parsed.success) {

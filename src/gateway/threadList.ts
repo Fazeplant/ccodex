@@ -155,6 +155,7 @@ export class ThreadCatalog {
   }
 
   public async list(params: ThreadListParams): Promise<ThreadListResponse> {
+    if (params.originators?.length) throw invalidParams("originator filtering is not supported by the local app-server");
     const key = threadKey(params);
     const threads = await this.projected(params);
     if (key !== "sectionRank") return this.paginate("thread", threads, (thread) => thread, params, threadQuery(params), key);
