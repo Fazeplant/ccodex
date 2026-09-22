@@ -227,7 +227,7 @@ export type GoalSessionCommand =
   | { readonly kind: "usage"; readonly turnId: string; readonly eventId: string; readonly tokenDelta: number }
   | { readonly kind: "toolGet" }
   | { readonly kind: "toolCreate"; readonly objective: string; readonly tokenBudget?: number }
-  | { readonly kind: "toolUpdate"; readonly status: "complete" | "blocked" }
+  | { readonly kind: "toolUpdate"; readonly status: "complete" | "blocked" | "paused" }
   | { readonly kind: "detach"; readonly checkpoint: string }
   | { readonly kind: "runtimeReady"; readonly runtimeGeneration: number }
   | { readonly kind: "recoverRestart"; readonly turnId: string }

@@ -50,3 +50,32 @@ describe("goal execution breaker", () => {
     expect(published).toEqual(["thread/goal/updated:blocked"]);
   });
 });
+
+const message = (id: string, text: string, phase: "commentary" | "final_answer" = "final_answer") => ({
+  type: "agentMessage", id, text, phase, memoryCitation: null, delivery: null, questions: null,
+} as unknown as Turn["items"][number]);
+
+describe("goal empty-response breaker", () => {
+  it("blocks the goal after three automatic continuations that answer with nothing", () => {
+    const { context, published, status } = harness();
+    const state = newGoalState();
+    const run = (id: string, items: Turn["items"], automatic = true) => {
+      if (automatic) state.operation = { id: `op-${id}`, kind: "continue", goalId: "g1", generation: 1 };
+      bindGoalTurn(state, context, id);
+      finishGoalTurn(state, context, turn(id, items));
+    };
+    run("1", [message("m1", "")]);
+    run("2", [message("m2", "")]);
+    run("3", [message("m3", "  "), message("m3b", "thinking aloud", "commentary")]); // visible text is activity
+    run("4", [message("m4", "")]);
+    run("5", [message("m5", "")], false); // user-initiated turns never count and reset
+    run("6", [message("m6", "")]);
+    run("7", [message("m7", ""), command("c1", "completed")]); // tool activity resets
+    run("8", [message("m8", "")]);
+    run("9", [message("m9", "")]);
+    expect(status()).toBe("active");
+    run("10", [message("m10", "")]);
+    expect(status()).toBe("blocked");
+    expect(published).toEqual(["thread/goal/updated:blocked"]);
+  });
+});

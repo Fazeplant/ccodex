@@ -17,7 +17,8 @@ If the user resumes a goal that was previously marked \`blocked\`, treat the res
 Once the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; set status to \`blocked\`.
 Do not use \`blocked\` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
 Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.
-You cannot use this tool to pause, resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.
+Set status to \`paused\` only at the user's explicit request to pause this goal, never on your own initiative. Ask if unclear; a later resume revokes that request. Report the returned status and stop goal work. Budget limits take precedence over pausing.
+You cannot use this tool to resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.
 When marking a budgeted goal achieved with status \`complete\`, report the final token usage from the tool result to the user.`;
 
 export const GOAL_MCP_TOOL_NAMES = [
@@ -48,7 +49,7 @@ Budget:
 
 Adjust the current turn to pursue the updated objective. Avoid continuing work that only served the previous objective unless it also helps the updated objective.
 
-Do not call update_goal unless the updated goal is actually complete.`;
+Do not call update_goal unless the updated goal is actually complete or the user explicitly requests a pause.`;
 
 export const BUDGET_LIMIT_TEMPLATE = `The active thread goal has reached its token budget.
 
@@ -65,7 +66,7 @@ Budget:
 
 The system has marked the goal as budget_limited, so do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step.
 
-Do not call update_goal unless the goal is actually complete.`;
+Do not call update_goal unless the goal is actually complete or the user explicitly requests a pause; budget_limited takes precedence over paused.`;
 
 export function publicGoal(goal: InternalGoal): ThreadGoal {
   const { goalId: _goalId, continuationDeferred: _continuationDeferred, ...value } = goal;
@@ -137,7 +138,7 @@ export function createGoalMcpServer(
           kind: "toolCreate", objective, ...(token_budget === undefined ? {} : { tokenBudget: token_budget }),
         }))),
       tool("update_goal", UPDATE_GOAL_DESCRIPTION, {
-        status: z.enum(["complete", "blocked"]).describe("Required. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit."),
+        status: z.enum(["complete", "blocked", "paused"]).describe("Required. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit."),
       }, async ({ status }) => json(await submit({ kind: "toolUpdate", status }))),
     ],
   });

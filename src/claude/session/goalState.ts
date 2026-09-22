@@ -19,6 +19,8 @@ import type { ClaudeSessionRepository } from "./repository.js";
 interface GoalTurn {
   turnId: string;
   goalId: string;
+  /** Started by the goal's own continuation rather than by the user. */
+  automatic: boolean;
   accountingId: string;
   startedAtMs: number;
   flushSequence: number;
@@ -35,6 +37,8 @@ export interface GoalState {
   turn?: GoalTurn;
   /** Stock's execution breaker: consecutive goal turns whose only tool activity was failed commands. */
   execFailures?: { goalId: string; count: number };
+  /** Stock's empty-response breaker: consecutive automatic continuations that produced nothing. */
+  emptyTurns?: { goalId: string; count: number };
   operation?: GoalOperation;
   pendingTurns: number;
   pendingNotifications: number;
@@ -77,6 +81,7 @@ function clear(state: GoalState): void {
 
 const TOOL_ITEMS = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall"]);
 const EXEC_FAILURE_THRESHOLD = 3;
+const EMPTY_RESPONSE_THRESHOLD = 3;
 
 /** Mirrors stock's failed-`exec` breaker: a successful tool resets, a turn with failed commands and no success counts. */
 function accountExecFailures(state: GoalState, context: GoalContext, goal: InternalGoal, turn: Turn): void {
@@ -87,6 +92,20 @@ function accountExecFailures(state: GoalState, context: GoalContext, goal: Inter
   if (count < EXEC_FAILURE_THRESHOLD) { state.execFailures = { goalId: goal.goalId, count }; return; }
   delete state.execFailures;
   updated(context, turn.id, context.repository.setGoal(context.threadId, { status: "blocked" }), `exec-unavailable:${turn.id}`);
+}
+
+/** Mirrors stock's empty-response breaker: an automatic continuation ending in an empty final message with no activity counts; anything else resets. */
+function accountEmptyResponses(state: GoalState, context: GoalContext, goal: InternalGoal, turn: Turn, automatic: boolean): void {
+  const hasActivity = turn.items.some((item) => item.type === "agentMessage"
+    ? item.text.trim().length > 0 || item.questions !== null
+    : item.type === "reasoning" ? item.summary.some((text) => text.trim().length > 0) : true);
+  const emptyFinal = turn.items.some((item) =>
+    item.type === "agentMessage" && item.text.trim().length === 0 && item.phase !== "commentary");
+  if (!automatic || !emptyFinal || hasActivity) { delete state.emptyTurns; return; }
+  const count = (state.emptyTurns?.goalId === goal.goalId ? state.emptyTurns.count : 0) + 1;
+  if (count < EMPTY_RESPONSE_THRESHOLD) { state.emptyTurns = { goalId: goal.goalId, count }; return; }
+  delete state.emptyTurns;
+  updated(context, turn.id, context.repository.setGoal(context.threadId, { status: "blocked" }), `empty-responses:${turn.id}`);
 }
 
 export function invalidateGoalEffect(state: GoalState): void {
@@ -156,6 +175,7 @@ export function bindGoalTurn(state: GoalState, context: GoalContext, turnId: str
   state.turn = {
     turnId,
     goalId: goal.goalId,
+    automatic: state.operation?.kind === "continue",
     accountingId: uuidv7(),
     startedAtMs: performance.now(),
     flushSequence: 0,
@@ -183,6 +203,9 @@ export function finishGoalTurn(state: GoalState, context: GoalContext, turn: Tur
     return;
   }
   accountExecFailures(state, context, goal, turn);
+  if (context.repository.goal(context.threadId)?.status === "active") {
+    accountEmptyResponses(state, context, goal, turn, active.automatic);
+  }
 }
 
 export function goalEffects(state: GoalState, context: GoalContext): GoalEffect[] {
