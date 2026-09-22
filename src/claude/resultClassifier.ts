@@ -25,7 +25,8 @@ function providerErrorInfo(providerError: string | undefined, message: string | 
   // account_on_hold is an account-state suspension requiring user action at
   // the provider, so it renders as an authorization problem, not a limit.
   if (providerError === "authentication_failed" || providerError === "oauth_org_not_allowed"
-    || providerError === "account_on_hold") return "unauthorized";
+    || providerError === "account_on_hold" || providerError === "verification_required"
+    || providerError === "cloud_credential_error") return "unauthorized";
   if (providerError === "billing_error" || providerError === "rate_limit") return "usageLimitExceeded";
   if (providerError === "overloaded") return "serverOverloaded";
   if (providerError === "server_error") return "internalServerError";

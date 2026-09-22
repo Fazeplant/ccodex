@@ -44,6 +44,8 @@ describe("Claude result classification", () => {
 
   it.each([
     ["authentication_failed", "unauthorized"],
+    ["verification_required", "unauthorized"],
+    ["cloud_credential_error", "unauthorized"],
     ["rate_limit", "usageLimitExceeded"],
     ["model_not_found", "badRequest"],
     ["server_error", "internalServerError"],
