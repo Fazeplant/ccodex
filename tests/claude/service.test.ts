@@ -440,6 +440,7 @@ describe("ClaudeService", () => {
     });
     expect(fake.inputs).toHaveLength(1);
     expect(fake.prompts[0]?.origin).toEqual({ kind: "human" });
+    expect(fake.prompts[0]?.client_composed).toBeUndefined();
     await service.close();
   });
 

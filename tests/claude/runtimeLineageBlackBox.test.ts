@@ -839,10 +839,12 @@ describe("Claude runtime lineage through public service and Query contracts", ()
       }],
     });
     expect(first.prompts).toHaveLength(1);
+    expect(first.prompts[0]?.client_composed).toBe(true);
 
     await service.updateThreadSettings({ threadId: started.thread.id, effort: "high" });
     await waitFor(() => replacement.prompts.length === 1, "pre-ready prelude replay");
     expect(JSON.stringify(replacement.prompts[0])).toContain("pre-ready ephemeral prelude");
+    expect(replacement.prompts[0]?.client_composed).toBe(true);
     expect(factoryCalls).toBe(2);
     await service.close();
   });

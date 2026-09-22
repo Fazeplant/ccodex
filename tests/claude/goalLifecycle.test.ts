@@ -371,6 +371,7 @@ describe("Claude goal lifecycle", () => {
     await waitFor(() => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed", "assistant-budget wrap");
     expect(fake.prompts).toHaveLength(2);
     expect(JSON.stringify(fake.prompts[1])).toContain("has reached its token budget");
+    expect(fake.prompts[1]?.client_composed).toBe(true);
     expect((await service.getGoal(started.thread.id)).goal).toMatchObject({ status: "budgetLimited", tokensUsed: 14 });
     await service.close();
   });

@@ -1418,6 +1418,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       session_id: "",
       parent_tool_use_id: null,
       uuid: messageUuid,
+      client_composed: true,
       message: { role: "user", content: [{ type: "text", text: prompt }] },
     } as unknown as SDKUserMessage;
     return Boolean(await this.sendPreparedRuntimeInput(owner, messageUuid, message, () =>
@@ -1460,7 +1461,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
       const counted = await this.sendPreparedRuntimeInput(
         owner,
         messageUuid,
-        { ...message, shouldQuery: false },
+        { ...message, shouldQuery: false, client_composed: true },
         () => this.submitRuntimeEffect<RuntimeInputAction | undefined>({
           type: "prepareRuntimeInput",
           runtimeGeneration: owner.generation,
