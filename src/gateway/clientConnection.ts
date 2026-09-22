@@ -1588,6 +1588,11 @@ export function attachClientConnection(
             sendResult(message.id, await claude.steerTurn((message.params ?? {}) as TurnSteerParams));
             return;
           }
+          // Desktop polls attachments for every open thread; Claude threads have none.
+          if (message.method === "thread/attachment/list") {
+            sendResult(message.id, { data: [], nextCursor: null });
+            return;
+          }
           throw new RpcError(-32601, `Method '${message.method}' is not implemented for Claude threads yet.`);
         }
         if (params.threadId && (message.method === "thread/read" || message.method === "thread/resume")) {
