@@ -3,6 +3,7 @@ import type {
   CanUseTool,
   ElicitationRequest,
   ElicitationResult,
+  McpServerProvenance,
   PermissionUpdate,
   Query,
   SDKMessage,
@@ -62,6 +63,8 @@ export class FakeClaudeQuery {
   public permissionMatchedAskRule: Parameters<CanUseTool>[2]["matchedAskRule"];
   public permissionDecisionReason: string | undefined;
   public permissionAgentID: string | undefined;
+  public permissionMcpServer: McpServerProvenance | undefined;
+  public skipPreToolHook = false;
   public readonly beforePermissionMessages: SDKMessage[] = [];
   public noQueryAcknowledgementBatchSize = 1;
   private permissionToolSequence = 0;
@@ -79,6 +82,9 @@ export class FakeClaudeQuery {
     private readonly beforeResultPause?: { afterIndex: number; wait: Promise<void> },
     private readonly noQueryAcknowledgementWait?: Promise<void>,
   ) {
+    this.permissionMcpServer = toolRequest?.name.startsWith("mcp__ccodex_goal__")
+      ? { name: "ccodex_goal", source: "sdk" }
+      : undefined;
     this.permissionSuggestions = toolRequest
       ? [{
           type: "addRules",
@@ -211,7 +217,7 @@ export class FakeClaudeQuery {
       if (this.beforePermissionMessages.length > 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
-      const preToolHook = input.options.hooks?.PreToolUse?.[0]?.hooks[0];
+      const preToolHook = this.skipPreToolHook ? undefined : input.options.hooks?.PreToolUse?.[0]?.hooks[0];
       const permissionToolId = this.toolRequest
         ? `tool-permission-${++this.permissionToolSequence}`
         : undefined;
@@ -226,6 +232,7 @@ export class FakeClaudeQuery {
           tool_name: this.toolRequest.name,
           tool_input: this.toolRequest.input,
           tool_use_id: permissionToolId!,
+          ...(this.permissionMcpServer ? { mcp_server: this.permissionMcpServer } : {}),
           ...(this.permissionAgentID ? { agent_id: this.permissionAgentID } : {}),
         }, permissionToolId, { signal: new AbortController().signal });
         this.preToolHookResults.push(result);
@@ -265,6 +272,7 @@ export class FakeClaudeQuery {
             ...(this.permissionMatchedAskRule ? { matchedAskRule: this.permissionMatchedAskRule } : {}),
             ...(this.permissionDecisionReason ? { decisionReason: this.permissionDecisionReason } : {}),
             ...(this.permissionAgentID ? { agentID: this.permissionAgentID } : {}),
+            ...(this.permissionMcpServer ? { mcpServer: this.permissionMcpServer } : {}),
             toolUseID: permissionToolId!,
             requestId,
           },

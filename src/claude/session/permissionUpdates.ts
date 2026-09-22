@@ -3,10 +3,10 @@ import type { CanUseTool, PermissionUpdate } from "@anthropic-ai/claude-agent-sd
 type PermissionOptions = Parameters<CanUseTool>[2];
 
 export function safeSessionPermissionUpdates(
-  options: Pick<PermissionOptions, "matchedAskRule" | "suggestions">,
+  options: Pick<PermissionOptions, "matchedAskRule" | "suggestions" | "suppressAlwaysAllowRule">,
 ): PermissionUpdate[] | undefined {
   const suggestions = options.suggestions;
-  if (!suggestions?.length || options.matchedAskRule) return undefined;
+  if (!suggestions?.length || options.matchedAskRule || options.suppressAlwaysAllowRule) return undefined;
   if (!suggestions.every((update) => {
     if (update.destination !== "session") return false;
     if (update.type === "addDirectories") return update.directories.length > 0;

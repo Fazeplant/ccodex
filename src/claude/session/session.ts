@@ -2675,7 +2675,7 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     const root = context.inspection;
     if (!root.activeTurnId) return { behavior: "deny", message: "No active Claude turn." };
     const settings = context.settings;
-    if (name.startsWith("mcp__ccodex_goal__")) {
+    if (name.startsWith("mcp__ccodex_goal__") && options.mcpServer?.source === "sdk") {
       return { behavior: "allow", updatedInput: input };
     }
     if (name === "AskUserQuestion") {
@@ -2973,7 +2973,9 @@ export class ClaudeSession implements ClaudeSessionHandle<ClaudeSessionCommand> 
     if (!inspection.activeTurnId) {
       return { continue: true };
     }
-    if (input.tool_name.startsWith("mcp__ccodex_goal__")) return allowProviderTool();
+    if (input.tool_name.startsWith("mcp__ccodex_goal__") && input.mcp_server?.source === "sdk") {
+      return allowProviderTool();
+    }
     const toolInput = input.tool_input && typeof input.tool_input === "object"
       ? input.tool_input as Record<string, unknown>
       : {};

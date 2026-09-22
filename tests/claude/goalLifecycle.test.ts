@@ -703,6 +703,57 @@ describe("Claude goal lifecycle", () => {
     await service.close();
   });
 
+  it("auto-allows genuine SDK goal provenance in the canUseTool path", async () => {
+    const root = directory();
+    const fake = new FakeClaudeQuery({ name: "mcp__ccodex_goal__get_goal", input: {} });
+    fake.skipPreToolHook = true;
+    const service = new ClaudeService(
+      config(root), new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(join(root, "state.sqlite")), fake.factory,
+    );
+    const started = await service.startThread({
+      model: "claude:haiku", cwd: root, approvalPolicy: "never", sandbox: "read-only",
+    });
+    const turn = await service.prepareTurn({
+      threadId: started.thread.id, input: [{ type: "text", text: "inspect goal", text_elements: [] }],
+    });
+    turn.announce();
+    turn.start();
+    await waitFor(() => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed", "SDK goal permission");
+
+    expect(fake.providerHookAllowedTools).toEqual([]);
+    expect(fake.permissionResults).toEqual([{ behavior: "allow", updatedInput: {} }]);
+    await service.close();
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["user", { name: "ccodex_goal", source: "user" }],
+    ["project", { name: "ccodex_goal", source: "project" }],
+  ] as const)("does not trust %s goal-tool provenance", async (_label, provenance) => {
+    const root = directory();
+    const fake = new FakeClaudeQuery({ name: "mcp__ccodex_goal__get_goal", input: {} });
+    fake.permissionMcpServer = provenance;
+    const service = new ClaudeService(
+      config(root), new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(join(root, "state.sqlite")), fake.factory,
+    );
+    const started = await service.startThread({
+      model: "claude:haiku", cwd: root, approvalPolicy: "never", sandbox: "read-only",
+    });
+    const turn = await service.prepareTurn({
+      threadId: started.thread.id, input: [{ type: "text", text: "inspect goal", text_elements: [] }],
+    });
+    turn.announce();
+    turn.start();
+    await waitFor(() => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed", "untrusted goal permission");
+
+    expect(fake.providerHookAllowedTools).toEqual([]);
+    expect(fake.permissionResults).toEqual([{
+      behavior: "deny",
+      message: "Tool 'mcp__ccodex_goal__get_goal' requires permission, but approvalPolicy is never.",
+    }]);
+    await service.close();
+  });
+
   it.each([
     { name: "dontAsk", approvalPolicy: "never", sandbox: "read-only", approvalsReviewer: "user", permissionMode: "dontAsk" },
     { name: "bypass", approvalPolicy: "never", sandbox: "danger-full-access", approvalsReviewer: "user", permissionMode: "bypassPermissions" },

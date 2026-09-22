@@ -42,4 +42,11 @@ describe("safeSessionPermissionUpdates", () => {
       matchedAskRule: { source: "projectSettings", toolName: "Bash", ruleContent: "printf ok" },
     })).toBeUndefined();
   });
+
+  it("rejects session persistence when Claude suppresses the always-allow rule", () => {
+    expect(safeSessionPermissionUpdates({
+      suggestions: [rule()],
+      suppressAlwaysAllowRule: true,
+    })).toBeUndefined();
+  });
 });
