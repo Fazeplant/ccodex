@@ -6684,6 +6684,32 @@ You are in a side conversation, not the main thread.`,
     await service.close();
   });
 
+  it("omits SDK effort when thread/start has no explicit effort", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-default-effort-"));
+    directories.push(directory);
+    const fake = new FakeClaudeQuery();
+    const service = new ClaudeService(
+      config(directory), new SubscriptionHub(), new Logger("error"),
+      new SqliteHybridStore(join(directory, "state.sqlite")), fake.factory,
+    );
+    const started = await service.startThread({ model: "claude:opus", cwd: directory });
+    const prepared = await service.prepareTurn({
+      threadId: started.thread.id,
+      input: [{ type: "text", text: "use the provider default", text_elements: [] }],
+    });
+
+    expect(fake.inputs[0]?.options).not.toHaveProperty("effort");
+    prepared.announce();
+    prepared.start();
+    await new Promise<void>((resolve) => {
+      const poll = () => service.readThread(started.thread.id, true).thread.turns[0]?.status === "completed"
+        ? resolve()
+        : setTimeout(poll, 5);
+      poll();
+    });
+    await service.close();
+  });
+
   it("keeps captured App collaboration effort when turn/start top-level effort is null", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-collaboration-effort-"));
     directories.push(directory);

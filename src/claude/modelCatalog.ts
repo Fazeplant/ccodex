@@ -14,18 +14,18 @@ const effortDescriptions: Record<string, string> = {
   max: "Maximum available reasoning effort.",
 };
 
-const requiredControls = ["initializationResult", "supportedModels", "reinitialize", "interrupt", "setModel", "close"] as const;
+interface ClaudeCatalogQuery extends Query {
+  getSettings(): Promise<{ readonly applied: { readonly effort: string | null } }>;
+}
 
-export function assertClaudeControlSurface(value: unknown): asserts value is Query {
+const requiredControls = [
+  "initializationResult", "supportedModels", "reinitialize", "interrupt", "setModel", "getSettings", "close",
+] as const;
+
+export function assertClaudeControlSurface(value: unknown): asserts value is ClaudeCatalogQuery {
   if (!value || typeof value !== "object") throw new Error("Claude SDK query did not return a control object.");
   const missing = requiredControls.filter((method) => typeof (value as Record<string, unknown>)[method] !== "function");
   if (missing.length > 0) throw new Error(`Claude SDK query is missing required controls: ${missing.join(", ")}.`);
-}
-
-function defaultEffort(levels: readonly string[]): string {
-  if (levels.includes("high")) return "high";
-  if (levels.includes("medium")) return "medium";
-  return levels[0] ?? "medium";
 }
 
 export function claudeModelDisplayName(model: ModelInfo): string {
@@ -42,7 +42,7 @@ export function claudeModelDisplayName(model: ModelInfo): string {
   return `${displayName} · ${label}`;
 }
 
-export function mapClaudeModel(model: ModelInfo, prefix: string): Model {
+export function mapClaudeModel(model: ModelInfo, prefix: string, appliedEffort: string | null): Model {
   const efforts = model.supportsEffort ? (model.supportedEffortLevels ?? []) : [];
   const serviceTiers = model.supportsFastMode
     ? [
@@ -66,7 +66,8 @@ export function mapClaudeModel(model: ModelInfo, prefix: string): Model {
       reasoningEffort,
       description: effortDescriptions[reasoningEffort] ?? `${reasoningEffort} reasoning effort.`,
     })),
-    defaultReasoningEffort: defaultEffort(efforts),
+    // The Codex model schema requires a value even when this model has no effort setting.
+    defaultReasoningEffort: appliedEffort ?? "medium",
     inputModalities: ["text", "image"],
     supportsPersonality: true,
     additionalSpeedTiers: [],
@@ -76,9 +77,13 @@ export function mapClaudeModel(model: ModelInfo, prefix: string): Model {
   };
 }
 
-export function mapClaudeModels(models: readonly ModelInfo[], prefix: string): Model[] {
+export function mapClaudeModels(
+  models: readonly ModelInfo[],
+  prefix: string,
+  appliedEfforts: ReadonlyMap<string, string | null>,
+): Model[] {
   return models.filter((model) => model.value !== "default")
-    .map((model) => mapClaudeModel(model, prefix));
+    .map((model) => mapClaudeModel(model, prefix, appliedEfforts.get(model.value)!));
 }
 
 export function claudeDefaultModelValue(models: readonly ModelInfo[]): string | undefined {
@@ -116,6 +121,7 @@ export class ClaudeModelCatalog {
     private readonly config: HybridConfig,
     private readonly logger: Logger,
     private readonly metrics: MetricsRegistry = new MetricsRegistry(),
+    private readonly queryFactory: typeof query = query,
   ) {}
 
   public async list(): Promise<Model[]> {
@@ -149,7 +155,7 @@ export class ClaudeModelCatalog {
 
   private async load(): Promise<Model[]> {
     const abort = new AbortController();
-    const sdkQuery = query({
+    const sdkQuery = this.queryFactory({
       prompt: idlePrompt(abort.signal),
       options: {
         pathToClaudeCodeExecutable: this.config.claudeBinary,
@@ -170,9 +176,15 @@ export class ClaudeModelCatalog {
           setTimeout(() => reject(new Error("Claude model probe timed out.")), 10_000),
         ),
       ]);
+      const appliedEfforts = new Map<string, string | null>();
+      for (const model of models) {
+        if (model.value === "default") continue;
+        await sdkQuery.setModel(model.value);
+        appliedEfforts.set(model.value, (await sdkQuery.getSettings()).applied.effort);
+      }
       await sdkQuery.reinitialize();
       await sdkQuery.interrupt();
-      const mapped = mapClaudeModels(models, this.config.modelPrefix);
+      const mapped = mapClaudeModels(models, this.config.modelPrefix, appliedEfforts);
       this.pickerIds = claudeModelPickerIds(models, this.config.modelPrefix);
       this.defaultValue = claudeDefaultModelValue(models);
       this.cache = {

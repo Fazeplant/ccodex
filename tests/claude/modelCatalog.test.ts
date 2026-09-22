@@ -1,16 +1,38 @@
+import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it } from "vitest";
 import {
   assertClaudeControlSurface,
+  ClaudeModelCatalog,
   claudeModelPickerIds,
   claudeModelDisplayName,
   mapClaudeModel,
   mapClaudeModels,
 } from "../../src/claude/modelCatalog.js";
 import { claudeModelLabel } from "../../src/claude/modelSelection.js";
+import type { HybridConfig } from "../../src/config/config.js";
+import { Logger } from "../../src/observability/logger.js";
+
+function config(): HybridConfig {
+  return {
+    realCodex: "/bin/false",
+    claudeBinary: "/bin/false",
+    dataDir: "/tmp",
+    publicSocket: "/tmp/ccodex-model-catalog.sock",
+    modelPrefix: "claude:",
+    idleTimeoutSeconds: 900,
+    modelCacheSeconds: 300,
+    logLevel: "error",
+    logPrompts: false,
+    debugCapture: false,
+    debugLogMaxBytes: 1_048_576,
+  };
+}
 
 describe("mapClaudeModel", () => {
   it("rejects an SDK query missing required lifecycle controls", () => {
-    expect(() => assertClaudeControlSurface({ supportedModels() {} })).toThrow("missing required controls");
+    expect(() => assertClaudeControlSurface({
+      initializationResult() {}, supportedModels() {}, reinitialize() {}, interrupt() {}, setModel() {}, close() {},
+    })).toThrow("getSettings");
   });
 
   it("namespaces Claude models and maps effort and fast-mode metadata", () => {
@@ -22,7 +44,7 @@ describe("mapClaudeModel", () => {
       supportsEffort: true,
       supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
       supportsFastMode: true,
-    }, "claude:")).toMatchObject({
+    }, "claude:", "high")).toMatchObject({
       id: "claude:claude-opus-4-8",
       model: "claude:claude-opus-4-8",
       displayName: "Opus 4.8",
@@ -40,7 +62,7 @@ describe("mapClaudeModel", () => {
       resolvedModel: "claude-fable-5",
       displayName: "Fable",
       description: "Largest Claude model.",
-    }, "claude:")).toMatchObject({
+    }, "claude:", "high")).toMatchObject({
       id: "claude:claude-fable-5",
       displayName: "Fable 5",
     });
@@ -54,7 +76,7 @@ describe("mapClaudeModel", () => {
       description: "Fable 5.1 · Most capable for your hardest and longest-running tasks",
       supportsEffort: true,
       supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-    }, "claude:")).toMatchObject({
+    }, "claude:", "high")).toMatchObject({
       id: "claude:claude-fable-5-1",
       model: "claude:claude-fable-5-1",
       displayName: "Fable 5.1",
@@ -79,7 +101,7 @@ describe("mapClaudeModel", () => {
       resolvedModel: "claude-opus-5[1m]",
       displayName: "Opus (1M context)",
       description: "Largest Claude context.",
-    }], "claude:");
+    }], "claude:", new Map([["opus[1m]", "high"]]));
     expect(models).toHaveLength(1);
     expect(models[0]).toMatchObject({
       id: "claude:claude-opus-5",
@@ -131,9 +153,47 @@ describe("mapClaudeModel", () => {
       value: "haiku",
       displayName: "Haiku",
       description: "Fast Claude model.",
-    }, "claude:");
+    }, "claude:", null);
     expect(model.supportedReasoningEfforts).toEqual([]);
     expect(model.serviceTiers).toEqual([]);
     expect(model.defaultServiceTier).toBeNull();
+  });
+
+  it("uses the effort Claude applies after selecting each model", async () => {
+    const controls: string[] = [];
+    let selected = "";
+    const fakeQuery: typeof import("@anthropic-ai/claude-agent-sdk").query = () => ({
+      initializationResult: async () => ({}),
+      supportedModels: async () => [{
+        value: "default", resolvedModel: "claude-opus-5-5", displayName: "Default", description: "Default model.",
+      }, {
+        value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus",
+        description: "Opus 5.5 · Best for everyday, complex tasks", supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"], supportsFastMode: true,
+      }],
+      setModel: async (model: string) => { selected = model; controls.push(`set:${model}`); },
+      getSettings: async () => {
+        controls.push(`settings:${selected}`);
+        return { applied: { effort: "medium" } };
+      },
+      reinitialize: async () => { controls.push("reinitialize"); },
+      interrupt: async () => { controls.push("interrupt"); },
+      close: () => undefined,
+    }) as unknown as Query;
+    const catalog = new ClaudeModelCatalog(config(), new Logger("error"), undefined, fakeQuery);
+
+    expect(await catalog.list()).toEqual([
+      expect.objectContaining({
+        id: "claude:opus",
+        displayName: "Opus 5.5",
+        defaultReasoningEffort: "medium",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" },
+          { reasoningEffort: "xhigh" }, { reasoningEffort: "max" },
+        ].map((effort) => expect.objectContaining(effort)),
+        serviceTiers: [{ id: "default" }, { id: "fast" }].map((tier) => expect.objectContaining(tier)),
+      }),
+    ]);
+    expect(controls).toEqual(["set:opus", "settings:opus", "reinitialize", "interrupt"]);
   });
 });
