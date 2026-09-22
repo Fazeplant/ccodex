@@ -1500,7 +1500,7 @@ Keep this summary.
     const thread = {
       id: "crashed-thread", extra: null, sessionId: "codex-session", forkedFromId: null, parentThreadId: null,
       canAcceptDirectInput: true,
-      preview: "crash", ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy" as const, modelProvider: "claude", model: null, reasoningEffort: null,
+      preview: "crash", ephemeral: false, section: null, sectionEnteredAt: null, environments: null, originator: null, daybreakEnabled: null, projectId: null, historyMode: "legacy" as const, modelProvider: "claude", model: null, reasoningEffort: null,
       createdAt: 1, updatedAt: 1, recencyAt: 1, status: { type: "active" as const, activeFlags: [] },
       path: null, cwd: directory, cliVersion: "test", source: "appServer" as const, threadSource: null,
       agentNickname: null, agentRole: null, gitInfo: null, name: null, turns: [],
@@ -7722,7 +7722,7 @@ You are in a side conversation, not the main thread.`,
 
     const inherited = await service.forkThread({ threadId: source.thread.id });
     expect(inherited).toMatchObject({
-      runtimeWorkspaceRoots: [directory, extra], thread: { section: null, sectionEnteredAt: null, projectId: null },
+      runtimeWorkspaceRoots: [directory, extra], thread: { section: null, sectionEnteredAt: null, environments: null, originator: null, daybreakEnabled: null, projectId: null },
     });
     const replaced = await service.forkThread({
       threadId: source.thread.id, runtimeWorkspaceRoots: [],

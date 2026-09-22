@@ -7,7 +7,7 @@ import { filterSortThreads, publicListParams } from "../../src/store/threadFilte
 function thread(id: string, createdAt: number, parentThreadId: string | null = null): Thread {
   return {
     id, extra: null, sessionId: id, forkedFromId: null, parentThreadId,
-    canAcceptDirectInput: parentThreadId === null, preview: id, ephemeral: false, section: null, sectionEnteredAt: null, projectId: null,
+    canAcceptDirectInput: parentThreadId === null, preview: id, ephemeral: false, section: null, sectionEnteredAt: null, environments: null, originator: null, daybreakEnabled: null, projectId: null,
     historyMode: "legacy", modelProvider: "claude", model: null, reasoningEffort: null, createdAt, updatedAt: createdAt, recencyAt: createdAt,
     status: { type: "idle" }, path: null, cwd: "/repo", cliVersion: "test", source: "vscode",
     threadSource: null, agentNickname: null, agentRole: null, gitInfo: null, name: id, turns: [],
@@ -158,5 +158,16 @@ describe("merged thread listing", () => {
     const newer = await catalog.search({ searchTerm: " hit ", cursor: first.backwardsCursor, sortDirection: "asc" });
     expect(newer.data).toEqual([]);
     await expect(catalog.search({ searchTerm: "  " })).rejects.toThrow("thread/search requires a non-empty searchTerm");
+  });
+});
+
+describe("originator filters", () => {
+  it("rejects a non-empty originators filter like the local app-server and ignores empty ones", async () => {
+    const stock = { request: async () => ({ data: [], nextCursor: null, backwardsCursor: null }) };
+    const claude = { listThreads: () => [], sectionOrders: () => new Map(), setSectionOrder: () => undefined };
+    const catalog = new ThreadCatalog(stock as never, claude as never, new CursorCodec(Buffer.alloc(32, 9)));
+    await expect(catalog.list({ limit: 10, originators: ["codex-desktop"] }))
+      .rejects.toThrow("originator filtering is not supported by the local app-server");
+    expect((await catalog.list({ limit: 10, originators: [] })).data).toEqual([]);
   });
 });

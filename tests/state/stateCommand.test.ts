@@ -11,7 +11,7 @@ function thread(): Thread {
   return {
     id: "thread-1", extra: null, sessionId: "session-1", forkedFromId: null, parentThreadId: null,
     canAcceptDirectInput: true,
-    preview: "hello", ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, historyMode: "paginated", modelProvider: "openai", model: null, reasoningEffort: null,
+    preview: "hello", ephemeral: false, section: null, sectionEnteredAt: null, environments: null, originator: null, daybreakEnabled: null, projectId: null, historyMode: "paginated", modelProvider: "openai", model: null, reasoningEffort: null,
     createdAt: 1_700_000_000, updatedAt: 1_700_007_200, recencyAt: 1_700_007_200,
     status: { type: "idle" }, path: null, cwd: "/tmp", cliVersion: "0.144.4",
     source: "appServer", threadSource: "user", agentNickname: null, agentRole: null,

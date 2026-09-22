@@ -595,6 +595,8 @@ describe("Claude goal lifecycle", () => {
     expect(await callGoalTool(fake, "create_goal", { objective: "replacement" })).toMatchObject({
       goal: { objective: "replacement", status: "active", tokensUsed: 0 },
     });
+    expect(goalTools(fake).update_goal!.description).toContain("explicit request");
+    expect(await callGoalTool(fake, "update_goal", { status: "paused" })).toMatchObject({ goal: { status: "paused" } });
     expect(service.readThread(started.thread.id, true).thread.turns).toHaveLength(1);
     await service.close();
   });
@@ -1387,7 +1389,7 @@ describe("Claude goal lifecycle", () => {
       thread: {
         id: "thread", extra: null, sessionId: "session", forkedFromId: null, parentThreadId: null,
         canAcceptDirectInput: true,
-        preview: "", ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy", modelProvider: "claude", model: null, reasoningEffort: null, createdAt: now,
+        preview: "", ephemeral: false, section: null, sectionEnteredAt: null, environments: null, originator: null, daybreakEnabled: null, projectId: null, historyMode: "legacy", modelProvider: "claude", model: null, reasoningEffort: null, createdAt: now,
         updatedAt: now, recencyAt: now, status: { type: "idle" }, path: null, cwd: root,
         cliVersion: "test", source: "appServer", threadSource: null, agentNickname: null, agentRole: null,
         gitInfo: null, name: null, turns: [],

@@ -113,8 +113,13 @@ function recoverableDatabase(path: string): DatabaseSync {
   }
 }
 
+function parseThread(json: string): Thread {
+  // Rows written before Codex 0.155.1 predate these nullable fields.
+  return { environments: null, originator: null, daybreakEnabled: null, ...JSON.parse(json) } as Thread;
+}
+
 function parseRecord(row: ThreadRow, turns: Turn[]): ClaudeThreadRecord {
-  const thread = JSON.parse(row.thread_json) as Thread;
+  const thread = parseThread(row.thread_json);
   const runtime = row.runtime_settings_json ? JSON.parse(row.runtime_settings_json) as Record<string, unknown> : {};
   const usage = (value: unknown): ClaudeThreadRecord["tokenUsageTotal"] => {
     const stored = value && typeof value === "object" ? value as Partial<ClaudeThreadRecord["tokenUsageTotal"]> : {};
@@ -296,7 +301,7 @@ export class SqliteHybridStore implements HybridStore {
   public listThreads(params: ThreadListParams): Thread[] {
     const archived = params.archived === true ? 1 : 0;
     const rows = this.database.prepare("SELECT thread_json FROM threads WHERE archived = ?").all(archived) as unknown as Array<{ thread_json: string }>;
-    return filterSortThreads(rows.map((row) => JSON.parse(row.thread_json) as Thread), params);
+    return filterSortThreads(rows.map((row) => parseThread(row.thread_json)), params);
   }
 
   public updateThread(record: ClaudeThreadRecord): void {

@@ -116,6 +116,8 @@ describe("Claude thread admin session cutover", () => {
       threadId: started.thread.id,
       gitInfo: { branch: "main", sha: "abc123" },
     });
+    expect(() => service.updateThreadMetadata({ threadId: started.thread.id, gitInfo: null, daybreakEnabled: true }))
+      .toThrow("Daybreak is not supported");
     const second = service.setThreadName({ threadId: started.thread.id, name: "second" });
     await waitFor(() => calls.length === 2);
     calls[1]!.operation.resolve();

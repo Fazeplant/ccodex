@@ -1298,6 +1298,7 @@ export class ClaudeService {
     if (params.projectId !== undefined && params.projectId !== null && params.projectId !== "") {
       throw invalidParams("Projects are not supported for Claude threads.");
     }
+    if (params.daybreakEnabled != null) throw invalidParams("Daybreak is not supported for Claude threads.");
     return this.sessions.submit(params.threadId, {
       type: "threadAdmin",
       command: { kind: "metadata", gitInfo: params.gitInfo },
@@ -2226,6 +2227,9 @@ export class ClaudeService {
         ephemeral: params.ephemeral ?? false,
         section: null,
         sectionEnteredAt: null,
+        environments: null,
+        originator: null,
+        daybreakEnabled: null,
         projectId: null,
         historyMode: params.historyMode ?? (params.ephemeral ? "legacy" : "paginated"),
         modelProvider: "claude", model: modelPickerId, reasoningEffort,

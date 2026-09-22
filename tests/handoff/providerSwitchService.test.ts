@@ -26,7 +26,7 @@ function turn(id: string, text: string): Turn {
 function thread(id: string, provider: string, turns: Turn[] = []): Thread {
   return {
     id, extra: null, sessionId: id, forkedFromId: null, parentThreadId: null, canAcceptDirectInput: true,
-    preview: "hello", ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy", modelProvider: provider, model: null, reasoningEffort: null,
+    preview: "hello", ephemeral: false, section: null, sectionEnteredAt: null, environments: null, originator: null, daybreakEnabled: null, projectId: null, historyMode: "legacy", modelProvider: provider, model: null, reasoningEffort: null,
     createdAt: 1, updatedAt: 2, recencyAt: 2, status: { type: "idle" }, path: null,
     cwd: "/tmp/project", cliVersion: "test", source: "cli", threadSource: "user",
     agentNickname: null, agentRole: null, gitInfo: null, name: "Migrated", turns,

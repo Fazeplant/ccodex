@@ -77,12 +77,14 @@ export interface ClaudeRateLimitSnapshot {
   spendControlReached: null;
   planType: "pro" | "team" | "enterprise" | "unknown";
   rateLimitReachedType: "rate_limit_reached" | null;
+  normalModelSlug: null;
 }
 
 export interface ClaudeRateLimitsResponse {
   rateLimits: ClaudeRateLimitSnapshot;
   rateLimitsByLimitId: Record<string, ClaudeRateLimitSnapshot>;
   rateLimitResetCredits: null;
+  ordinaryUsageAllowed: null;
 }
 
 export class ClaudeUsageSchemaError extends Error {
@@ -133,13 +135,13 @@ function snapshot(
 ): ClaudeRateLimitSnapshot {
   return {
     limitId, limitName, primary, secondary, credits: null, individualLimit: null,
-    planType, rateLimitReachedType: null, spendControlReached: null,
+    planType, rateLimitReachedType: null, spendControlReached: null, normalModelSlug: null,
   };
 }
 
 export function unavailableClaudeRateLimits(): ClaudeRateLimitsResponse {
   const aggregate = snapshot("claude", "Claude (unavailable)", null, null, "unknown");
-  return { rateLimits: aggregate, rateLimitsByLimitId: { claude: aggregate }, rateLimitResetCredits: null };
+  return { rateLimits: aggregate, rateLimitsByLimitId: { claude: aggregate }, rateLimitResetCredits: null, ordinaryUsageAllowed: null };
 }
 
 export function mapClaudeUsage(raw: unknown): ClaudeRateLimitsResponse {
@@ -164,7 +166,7 @@ export function mapClaudeUsage(raw: unknown): ClaudeRateLimitsResponse {
     if (buckets[id]) throw new ClaudeUsageSchemaError(`Duplicate Claude model-scoped rate-limit id '${id}'.`);
     buckets[id] = snapshot(id, `Claude ${value.display_name} · 7 day`, window(value, 10_080), null, mappedPlan);
   }
-  return { rateLimits: aggregate, rateLimitsByLimitId: buckets, rateLimitResetCredits: null };
+  return { rateLimits: aggregate, rateLimitsByLimitId: buckets, rateLimitResetCredits: null, ordinaryUsageAllowed: null };
 }
 
 export interface ClaudeUsageSource {

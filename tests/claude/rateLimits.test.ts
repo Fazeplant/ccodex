@@ -78,37 +78,37 @@ describe("Claude rate-limit wire mapping", () => {
         limitId: "claude", limitName: "Claude",
         primary: { usedPercent: 12.5, windowDurationMins: 300, resetsAt: 1_784_250_123 },
         secondary: { usedPercent: 34, windowDurationMins: 10_080, resetsAt: 1_784_505_600 },
-        credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
+        credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null, normalModelSlug: null,
       },
       rateLimitsByLimitId: {
         claude: {
           limitId: "claude", limitName: "Claude",
           primary: { usedPercent: 12.5, windowDurationMins: 300, resetsAt: 1_784_250_123 },
           secondary: { usedPercent: 34, windowDurationMins: 10_080, resetsAt: 1_784_505_600 },
-          credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
+          credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null, normalModelSlug: null,
         },
         "claude-seven-day-opus": {
           limitId: "claude-seven-day-opus", limitName: "Claude Opus · 7 day",
           primary: { usedPercent: 100, windowDurationMins: 10_080, resetsAt: 1_784_592_000 },
-          secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
+          secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null, normalModelSlug: null,
         },
         "claude-seven-day-sonnet": {
           limitId: "claude-seven-day-sonnet", limitName: "Claude Sonnet · 7 day",
           primary: { usedPercent: 0, windowDurationMins: 10_080, resetsAt: null },
-          secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
+          secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null, normalModelSlug: null,
         },
         "claude-oauth-apps": {
           limitId: "claude-oauth-apps", limitName: "Claude OAuth apps · 7 day",
           primary: null,
-          secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
+          secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null, normalModelSlug: null,
         },
         "claude-model-fable-5": {
           limitId: "claude-model-fable-5", limitName: "Claude Fable 5 · 7 day",
           primary: { usedPercent: 44, windowDurationMins: 10_080, resetsAt: 1_784_678_400 },
-          secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
+          secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null, normalModelSlug: null,
         },
       },
-      rateLimitResetCredits: null,
+      rateLimitResetCredits: null, ordinaryUsageAllowed: null,
     });
   });
 
@@ -385,10 +385,10 @@ describe("CCodex status command", () => {
               resetsAt: Math.floor(new Date(2026, 6, 19, 14, 30).getTime() / 1_000),
             },
             secondary: null, credits: null, individualLimit: null, spendControlReached: null,
-            planType: "pro", rateLimitReachedType: null,
+            planType: "pro", rateLimitReachedType: null, normalModelSlug: null,
           },
           rateLimitsByLimitId: null,
-          rateLimitResetCredits: null, accountId: null, rateLimitUpsell: null,
+          rateLimitResetCredits: null, accountId: null, rateLimitUpsell: null, ordinaryUsageAllowed: null,
         },
       },
     }, now)).toBe([
@@ -427,5 +427,14 @@ describe("CCodex status command", () => {
       "֎ **Codex** · ⚠️ not authenticated",
       "  ↳ `codex auth login`",
     ].join("\n"));
+  });
+});
+
+describe("Codex 0.155.1 rate-limit fields", () => {
+  it("never claims Luna reserve eligibility or a normal model for Claude", () => {
+    const mapped = mapClaudeUsage(usage());
+    expect(mapped.ordinaryUsageAllowed).toBeNull();
+    expect(Object.values(mapped.rateLimitsByLimitId).every((bucket) => bucket.normalModelSlug === null)).toBe(true);
+    expect(unavailableClaudeRateLimits()).toMatchObject({ ordinaryUsageAllowed: null, rateLimits: { normalModelSlug: null } });
   });
 });

@@ -11,7 +11,7 @@ function response(id = "public-side"): ThreadForkResponse {
     thread: {
       id, extra: null, sessionId: "parent", forkedFromId: "parent", parentThreadId: null,
       canAcceptDirectInput: true,
-      preview: "", ephemeral: true, section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy", modelProvider: "claude", model: null, reasoningEffort: null,
+      preview: "", ephemeral: true, section: null, sectionEnteredAt: null, environments: null, originator: null, daybreakEnabled: null, projectId: null, historyMode: "legacy", modelProvider: "claude", model: null, reasoningEffort: null,
       createdAt: 1, updatedAt: 1, recencyAt: 1, status: { type: "idle" }, path: null,
       cwd: "/repo", cliVersion: "test", source: "appServer", threadSource: "user",
       agentNickname: null, agentRole: null, gitInfo: null, name: "Side", turns: [],
