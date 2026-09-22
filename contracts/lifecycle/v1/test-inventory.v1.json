@@ -17,9 +17,9 @@
     ]
   },
   "counts": {
-    "architecture-invariant": 145,
-    "external-contract": 388,
-    "provider-mapping": 73,
+    "architecture-invariant": 146,
+    "external-contract": 389,
+    "provider-mapping": 74,
     "old-implementation-detail": 34
   },
   "cases": [
@@ -816,6 +816,12 @@
       "rationale": "Freezes Claude SDK/control/tool input into normalized Codex semantics."
     },
     {
+      "path": "tests/claude/rateLimits.test.ts",
+      "title": "never claims Luna reserve eligibility or a normal model for Claude",
+      "classification": "provider-mapping",
+      "rationale": "Freezes Claude SDK/control/tool input into normalized Codex semantics."
+    },
+    {
       "path": "tests/claude/responseItemValidation.test.ts",
       "title": "accepts every pinned shape including additional_tools",
       "classification": "external-contract",
@@ -836,6 +842,12 @@
     {
       "path": "tests/claude/responseItemValidation.test.ts",
       "title": "matches pinned remote image rejection for messages and tool outputs",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/claude/responseItemValidation.test.ts",
+      "title": "rejects configuration_update items like stock's inject and resume guards",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
@@ -2174,6 +2186,12 @@
     {
       "path": "tests/claude/session/goalState.test.ts",
       "title": "blocks the goal after three goal turns whose only tool activity failed",
+      "classification": "architecture-invariant",
+      "rationale": "Freezes bounded mailbox, single-owner session routing, ordering, backpressure, and shutdown invariants required by the lifecycle rewrite."
+    },
+    {
+      "path": "tests/claude/session/goalState.test.ts",
+      "title": "blocks the goal after three automatic continuations that answer with nothing",
       "classification": "architecture-invariant",
       "rationale": "Freezes bounded mailbox, single-owner session routing, ordering, backpressure, and shutdown invariants required by the lifecycle rewrite."
     },
