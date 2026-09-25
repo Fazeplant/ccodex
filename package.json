@@ -1,6 +1,6 @@
 {
   "name": "@gkorepanov/ccodex",
-  "version": "0.4.25-orbital.5",
+  "version": "0.4.25-orbital.6",
   "description": "Unofficial Codex App compatibility bridge for Codex CLI and Claude Code runtimes.",
   "homepage": "https://github.com/gkorepanov/ccodex#readme",
   "repository": {
