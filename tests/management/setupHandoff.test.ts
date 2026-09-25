@@ -6,7 +6,10 @@ import { installLayout } from "../../src/management/layout.js";
 import { setup } from "../../src/management/setup.js";
 
 const roots: string[] = [];
-const saved = { HOME: process.env.HOME, CCODEX_HOME: process.env.CCODEX_HOME, PATH: process.env.PATH };
+const saved = {
+  HOME: process.env.HOME, CCODEX_HOME: process.env.CCODEX_HOME, PATH: process.env.PATH,
+  CCODEX_PACKAGE_SPEC: process.env.CCODEX_PACKAGE_SPEC,
+};
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -62,6 +65,8 @@ describe("cross-version setup handoff", () => {
     writeFileSync(join(tools, "npm"), `#!/bin/sh\ncp -R ${JSON.stringify(`${stage}/.`)} "$3"\n`);
     chmodSync(join(tools, "npm"), 0o755);
     process.env.PATH = `${tools}${delimiter}${process.env.PATH ?? ""}`;
+    // Skip the GitHub release download; the fake npm copies the fixture stage.
+    process.env.CCODEX_PACKAGE_SPEC = "fixture";
     expect(await setup(["--version", "99.0.0"])).toBe(7);
     expect(existsSync(join(installLayout().staging, `99.0.0-${process.pid}`))).toBe(false);
   });
