@@ -27,7 +27,7 @@ import {
 } from "./settings.js";
 
 const execFileAsync = promisify(execFile);
-const START_TIMEOUT_MS = 10_000;
+const START_TIMEOUT_MS = 30_000;
 const POLL_MS = 50;
 
 interface DaemonInvocation {
