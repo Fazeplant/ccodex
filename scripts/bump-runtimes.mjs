@@ -54,6 +54,33 @@ function replaceCodexVersion(from, to) {
   return files;
 }
 
+// The vendored transport crate inherits its dependencies from the relay
+// workspace; declare any it newly needs, mirroring the upstream codex-rs
+// workspace with path dependencies rewritten to the pinned git revision.
+function syncTransportWorkspaceDependencies(tag, ref) {
+  const cargoPath = "relay/Cargo.toml";
+  const cargo = read(cargoPath);
+  const section = /^\[workspace\.dependencies\]\n([\s\S]*?)(?=^\[)/mu.exec(cargo);
+  if (!section) throw new Error(`${cargoPath} has no [workspace.dependencies] section.`);
+  const declared = new Set([...section[1].matchAll(/^([\w-]+)\s*=/gmu)].map((match) => match[1]));
+  const needed = [...read("relay/vendor/app-server-transport/Cargo.toml")
+    .matchAll(/^([\w-]+)\s*=\s*\{[^}\n]*\bworkspace\s*=\s*true/gmu)].map((match) => match[1]);
+  const missing = [...new Set(needed)].filter((name) => !declared.has(name));
+  if (missing.length === 0) return [];
+  const upstream = capture("curl", ["-fsSL", `https://raw.githubusercontent.com/openai/codex/${tag}/codex-rs/Cargo.toml`]);
+  const lines = missing.map((name) => {
+    const line = new RegExp(`^${name}\\s*=\\s*(.+)$`, "mu").exec(upstream)?.[1];
+    if (!line) throw new Error(`Codex ${tag} workspace does not declare ${name}.`);
+    if (/\bpath\s*=/u.test(line)) return `${name} = { git = "https://github.com/openai/codex.git", rev = "${ref}" }`;
+    if ((line.match(/[[{]/gu)?.length ?? 0) !== (line.match(/[\]}]/gu)?.length ?? 0)) {
+      throw new Error(`Codex ${tag} declares ${name} over several lines; add it to ${cargoPath} by hand.`);
+    }
+    return `${name} = ${line}`;
+  });
+  write(cargoPath, cargo.replace(section[0], `${section[0].trimEnd()}\n${lines.join("\n")}\n\n`));
+  return missing;
+}
+
 function syncRustToolchain(tag) {
   const upstream = capture("curl", [
     "-fsSL", `https://raw.githubusercontent.com/openai/codex/${tag}/codex-rs/rust-toolchain.toml`,
@@ -115,6 +142,7 @@ if (target.codex !== current.codex) {
   replaceCodexVersion(current.codex, target.codex);
   writeJson("config/compatibility.json", { ...readJson("config/compatibility.json"), codexGitRevision: ref });
   run(process.execPath, [join(root, "scripts", "update-codex-pin.mjs"), ref]);
+  syncTransportWorkspaceDependencies(tag, ref);
   const toolchain = syncRustToolchain(tag);
   changes.push(`Codex ${current.codex} -> ${target.codex} (${tag})${toolchain ? `, Rust ${toolchain}` : ""}`);
 }
