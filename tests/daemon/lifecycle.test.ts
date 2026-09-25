@@ -275,5 +275,6 @@ describe("npm-backed hybrid daemon lifecycle", () => {
     await expect(runDaemonCommand(config, { command: "start", remoteControl: false }, fixture)).rejects.toThrow();
     expect(alive(child.pid!)).toBe(true);
     expect(existsSync(join(home, "app-server-daemon", "app-server.pid"))).toBe(false);
-  }, 20_000);
+    // Start may wait out the daemon's 30s START_TIMEOUT_MS before hard-failing.
+  }, 45_000);
 });
