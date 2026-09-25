@@ -75,35 +75,35 @@ describe("Claude rate-limit wire mapping", () => {
     const mapped = mapClaudeUsage(usage());
     expect(mapped).toEqual({
       rateLimits: {
-        limitId: "claude", limitName: "Claude",
+        limitId: "claude", limitName: "Claude", normalModelSlug: null,
         primary: { usedPercent: 12.5, windowDurationMins: 300, resetsAt: 1_784_250_123 },
         secondary: { usedPercent: 34, windowDurationMins: 10_080, resetsAt: 1_784_505_600 },
         credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
       },
       rateLimitsByLimitId: {
         claude: {
-          limitId: "claude", limitName: "Claude",
+          limitId: "claude", limitName: "Claude", normalModelSlug: null,
           primary: { usedPercent: 12.5, windowDurationMins: 300, resetsAt: 1_784_250_123 },
           secondary: { usedPercent: 34, windowDurationMins: 10_080, resetsAt: 1_784_505_600 },
           credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
         },
         "claude-seven-day-opus": {
-          limitId: "claude-seven-day-opus", limitName: "Claude Opus · 7 day",
+          limitId: "claude-seven-day-opus", limitName: "Claude Opus · 7 day", normalModelSlug: null,
           primary: { usedPercent: 100, windowDurationMins: 10_080, resetsAt: 1_784_592_000 },
           secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
         },
         "claude-seven-day-sonnet": {
-          limitId: "claude-seven-day-sonnet", limitName: "Claude Sonnet · 7 day",
+          limitId: "claude-seven-day-sonnet", limitName: "Claude Sonnet · 7 day", normalModelSlug: null,
           primary: { usedPercent: 0, windowDurationMins: 10_080, resetsAt: null },
           secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
         },
         "claude-oauth-apps": {
-          limitId: "claude-oauth-apps", limitName: "Claude OAuth apps · 7 day",
+          limitId: "claude-oauth-apps", limitName: "Claude OAuth apps · 7 day", normalModelSlug: null,
           primary: null,
           secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
         },
         "claude-model-fable-5": {
-          limitId: "claude-model-fable-5", limitName: "Claude Fable 5 · 7 day",
+          limitId: "claude-model-fable-5", limitName: "Claude Fable 5 · 7 day", normalModelSlug: null,
           primary: { usedPercent: 44, windowDurationMins: 10_080, resetsAt: 1_784_678_400 },
           secondary: null, credits: null, individualLimit: null, spendControlReached: null, planType: "unknown", rateLimitReachedType: null,
         },
@@ -379,7 +379,7 @@ describe("CCodex status command", () => {
         availability: { state: "ready" },
         rateLimits: {
           rateLimits: {
-            limitId: "codex", limitName: null,
+            limitId: "codex", limitName: null, normalModelSlug: null,
             primary: {
               usedPercent: 12, windowDurationMins: 300,
               resetsAt: Math.floor(new Date(2026, 6, 19, 14, 30).getTime() / 1_000),
@@ -388,7 +388,7 @@ describe("CCodex status command", () => {
             planType: "pro", rateLimitReachedType: null,
           },
           rateLimitsByLimitId: null,
-          rateLimitResetCredits: null, accountId: null, rateLimitUpsell: null,
+          rateLimitResetCredits: null, accountId: null, rateLimitUpsell: null, ordinaryUsageAllowed: null,
         },
       },
     }, now)).toBe([

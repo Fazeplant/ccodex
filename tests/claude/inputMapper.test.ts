@@ -28,6 +28,8 @@ describe("mapUserInput", () => {
 
   it("accepts only HTTP(S) remote images", async () => {
     await expect(mapUserInput([{ type: "image", url: "file:///etc/passwd" }], "uuid")).rejects.toThrow("file:");
+    await expect(mapUserInput([{ type: "image", fileId: "file-123" }], "uuid"))
+      .rejects.toThrow("OpenAI file-id images are not available in Claude threads.");
     const mapped = await mapUserInput([{ type: "image", url: "https://example.com/image.png" }], "uuid");
     expect((mapped.message.content as Array<{ source?: { url?: string } }>)[0]?.source?.url).toBe("https://example.com/image.png");
   });

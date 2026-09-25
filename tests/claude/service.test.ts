@@ -1282,7 +1282,7 @@ Keep this summary.
         id: "claude:haiku", model: "claude:haiku", upgrade: null, upgradeInfo: null, availabilityNux: null,
         displayName: "Haiku", description: "test", hidden: false, supportedReasoningEfforts: [],
         defaultReasoningEffort: "medium", inputModalities: ["text" as const], supportsPersonality: true,
-        additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null,
+        additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null, availableAccessPrograms: null,
       }], invalidate: () => { invalidations += 1; } },
     );
     const started = await service.startThread({ model: "claude:haiku", cwd: directory });
@@ -1350,8 +1350,8 @@ Keep this summary.
     });
     expect(service.listItems({ threadId: started.thread.id })).toEqual({
       data: [
-        { turnId: expect.any(String), item: expect.objectContaining({ type: "userMessage" }) },
-        { turnId: expect.any(String), item: expect.objectContaining({ type: "agentMessage" }) },
+        { turnId: expect.any(String), item: expect.objectContaining({ type: "userMessage" }), startedAtMs: null, completedAtMs: null },
+        { turnId: expect.any(String), item: expect.objectContaining({ type: "agentMessage" }), startedAtMs: null, completedAtMs: null },
       ],
       nextCursor: null,
       backwardsCursor: JSON.stringify({ itemId: resumed.initialTurnsPage!.data[0]!.items[0]!.id, includeAnchor: true }),
@@ -1499,7 +1499,7 @@ Keep this summary.
     const thread = {
       id: "crashed-thread", extra: null, sessionId: "codex-session", forkedFromId: null, parentThreadId: null,
       canAcceptDirectInput: true,
-      preview: "crash", ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy" as const, modelProvider: "claude", model: null, reasoningEffort: null,
+      preview: "crash", ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, environments: null, originator: null, daybreakEnabled: null, historyMode: "legacy" as const, modelProvider: "claude", model: null, reasoningEffort: null,
       createdAt: 1, updatedAt: 1, recencyAt: 1, status: { type: "active" as const, activeFlags: [] },
       path: null, cwd: directory, cliVersion: "test", source: "appServer" as const, threadSource: null,
       agentNickname: null, agentRole: null, gitInfo: null, name: null, turns: [],
@@ -6207,7 +6207,7 @@ You are in a side conversation, not the main thread.`,
       displayName: "Haiku", description: "test", hidden: false,
       supportedReasoningEfforts: [{ reasoningEffort: "low", description: "Low" }], defaultReasoningEffort: "low",
       inputModalities: ["text" as const], supportsPersonality: true, additionalSpeedTiers: [], serviceTiers: [],
-      defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null,
+      defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null, availableAccessPrograms: null,
     }] };
     const service = new ClaudeService(
       config(directory), hub, new Logger("error"), new SqliteHybridStore(join(directory, "state.sqlite")), fake.factory, catalog,
@@ -7297,7 +7297,7 @@ You are in a side conversation, not the main thread.`,
       availabilityNux: null, displayName: "Fable", description: "test", hidden: false,
       supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "Extra high" }],
       defaultReasoningEffort: "xhigh", inputModalities: ["text" as const], supportsPersonality: true,
-      additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null,
+      additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null, availableAccessPrograms: null,
     }] };
     const service = new ClaudeService(
       config(directory), new SubscriptionHub(), new Logger("error"),
@@ -7329,7 +7329,7 @@ You are in a side conversation, not the main thread.`,
       availabilityNux: null, displayName: "Fable", description: "test", hidden: false,
       supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "Extra high" }],
       defaultReasoningEffort: "xhigh", inputModalities: ["text" as const], supportsPersonality: true,
-      additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null,
+      additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null, availableAccessPrograms: null,
     }] };
     const service = new ClaudeService(
       config(directory), hub, new Logger("error"),
@@ -7386,7 +7386,7 @@ You are in a side conversation, not the main thread.`,
       availabilityNux: null, displayName: "Fable", description: "test", hidden: false,
       supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "Extra high" }],
       defaultReasoningEffort: "xhigh", inputModalities: ["text" as const], supportsPersonality: true,
-      additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null,
+      additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null, availableAccessPrograms: null,
     }] };
     const service = new ClaudeService(
       config(directory), hub, new Logger("error"),
@@ -7752,7 +7752,7 @@ You are in a side conversation, not the main thread.`,
     hidden: false, defaultReasoningEffort: (efforts[0] ?? "medium") as Model["defaultReasoningEffort"],
     supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort, description: reasoningEffort })) as Model["supportedReasoningEfforts"],
     inputModalities: ["text"], supportsPersonality: true, additionalSpeedTiers: [], serviceTiers: [],
-    defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null,
+    defaultServiceTier: null, isDefault: false, modelSpecialty: null, multiAgentVersion: null, availableAccessPrograms: null,
   });
 
   it("migrates a retired Claude model id onto its family successor at thread start and on settings updates", async () => {

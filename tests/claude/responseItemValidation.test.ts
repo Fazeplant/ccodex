@@ -77,4 +77,10 @@ describe("pinned ResponseItem validation", () => {
       type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }],
     }])).not.toThrow();
   });
+
+  it("rejects OpenAI file-id images that Claude cannot resolve", () => {
+    expect(() => validateResponseItems([{
+      type: "message", role: "user", content: [{ type: "input_image", file_id: "file-123" }],
+    }])).toThrow("OpenAI file-id images are not supported; use an inline data URL instead");
+  });
 });

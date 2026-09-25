@@ -7,7 +7,7 @@ import { filterSortThreads, publicListParams } from "../../src/store/threadFilte
 function thread(id: string, createdAt: number, parentThreadId: string | null = null): Thread {
   return {
     id, extra: null, sessionId: id, forkedFromId: null, parentThreadId,
-    canAcceptDirectInput: parentThreadId === null, preview: id, ephemeral: false, section: null, sectionEnteredAt: null, projectId: null,
+    canAcceptDirectInput: parentThreadId === null, preview: id, ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, environments: null, originator: null, daybreakEnabled: null,
     historyMode: "legacy", modelProvider: "claude", model: null, reasoningEffort: null, createdAt, updatedAt: createdAt, recencyAt: createdAt,
     status: { type: "idle" }, path: null, cwd: "/repo", cliVersion: "test", source: "vscode",
     threadSource: null, agentNickname: null, agentRole: null, gitInfo: null, name: id, turns: [],

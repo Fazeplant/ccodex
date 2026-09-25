@@ -25,7 +25,7 @@ function turn(id: string, text: string): Turn {
 function thread(id: string, turns: Turn[] = []): Thread {
   return {
     id, extra: null, sessionId: id, forkedFromId: null, parentThreadId: null, canAcceptDirectInput: true, preview: "source preview",
-    ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy", modelProvider: "openai", model: null, reasoningEffort: null, createdAt: 1, updatedAt: 1, recencyAt: 1,
+    ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, environments: null, originator: null, daybreakEnabled: null, historyMode: "legacy", modelProvider: "openai", model: null, reasoningEffort: null, createdAt: 1, updatedAt: 1, recencyAt: 1,
     status: { type: "idle" }, path: null, cwd: "/tmp", cliVersion: "0.144.4", source: "appServer",
     threadSource: null, agentNickname: null, agentRole: null, gitInfo: null, name: "source", turns,
   };
@@ -33,7 +33,7 @@ function thread(id: string, turns: Turn[] = []): Thread {
 
 function settings(model: string, provider: string): ThreadSettings {
   return {
-    cwd: "/tmp", approvalPolicy: "on-request", approvalsReviewer: "user",
+    disabledPluginIds: [], cwd: "/tmp", approvalPolicy: "on-request", approvalsReviewer: "user",
     sandboxPolicy: { type: "dangerFullAccess" }, activePermissionProfile: null,
     model, modelProvider: provider, serviceTier: "default", effort: "medium", summary: null,
     collaborationMode: { mode: "default", settings: { model, reasoning_effort: "medium", developer_instructions: null } },
@@ -43,7 +43,7 @@ function settings(model: string, provider: string): ThreadSettings {
 
 function response(value: Thread, model: string, provider: string): ThreadForkResponse {
   return {
-    thread: value, model, modelProvider: provider, serviceTier: "default", cwd: value.cwd,
+    thread: value, model, modelProvider: provider, serviceTier: "default", disabledPluginIds: [], cwd: value.cwd,
     runtimeWorkspaceRoots: [value.cwd], instructionSources: [], approvalPolicy: "on-request",
     approvalsReviewer: "user", sandbox: { type: "dangerFullAccess" }, activePermissionProfile: null,
     reasoningEffort: "medium", multiAgentMode: "explicitRequestOnly",

@@ -51,6 +51,7 @@ export async function mapUserInput(input: readonly UserInput[], uuid?: string, c
     } else if (item.type === "skill") {
       throw invalidParams("Codex skills are not available in Claude threads.");
     } else if (item.type === "image") {
+      if (!("url" in item)) throw invalidParams("OpenAI file-id images are not available in Claude threads.");
       const inline = dataImageUrl.exec(item.url);
       if (inline) {
         const mediaType = inline[1]!.toLocaleLowerCase();

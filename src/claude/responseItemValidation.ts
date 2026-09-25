@@ -24,14 +24,16 @@ function normalized(item: unknown): unknown {
   return { ...item, action: { ...item.action, type: "other" } };
 }
 
-function hasRemoteImage(item: Record<string, unknown>): boolean {
+function hasImage(item: Record<string, unknown>, matches: (entry: Record<string, unknown>) => boolean): boolean {
   return (imageFields[item.type as string] ?? []).some((field) => {
     const content = item[field];
-    return Array.isArray(content) && content.some((entry) =>
-      record(entry) && entry.type === "input_image"
-      && typeof entry.image_url === "string" && /^https?:/iu.test(entry.image_url));
+    return Array.isArray(content) && content.some((entry) => record(entry) && entry.type === "input_image" && matches(entry));
   });
 }
+
+const remoteImage = (entry: Record<string, unknown>) =>
+  typeof entry.image_url === "string" && /^https?:/iu.test(entry.image_url);
+const fileIdImage = (entry: Record<string, unknown>) => typeof entry.file_id === "string";
 
 export function validateResponseItems(items: JsonValue[]): void {
   if (items.length === 0) throw invalidRequest("items must not be empty");
@@ -41,8 +43,11 @@ export function validateResponseItems(items: JsonValue[]): void {
     if (!parsed.success) {
       throw invalidRequest(`items[${index}] is not a valid response item: ${z.prettifyError(parsed.error)}`);
     }
-    if (record(item) && hasRemoteImage(item)) {
+    if (record(item) && hasImage(item, remoteImage)) {
       throw invalidRequest("remote image URLs are not supported; use an inline data URL instead");
+    }
+    if (record(item) && hasImage(item, fileIdImage)) {
+      throw invalidRequest("OpenAI file-id images are not supported; use an inline data URL instead");
     }
   }
 }

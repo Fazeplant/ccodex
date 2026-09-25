@@ -59,6 +59,7 @@ export function mapClaudeModel(model: ModelInfo, prefix: string): Model {
     availabilityNux: null,
     modelSpecialty: null,
     multiAgentVersion: null,
+    availableAccessPrograms: null,
     displayName: claudeModelDisplayName(model),
     description: model.description,
     hidden: false,

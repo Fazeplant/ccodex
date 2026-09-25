@@ -125,7 +125,8 @@ export function paginateItems(
   params: Omit<ThreadItemsListParams, "threadId">,
   legacyPrefixes: readonly string[] = [],
 ): ThreadItemsListResponse {
-  const entries = turns.flatMap((turn) => turn.items.map((item) => ({ turnId: turn.id, item })));
+  const entries = turns.flatMap((turn) =>
+    turn.items.map((item) => ({ turnId: turn.id, item, startedAtMs: null, completedAtMs: null })));
   return paginate(entries, "itemId", (entry) => entry.item.id, params, legacyPrefixes, "asc",
     (entry) => !params.turnId || entry.turnId === params.turnId);
 }

@@ -32,8 +32,7 @@ import type { ThreadForkParams } from "../codex/generated/v2/ThreadForkParams.js
 import type { ThreadForkResponse } from "../codex/generated/v2/ThreadForkResponse.js";
 import type { ThreadRevertParams } from "../codex/generated/v2/ThreadRevertParams.js";
 import type { ThreadRevertResponse } from "../codex/generated/v2/ThreadRevertResponse.js";
-import type { ThreadRollbackParams } from "../codex/generated/v2/ThreadRollbackParams.js";
-import type { ThreadRollbackResponse } from "../codex/generated/v2/ThreadRollbackResponse.js";
+import type { ThreadRollbackParams, ThreadRollbackResponse } from "../protocol/legacyRollback.js";
 import type { ThreadSettingsUpdateParams } from "../codex/generated/v2/ThreadSettingsUpdateParams.js";
 import type { ThreadSettings } from "../codex/generated/v2/ThreadSettings.js";
 import type { ThreadInjectItemsParams } from "../codex/generated/v2/ThreadInjectItemsParams.js";
@@ -336,6 +335,9 @@ function threadResponse(record: ClaudeThreadRecord, includeTurns: boolean): Thre
       section: record.thread.section ?? null,
       sectionEnteredAt: record.thread.sectionEnteredAt ?? null,
       projectId: record.thread.projectId ?? null,
+      environments: record.thread.environments ?? null,
+      originator: record.thread.originator ?? null,
+      daybreakEnabled: record.thread.daybreakEnabled ?? null,
       canAcceptDirectInput: record.thread.parentThreadId ? false : true,
       turns: includeTurns ? record.thread.turns : [],
     },
@@ -756,6 +758,7 @@ export class ClaudeService {
       record = { ...record, thread: this.withNativeMetadata(record) };
       return {
         ...threadResponse(record, !resume.excludeTurns),
+        collaborationMode: threadSettings(record).collaborationMode,
         ...historyCursors(record.thread.turns),
         initialTurnsPage: resume.initialTurnsPage
           ? this.turnsPage({
@@ -787,6 +790,7 @@ export class ClaudeService {
     if (this.store.listQueuedSubmissions(threadId).length) this.scheduleQueueDrain(threadId);
     return {
       ...threadResponse(record, !resume.excludeTurns),
+      collaborationMode: threadSettings(record).collaborationMode,
       ...historyCursors(record.thread.turns),
       initialTurnsPage: resume.initialTurnsPage
         ? this.turnsPage({
@@ -1538,6 +1542,7 @@ export class ClaudeService {
     const thread: Thread = {
       ...sourceRecord.thread, id: threadId, ephemeral: params.ephemeral ?? false,
       section: null, sectionEnteredAt: null, projectId: null,
+      environments: null, originator: null, daybreakEnabled: sourceRecord.thread.daybreakEnabled ?? null,
       sessionId: threadId, forkedFromId: visibleForkedFromId,
       cwd, modelProvider: "claude", model: modelPickerId, reasoningEffort,
       createdAt, updatedAt: createdAt, recencyAt: createdAt,
@@ -2127,6 +2132,9 @@ export class ClaudeService {
       section: record.thread.section ?? null,
       sectionEnteredAt: record.thread.sectionEnteredAt ?? null,
       projectId: record.thread.projectId ?? null,
+      environments: record.thread.environments ?? null,
+      originator: record.thread.originator ?? null,
+      daybreakEnabled: record.thread.daybreakEnabled ?? null,
       canAcceptDirectInput: record.thread.parentThreadId ? false : true,
     };
     const createdAt = native.createdAt === undefined
@@ -2138,6 +2146,9 @@ export class ClaudeService {
       section: record.thread.section ?? null,
       sectionEnteredAt: record.thread.sectionEnteredAt ?? null,
       projectId: record.thread.projectId ?? null,
+      environments: record.thread.environments ?? null,
+      originator: record.thread.originator ?? null,
+      daybreakEnabled: record.thread.daybreakEnabled ?? null,
       canAcceptDirectInput: record.thread.parentThreadId ? false : true,
       name: record.thread.name || native.customTitle || native.summary,
       preview: native.firstPrompt ?? record.thread.preview,
@@ -2227,6 +2238,9 @@ export class ClaudeService {
         section: null,
         sectionEnteredAt: null,
         projectId: null,
+        environments: null,
+        originator: null,
+        daybreakEnabled: null,
         historyMode: params.historyMode ?? (params.ephemeral ? "legacy" : "paginated"),
         modelProvider: "claude", model: modelPickerId, reasoningEffort,
         createdAt,

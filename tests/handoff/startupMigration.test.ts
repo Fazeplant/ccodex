@@ -25,7 +25,7 @@ function thread(id: string): Thread {
     canAcceptDirectInput: true,
     preview: `private ${id}`,
     ephemeral: false,
-    section: null, sectionEnteredAt: null, projectId: null,
+    section: null, sectionEnteredAt: null, projectId: null, environments: null, originator: null, daybreakEnabled: null,
     historyMode: "legacy",
     modelProvider: "openai", model: null, reasoningEffort: null,
     createdAt: 1,

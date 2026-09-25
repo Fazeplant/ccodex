@@ -26,7 +26,7 @@ function thread(id: string): Thread {
     canAcceptDirectInput: true,
     preview: "hello",
     ephemeral: false,
-    section: null, sectionEnteredAt: null, projectId: null,
+    section: null, sectionEnteredAt: null, projectId: null, environments: null, originator: null, daybreakEnabled: null,
     historyMode: "legacy",
     modelProvider: "claude", model: null, reasoningEffort: null,
     createdAt: 10,

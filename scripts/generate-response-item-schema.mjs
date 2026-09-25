@@ -25,6 +25,7 @@ const SERDE_OVERLAYS = {
   "0.146.0": RESPONSE_ITEM_SERDE_OVERLAY,
   "0.149.1": RESPONSE_ITEM_SERDE_OVERLAY,
   "0.153.3": RESPONSE_ITEM_SERDE_OVERLAY,
+  "0.157.0": RESPONSE_ITEM_SERDE_OVERLAY,
 };
 
 function visit(value, visitor) {
@@ -76,7 +77,10 @@ function imageFields(variants, definitions) {
     value = ref(value);
     if (!value || typeof value !== "object" || seen.has(value)) return false;
     seen.add(value);
-    if (value.properties?.type?.enum?.includes("input_image") && value.properties.image_url) return true;
+    // Codex >= 0.157 moves image_url into an anyOf with file_id alternatives.
+    const imageUrl = (candidate) => Boolean(ref(candidate)?.properties?.image_url);
+    if (value.properties?.type?.enum?.includes("input_image")
+      && (imageUrl(value) || [...(value.anyOf ?? []), ...(value.oneOf ?? [])].some(imageUrl))) return true;
     return Object.values(value).some((child) => containsInputImage(child, seen));
   };
   for (const [type, variant] of variants) {
@@ -84,6 +88,9 @@ function imageFields(variants, definitions) {
       .filter(([, property]) => containsInputImage(property))
       .map(([field]) => field);
     if (matching.length > 0) fields[type] = matching;
+  }
+  if (Object.keys(fields).length === 0) {
+    throw new Error("No ResponseItem field carries input_image.image_url; remote-image rejection would be lost.");
   }
   return fields;
 }

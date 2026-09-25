@@ -26,7 +26,7 @@ import type { ThreadQueueStartParams } from "../codex/generated/v2/ThreadQueueSt
 import type { ThreadForkParams } from "../codex/generated/v2/ThreadForkParams.js";
 import type { ThreadForkResponse } from "../codex/generated/v2/ThreadForkResponse.js";
 import type { ThreadRevertParams } from "../codex/generated/v2/ThreadRevertParams.js";
-import type { ThreadRollbackParams } from "../codex/generated/v2/ThreadRollbackParams.js";
+import type { ThreadRollbackParams } from "../protocol/legacyRollback.js";
 import type { ThreadSectionMoveParams } from "../codex/generated/v2/ThreadSectionMoveParams.js";
 import type { ThreadSettingsUpdateParams } from "../codex/generated/v2/ThreadSettingsUpdateParams.js";
 import type { ThreadSettings } from "../codex/generated/v2/ThreadSettings.js";

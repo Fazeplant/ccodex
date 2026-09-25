@@ -581,7 +581,7 @@ describe("Claude autonomous continuation lifecycle", () => {
       thread: {
         id: threadId, extra: null, sessionId: threadId, forkedFromId: null, parentThreadId: null,
         canAcceptDirectInput: true,
-        preview: "restart fence", ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, historyMode: "legacy",
+        preview: "restart fence", ephemeral: false, section: null, sectionEnteredAt: null, projectId: null, environments: null, originator: null, daybreakEnabled: null, historyMode: "legacy",
         modelProvider: "claude", model: null, reasoningEffort: null, createdAt, updatedAt: createdAt, recencyAt: createdAt,
         status: { type: "active", activeFlags: [] }, path: null, cwd: directory, cliVersion: "test",
         source: "appServer", threadSource: null, agentNickname: null, agentRole: null, gitInfo: null,

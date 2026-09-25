@@ -70,6 +70,7 @@ export interface ClaudeRateLimitWindow {
 export interface ClaudeRateLimitSnapshot {
   limitId: string;
   limitName: string;
+  normalModelSlug: null;
   primary: ClaudeRateLimitWindow | null;
   secondary: ClaudeRateLimitWindow | null;
   credits: null;
@@ -132,7 +133,7 @@ function snapshot(
   planType: ClaudeRateLimitSnapshot["planType"],
 ): ClaudeRateLimitSnapshot {
   return {
-    limitId, limitName, primary, secondary, credits: null, individualLimit: null,
+    limitId, limitName, normalModelSlug: null, primary, secondary, credits: null, individualLimit: null,
     planType, rateLimitReachedType: null, spendControlReached: null,
   };
 }

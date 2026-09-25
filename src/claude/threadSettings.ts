@@ -25,6 +25,7 @@ export function syncedCollaborationMode(
 export function threadSettings(record: ClaudeThreadRecord): ThreadSettings {
   const sandboxPolicy = record.sandboxPolicy as ThreadSettings["sandboxPolicy"];
   return {
+    disabledPluginIds: [],
     cwd: record.thread.cwd,
     approvalPolicy: record.approvalPolicy as ThreadSettings["approvalPolicy"],
     approvalsReviewer: record.approvalsReviewer,

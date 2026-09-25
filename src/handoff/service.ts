@@ -11,8 +11,7 @@ import type { ThreadMetadataUpdateParams } from "../codex/generated/v2/ThreadMet
 import type { ThreadSetNameParams } from "../codex/generated/v2/ThreadSetNameParams.js";
 import type { ThreadRevertParams } from "../codex/generated/v2/ThreadRevertParams.js";
 import type { ThreadRevertResponse } from "../codex/generated/v2/ThreadRevertResponse.js";
-import type { ThreadRollbackParams } from "../codex/generated/v2/ThreadRollbackParams.js";
-import type { ThreadRollbackResponse } from "../codex/generated/v2/ThreadRollbackResponse.js";
+import type { ThreadRollbackParams, ThreadRollbackResponse } from "../protocol/legacyRollback.js";
 import type { ThreadInjectItemsParams } from "../codex/generated/v2/ThreadInjectItemsParams.js";
 import type { ThreadShellCommandParams } from "../codex/generated/v2/ThreadShellCommandParams.js";
 import type { TurnInterruptParams } from "../codex/generated/v2/TurnInterruptParams.js";
@@ -436,6 +435,7 @@ export class CrossProviderForks {
       model: source.epoch.model,
       modelProvider: source.epoch.provider === "claude" ? "claude" : "openai",
       serviceTier: typeof settings.serviceTier === "string" ? settings.serviceTier : null,
+      disabledPluginIds: Array.isArray(settings.disabledPluginIds) ? settings.disabledPluginIds as string[] : [],
       cwd,
       runtimeWorkspaceRoots: Array.isArray(settings.runtimeWorkspaceRoots)
         ? settings.runtimeWorkspaceRoots as string[] : [],
@@ -1962,7 +1962,11 @@ export class CrossProviderForks {
     return readStockThread(stock, resolved.epoch.backendThreadId);
   }
 
-  /** Drops the current epoch's trailing turns: `thread/revert` on paginated backends, `thread/rollback` on legacy ones. */
+  /**
+   * Drops the current epoch's trailing turns: `thread/revert` on paginated backends, the Claude
+   * rollback on legacy Claude ones. Stock Codex 0.157 no longer serves `thread/rollback`, so a
+   * legacy stock backend fails like stock `thread/revert` does.
+   */
   private async truncateBackend(
     target: ResolvedProviderEpoch,
     backend: Thread,
@@ -1972,10 +1976,8 @@ export class CrossProviderForks {
   ): Promise<Thread> {
     const threadId = target.epoch.backendThreadId;
     if (backend.historyMode !== "paginated") {
-      const rolled = target.epoch.provider === "claude"
-        ? await this.claude.rollbackThread({ threadId, numTurns })
-        : await clientStock.request("thread/rollback", { threadId, numTurns }) as ThreadRollbackResponse;
-      return rolled.thread;
+      if (target.epoch.provider !== "claude") throw invalidRequest("thread/revert only supports paginated threads");
+      return (await this.claude.rollbackThread({ threadId, numTurns })).thread;
     }
     if (!firstDropped.providerTurnId) throw invalidParams("Rollback has no provider-backed turn boundary.");
     const revert = { threadId, beforeTurnId: firstDropped.providerTurnId };
@@ -2535,6 +2537,7 @@ export class CrossProviderForks {
       return {
         summary,
         settings: {
+          disabledPluginIds: temporary.disabledPluginIds,
           cwd: temporary.cwd,
           approvalPolicy: temporary.approvalPolicy,
           approvalsReviewer: temporary.approvalsReviewer,

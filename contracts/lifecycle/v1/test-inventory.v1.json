@@ -17,10 +17,10 @@
     ]
   },
   "counts": {
-    "architecture-invariant": 143,
-    "external-contract": 381,
+    "architecture-invariant": 144,
+    "external-contract": 385,
     "provider-mapping": 72,
-    "old-implementation-detail": 32
+    "old-implementation-detail": 34
   },
   "cases": [
     {
@@ -76,6 +76,18 @@
       "title": "round-trips MCP form elicitation with content intact",
       "classification": "provider-mapping",
       "rationale": "Freezes Claude SDK/control/tool input into normalized Codex semantics."
+    },
+    {
+      "path": "tests/claude/autonomousContinuation.test.ts",
+      "title": "reports a projection failure and stops the provider instead of expiring the side chat",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/claude/autonomousContinuation.test.ts",
+      "title": "keeps a notification arriving before the first token for the next request (ephemeral=%s)",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
     {
       "path": "tests/claude/autonomousContinuation.test.ts",
@@ -804,6 +816,12 @@
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
     {
+      "path": "tests/claude/responseItemValidation.test.ts",
+      "title": "rejects OpenAI file-id images that Claude cannot resolve",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
       "path": "tests/claude/resultClassifier.test.ts",
       "title": "uses authoritative abort terminal reasons even with opaque diagnostics",
       "classification": "provider-mapping",
@@ -1063,7 +1081,7 @@
     },
     {
       "path": "tests/claude/service.test.ts",
-      "title": "projects title, cwd, and timestamps from native Claude session metadata",
+      "title": "projects native metadata consistently through list, read, and resume (%s)",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
@@ -1363,7 +1381,7 @@
     },
     {
       "path": "tests/claude/service.test.ts",
-      "title": "unloads an idle user side runtime without deleting the conversation",
+      "title": "keeps a user side resumable after more than 24 hours and runtime unload",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
     },
@@ -2264,6 +2282,12 @@
     {
       "path": "tests/claude/session/runtime.test.ts",
       "title": "serializes provider delivery through the fact sink",
+      "classification": "architecture-invariant",
+      "rationale": "Freezes bounded mailbox, single-owner session routing, ordering, backpressure, and shutdown invariants required by the lifecycle rewrite."
+    },
+    {
+      "path": "tests/claude/session/runtime.test.ts",
+      "title": "yields to the event loop between buffered SDK messages",
       "classification": "architecture-invariant",
       "rationale": "Freezes bounded mailbox, single-owner session routing, ordering, backpressure, and shutdown invariants required by the lifecycle rewrite."
     },
@@ -3475,6 +3499,12 @@
     },
     {
       "path": "tests/gateway/providerRateLimits.test.ts",
+      "title": "persists a completed title before clearing its worker state without blocking delivery",
+      "classification": "external-contract",
+      "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
+    },
+    {
+      "path": "tests/gateway/providerRateLimits.test.ts",
       "title": "returns the provider-owned title without fabricating a rename event",
       "classification": "external-contract",
       "rationale": "Freezes App-visible RPC, durable snapshot, event ordering/cardinality, or restart behavior."
@@ -3668,6 +3698,18 @@
     {
       "path": "tests/store/sqliteStore.test.ts",
       "title": "backfills Thread.model and Thread.reasoningEffort from the record when migration 11 runs",
+      "classification": "old-implementation-detail",
+      "rationale": "Freezes the current broad-record/SQLite implementation; retain as migration evidence, not reducer parity."
+    },
+    {
+      "path": "tests/store/sqliteStore.test.ts",
+      "title": "persists gateway-owned section orders",
+      "classification": "old-implementation-detail",
+      "rationale": "Freezes the current broad-record/SQLite implementation; retain as migration evidence, not reducer parity."
+    },
+    {
+      "path": "tests/store/sqliteStore.test.ts",
+      "title": "relabels appServer Claude threads as vscode when migration 12 runs",
       "classification": "old-implementation-detail",
       "rationale": "Freezes the current broad-record/SQLite implementation; retain as migration evidence, not reducer parity."
     },
