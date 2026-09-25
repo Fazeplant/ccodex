@@ -1,13 +1,12 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync, lstatSync, readFileSync, readlinkSync, renameSync, rmSync, statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { promisify } from "node:util";
 import { atomicSymlink, atomicWrite, ensureLayout, installLayout } from "./layout.js";
 import { readInstallManifest, setup, type InstallManifest } from "./setup.js";
+import { latestReleaseVersion, RELEASE_REPOSITORY } from "./releaseSource.js";
 import { reconcileManagedProcess, stopManagedProcess } from "../daemon/supervisor.js";
 import { reconcileOwnedGateway, stopSocketOwner } from "../daemon/ownership.js";
 import { uninstallRemoteCodexShim } from "./remoteShim.js";
@@ -27,18 +26,9 @@ import {
   installManagedShims, restoreManagedShims, type ManagedShimChange,
 } from "./shims.js";
 
-const execute = promisify(execFile);
-
 async function registryVersion(channel: string): Promise<string> {
-  const { stdout } = await execute("npm", ["view", "@gkorepanov/ccodex", `dist-tags.${channel}`, "--json"], {
-    timeout: 30_000,
-    maxBuffer: 128 * 1024,
-  });
-  const value = JSON.parse(stdout) as unknown;
-  if (typeof value !== "string" || !/^\d+\.\d+\.\d+(?:[-+].+)?$/u.test(value)) {
-    throw new Error(`npm returned an invalid latest version: ${stdout.trim()}`);
-  }
-  return value;
+  if (channel !== "latest") throw new Error(`${RELEASE_REPOSITORY} publishes only the latest channel.`);
+  return latestReleaseVersion();
 }
 
 function daemonPidFile(): string {

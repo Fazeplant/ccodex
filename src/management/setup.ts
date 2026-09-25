@@ -21,6 +21,7 @@ import {
   installManagedShims, restoreManagedShims, type ManagedShimChange,
 } from "./shims.js";
 import { compareSemver } from "./shimSelect.js";
+import { releaseTarballSpecs } from "./releaseSource.js";
 import {
   installRemoteCodexShim, relocatedDelegate, restoreRemoteCodexShim, type RemoteCodexShim,
 } from "./remoteShim.js";
@@ -70,8 +71,10 @@ async function installClaudeStack(packageRoot: string): Promise<void> {
 }
 
 async function npmStage(destination: string, version = packageVersion()): Promise<void> {
-  const main = process.env.CCODEX_PACKAGE_SPEC ?? `@gkorepanov/ccodex@${version}`;
-  const specs = [main, ...(process.env.CCODEX_RELAY_PACKAGE_SPEC ? [process.env.CCODEX_RELAY_PACKAGE_SPEC] : [])];
+  const main = process.env.CCODEX_PACKAGE_SPEC;
+  const specs = main
+    ? [main, ...(process.env.CCODEX_RELAY_PACKAGE_SPEC ? [process.env.CCODEX_RELAY_PACKAGE_SPEC] : [])]
+    : releaseTarballSpecs(version);
   await execute("npm", ["install", "--prefix", destination, "--include=optional", "--ignore-scripts", "--save=false", ...specs], {
     timeout: 20 * 60_000,
     maxBuffer: 2 * 1024 * 1024,

@@ -1,0 +1,73 @@
+name: Auto-update runtimes
+
+# Daily: move the pinned Claude Agent SDK / Claude Code and Codex CLI to npm
+# latest (scripts/auto-update.sh). Green bumps are released; red bumps become
+# auto/<runtime>-<version> PRs.
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-update
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      tag: ${{ steps.update.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          # npm 10 keeps the optional lockfile entries Node 22 CI needs.
+          node-version: 22
+          cache: npm
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            relay/target
+          key: auto-update-cargo-${{ hashFiles('relay/Cargo.lock') }}
+          restore-keys: auto-update-cargo-
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - run: npm ci --ignore-scripts
+      - name: Report new upstream commits
+        run: |
+          git fetch --quiet https://github.com/gkorepanov/ccodex.git main
+          behind=$(git rev-list --count HEAD..FETCH_HEAD)
+          [ "$behind" -gt 0 ] || exit 0
+          title="Upstream gkorepanov/ccodex has new commits"
+          body="Upstream main $(git rev-parse --short FETCH_HEAD) has $behind commit(s) not in this fork. Merge upstream/main manually, keeping the fork's version, release source and workflows."
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then gh issue edit "$existing" --body "$body"; else gh issue create --title "$title" --body "$body"; fi
+      - id: update
+        run: ./scripts/auto-update.sh
+
+  release:
+    needs: bump
+    if: needs.bump.outputs.tag != ''
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release.yml
+    with:
+      ref: ${{ needs.bump.outputs.tag }}

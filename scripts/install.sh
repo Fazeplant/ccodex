@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-package='@gkorepanov/ccodex'
+repository=${CCODEX_RELEASE_REPO:-Fazeplant/ccodex}
 home=${CCODEX_HOME:-"$HOME/.ccodex"}
 
 fail() {
@@ -11,7 +11,9 @@ fail() {
 
 [ "$(id -u)" -ne 0 ] || fail 'do not run this installer as root or with sudo.'
 case "$(uname -s):$(uname -m)" in
-  Darwin:arm64|Linux:aarch64|Linux:arm64|Linux:x86_64) ;;
+  Darwin:arm64) relay=relay-darwin-arm64 ;;
+  Linux:aarch64|Linux:arm64) relay=relay-linux-arm64-gnu ;;
+  Linux:x86_64) relay=relay-linux-x64-gnu ;;
   *) fail "unsupported platform $(uname -s)/$(uname -m); supported: macOS arm64 or Linux glibc arm64/x64." ;;
 esac
 if [ "$(uname -s)" = Linux ]; then
@@ -32,12 +34,16 @@ node -e 'const [M,m]=process.versions.node.split(".").map(Number);process.exit(M
 command -v npm >/dev/null 2>&1 || fail 'npm >=10 is missing. Reinstall Node.js 22 or 24 LTS.'
 [ "$(npm --version | cut -d. -f1)" -ge 10 ] || fail 'npm >=10 is required. Run: npm install -g npm@latest'
 
-version=${CCODEX_VERSION:-$(npm view "$package" dist-tags.latest --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s)))')}
+command -v curl >/dev/null 2>&1 || fail 'curl is required to resolve the latest release.'
+version=${CCODEX_VERSION:-$(curl -fsSL "https://api.github.com/repos/$repository/releases/latest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).tag_name).replace(/^v/,"")))')}
+[ -n "$version" ] || fail "could not resolve the latest release of $repository."
+release="https://github.com/$repository/releases/download/v$version"
 stage="$home/staging/bootstrap-$version-$$"
 umask 077
 mkdir -p "$home/staging"
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
-npm install --prefix "$stage" --include=optional --ignore-scripts --save=false "$package@$version"
+npm install --prefix "$stage" --include=optional --ignore-scripts --save=false \
+  "$release/gkorepanov-ccodex-$version.tgz" "$release/gkorepanov-ccodex-$relay-$version.tgz"
 "$stage/node_modules/.bin/ccodex" setup --staged "$stage" --version "$version"
 trap - EXIT HUP INT TERM
 printf 'CCodex %s installed. Open a new shell.\n' "$version"

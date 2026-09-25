@@ -10,8 +10,20 @@ Codex desktop and mobile apps to run Claude models.*
 </div>
 
 ```sh
-curl -fsSL https://github.com/gkorepanov/ccodex/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Fazeplant/ccodex/releases/latest/download/install.sh | sh
 ```
+
+> **Fork note (Fazeplant/ccodex).** This fork of
+> [gkorepanov/ccodex](https://github.com/gkorepanov/ccodex) ships through GitHub
+> Releases instead of npm: `install.sh` and `ccodex update` install the release's
+> main and relay tarballs (`CCODEX_RELEASE_REPO` overrides the repository). A daily
+> `Auto-update runtimes` workflow moves the pinned Claude Agent SDK / Claude Code and
+> Codex CLI to npm latest, runs the full check, test and relay suite, and releases
+> green bumps as `<upstream>-orbital.<n>`. A bump that fails (typically a Codex
+> app-server protocol change) becomes an `auto/<runtime>-<version>` pull request to
+> port by hand; it never blocks the other runtime. Remove any global
+> `npm install -g @gkorepanov/ccodex`, because the `ccodex` shim prefers it for
+> `setup` / `update`.
 
 <p align="center">
   <img src="docs/screenshots/mobile-claude-model-picker.png" width="30%" alt="Claude models in the Codex App mobile model picker" />
@@ -93,7 +105,7 @@ Keeping it healthy, updated, or removing it:
 
 ```sh
 ccodex doctor            # (or --json)
-ccodex update            # npm latest; --check / --channel next / rollback available
+ccodex update            # latest GitHub release; --check / rollback available
 ccodex uninstall         # preserves config and state; add --purge --yes to wipe
 ```
 
