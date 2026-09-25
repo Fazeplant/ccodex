@@ -34,8 +34,10 @@ for (const [directory, os, cpu, libc] of packages) {
   if (manifest.os?.[0] !== os || manifest.cpu?.[0] !== cpu || manifest.libc?.[0] !== libc) {
     throw new Error(`${directory} platform selectors are incorrect`);
   }
-  if (main.optionalDependencies[manifest.name] !== main.version) {
-    throw new Error(`${manifest.name} is not an exact-version optional dependency`);
+  // The fork installs the relay tarball explicitly next to the main package
+  // (GitHub release assets), so it must not be an npm registry dependency.
+  if (main.optionalDependencies?.[manifest.name] !== undefined) {
+    throw new Error(`${manifest.name} must not be an npm dependency of the fork`);
   }
   const key = os === "darwin" ? `${os}-${cpu}` : `${os}-${cpu}-gnu`;
   if (compatibility.relayPackages[key] !== manifest.name) throw new Error(`${directory} is absent from compatibility.json`);

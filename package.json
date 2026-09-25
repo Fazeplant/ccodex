@@ -81,11 +81,6 @@
     "ws": "8.21.0",
     "zod": "4.4.3"
   },
-  "optionalDependencies": {
-    "@gkorepanov/ccodex-relay-darwin-arm64": "0.4.25-orbital.1",
-    "@gkorepanov/ccodex-relay-linux-arm64-gnu": "0.4.25-orbital.1",
-    "@gkorepanov/ccodex-relay-linux-x64-gnu": "0.4.25-orbital.1"
-  },
   "devDependencies": {
     "@types/node": "24.10.1",
     "@types/ws": "8.18.1",

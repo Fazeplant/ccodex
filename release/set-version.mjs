@@ -14,7 +14,6 @@ const writeJson = (path, value) => writeFileSync(path, `${JSON.stringify(value, 
 const mainPath = join(root, "package.json");
 const main = JSON.parse(readFileSync(mainPath, "utf8"));
 main.version = version;
-for (const name of Object.keys(main.optionalDependencies)) main.optionalDependencies[name] = version;
 writeJson(mainPath, main);
 for (const directory of platformDirectories) {
   const path = join(root, "packages", directory, "package.json");
