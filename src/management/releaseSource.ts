@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { compatibilityManifest } from "../compatibility/probe.js";
 import { runtimePlatformKey } from "../runtime/dependencies.js";
 
@@ -34,4 +36,17 @@ export async function latestReleaseVersion(repository = RELEASE_REPOSITORY): Pro
   const version = typeof tag === "string" ? tag.replace(/^v/u, "") : "";
   if (!VERSION.test(version)) throw new Error(`GitHub returned an invalid latest release tag: ${String(tag)}`);
   return version;
+}
+
+// npm >= 12 refuses remote tarball specs by default (allow-remote), so the
+// release tarballs are downloaded first and installed as local files.
+export async function downloadReleaseTarballs(version: string, directory: string): Promise<string[]> {
+  mkdirSync(directory, { recursive: true });
+  return Promise.all(releaseTarballSpecs(version).map(async (url) => {
+    const response = await fetch(url, { signal: AbortSignal.timeout(10 * 60_000) });
+    if (!response.ok) throw new Error(`GitHub returned ${response.status} for ${url}`);
+    const path = join(directory, basename(new URL(url).pathname));
+    writeFileSync(path, Buffer.from(await response.arrayBuffer()));
+    return path;
+  }));
 }

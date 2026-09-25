@@ -41,9 +41,16 @@ release="https://github.com/$repository/releases/download/v$version"
 stage="$home/staging/bootstrap-$version-$$"
 umask 077
 mkdir -p "$home/staging"
-trap 'rm -rf "$stage"' EXIT HUP INT TERM
+tarballs="$stage.tarballs"
+trap 'rm -rf "$stage" "$tarballs"' EXIT HUP INT TERM
+# npm >= 12 refuses remote tarball specs by default, so install downloaded files.
+mkdir -p "$tarballs"
+for name in "gkorepanov-ccodex-$version.tgz" "gkorepanov-ccodex-$relay-$version.tgz"; do
+  curl -fsSL -o "$tarballs/$name" "$release/$name" || fail "could not download $release/$name."
+done
 npm install --prefix "$stage" --include=optional --ignore-scripts --save=false \
-  "$release/gkorepanov-ccodex-$version.tgz" "$release/gkorepanov-ccodex-$relay-$version.tgz"
+  "$tarballs/gkorepanov-ccodex-$version.tgz" "$tarballs/gkorepanov-ccodex-$relay-$version.tgz"
+rm -rf "$tarballs"
 "$stage/node_modules/.bin/ccodex" setup --staged "$stage" --version "$version"
 trap - EXIT HUP INT TERM
 printf 'CCodex %s installed. Open a new shell.\n' "$version"
