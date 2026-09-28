@@ -241,6 +241,20 @@ describe("ClaudeService", () => {
     await service.close();
   });
 
+  it("answers the App's attachment poll with an empty page for Claude threads", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-attachments-"));
+    directories.push(directory);
+    const service = new ClaudeService(
+      config(directory), new SubscriptionHub(), new Logger("error"), new SqliteHybridStore(join(directory, "state.sqlite")),
+      new FakeClaudeQuery().factory,
+    );
+
+    const started = await service.startThread({ model: "claude:haiku", cwd: directory });
+    expect(service.listAttachments({ threadId: started.thread.id })).toEqual({ data: [], nextCursor: null });
+    expect(() => service.listAttachments({ threadId: "missing-thread" })).toThrow(/missing-thread/u);
+    await service.close();
+  });
+
   it("projects streamed image Reads atomically and durably without duplicate lifecycle items", async () => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-image-view-"));
     directories.push(directory);

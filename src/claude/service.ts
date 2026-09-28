@@ -58,6 +58,8 @@ import type { TurnInterruptParams } from "../codex/generated/v2/TurnInterruptPar
 import type { ThreadBackgroundTerminalsCleanParams } from "../codex/generated/v2/ThreadBackgroundTerminalsCleanParams.js";
 import type { ThreadBackgroundTerminalsCleanResponse } from "../codex/generated/v2/ThreadBackgroundTerminalsCleanResponse.js";
 import type { ThreadBackgroundTerminalsListParams } from "../codex/generated/v2/ThreadBackgroundTerminalsListParams.js";
+import type { ThreadAttachmentListParams } from "../codex/generated/v2/ThreadAttachmentListParams.js";
+import type { ThreadAttachmentListResponse } from "../codex/generated/v2/ThreadAttachmentListResponse.js";
 import type { ThreadBackgroundTerminalsListResponse } from "../codex/generated/v2/ThreadBackgroundTerminalsListResponse.js";
 import type { ThreadBackgroundTerminalsTerminateParams } from "../codex/generated/v2/ThreadBackgroundTerminalsTerminateParams.js";
 import type { ThreadBackgroundTerminalsTerminateResponse } from "../codex/generated/v2/ThreadBackgroundTerminalsTerminateResponse.js";
@@ -1044,6 +1046,12 @@ export class ClaudeService {
   ): Promise<ThreadBackgroundTerminalsCleanResponse> {
     await (await this.sessions.getOrCreate(params.threadId)).cleanBackgroundTerminals(params.threadId);
     return {};
+  }
+
+  /** Claude threads never hold Codex thread attachments; the App polls this list for every thread. */
+  public listAttachments(params: ThreadAttachmentListParams): ThreadAttachmentListResponse {
+    this.requireRecord(params.threadId, false);
+    return { data: [], nextCursor: null };
   }
 
   public async listBackgroundTerminals(

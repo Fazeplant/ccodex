@@ -38,6 +38,7 @@ import type { TurnStartParams } from "../codex/generated/v2/TurnStartParams.js";
 import type { TurnSteerParams } from "../codex/generated/v2/TurnSteerParams.js";
 import type { ThreadBackgroundTerminalsCleanParams } from "../codex/generated/v2/ThreadBackgroundTerminalsCleanParams.js";
 import type { ThreadBackgroundTerminalsListParams } from "../codex/generated/v2/ThreadBackgroundTerminalsListParams.js";
+import type { ThreadAttachmentListParams } from "../codex/generated/v2/ThreadAttachmentListParams.js";
 import type { ThreadBackgroundTerminalsTerminateParams } from "../codex/generated/v2/ThreadBackgroundTerminalsTerminateParams.js";
 import type { GetAccountRateLimitsResponse } from "../codex/generated/v2/GetAccountRateLimitsResponse.js";
 import type { ClaudeModelCatalog } from "../claude/modelCatalog.js";
@@ -708,6 +709,12 @@ export function attachClientConnection(
         if (request.method === "thread/backgroundTerminals/list") {
           sendResult(request.id, target.provider === "claude"
             ? await claude.listBackgroundTerminals(params as unknown as ThreadBackgroundTerminalsListParams)
+            : await optimisticStockRequest(request.method, params));
+          return;
+        }
+        if (request.method === "thread/attachment/list") {
+          sendResult(request.id, target.provider === "claude"
+            ? claude.listAttachments(params as unknown as ThreadAttachmentListParams)
             : await optimisticStockRequest(request.method, params));
           return;
         }
@@ -1473,6 +1480,10 @@ export function attachClientConnection(
             sendResult(message.id, await claude.cleanBackgroundTerminals(
               (message.params ?? {}) as ThreadBackgroundTerminalsCleanParams,
             ));
+            return;
+          }
+          if (message.method === "thread/attachment/list") {
+            sendResult(message.id, claude.listAttachments((message.params ?? {}) as ThreadAttachmentListParams));
             return;
           }
           if (message.method === "thread/backgroundTerminals/list") {
