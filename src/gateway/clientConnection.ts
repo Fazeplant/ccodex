@@ -59,6 +59,7 @@ import type { RpcRecorder } from "../observability/rpcRecorder.js";
 import type { RemoteControlController } from "./remoteControlController.js";
 import { ServerRequestIds } from "./serverRequestIds.js";
 import type { CrossProviderForks } from "../handoff/service.js";
+import { isSystemEphemeralForkSource } from "../handoff/systemEphemeralSources.js";
 import {
   providerMigrationCompleted, providerMigrationFailed, providerMigrationNotice, transientCommandNotice, transientSystemNotice,
   transientSystemItemNotice, type SystemNoticeKind, type TransientNotice,
@@ -178,7 +179,8 @@ export function attachClientConnection(
     if (message.method === "initialize" && typeof params?.clientInfo?.name === "string") clientName = params.clientInfo.name;
     const systemEphemeral = (message.method === "thread/start" || message.method === "thread/fork")
       && params?.ephemeral === true
-      && (params.threadSource === "system" || (message.method === "thread/start" && params.threadSource !== "user"));
+      && (isSystemEphemeralForkSource(params.threadSource)
+        || (message.method === "thread/start" && params.threadSource !== "user"));
     const internalEphemeralThread = typeof params?.threadId === "string"
       && handoffs.ownsSystemEphemeral(connectionId, params.threadId);
     const stockSide = params?.threadSource === STOCK_SIDE_THREAD_SOURCE;

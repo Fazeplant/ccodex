@@ -139,6 +139,9 @@ describe("CrossProviderForks", () => {
     };
 
     expect(handoffs.isSystemEphemeralFork(captured)).toBe(true);
+    // Codex App 0.157-era builds fork every new chat this way to write its description.
+    expect(handoffs.isSystemEphemeralFork({ ...captured, threadSource: "thread_description" })).toBe(true);
+    expect(handoffs.isSystemEphemeralFork({ ...captured, threadSource: "user" })).toBe(false);
     const fork = await handoffs.forkSystemEphemeral(captured, stock, "title-connection");
 
     expect(fork).toMatchObject({

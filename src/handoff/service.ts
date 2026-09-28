@@ -49,6 +49,7 @@ import {
   projectRpcToPublicThread,
 } from "../gateway/logicalThreadProjection.js";
 import { invalidParams, invalidRequest } from "../protocol/errors.js";
+import { isSystemEphemeralForkSource } from "./systemEphemeralSources.js";
 import { historyCursors, paginateItems, paginateTurns } from "../protocol/turnPagination.js";
 import { searchTurnOccurrences } from "../protocol/search.js";
 import type { ThreadSearchOccurrencesParams } from "../codex/generated/v2/ThreadSearchOccurrencesParams.js";
@@ -1568,7 +1569,7 @@ export class CrossProviderForks {
   public isSystemEphemeralFork(params: ThreadForkParams): boolean {
     const logical = this.epochs.resolve(params.threadId);
     return params.ephemeral === true
-      && params.threadSource === "system"
+      && isSystemEphemeralForkSource(params.threadSource)
       && (logical?.epoch.provider === "claude" || this.claude.ownsThread(params.threadId))
       && Boolean(params.model && providerForModel(this.claude, params.model) === "stock");
   }
