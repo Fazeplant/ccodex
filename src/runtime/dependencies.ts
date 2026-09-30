@@ -28,7 +28,7 @@ export function pinnedCodexExecutable(): string {
   try {
     return require.resolve("@openai/codex/bin/codex.js");
   } catch {
-    throw new Error("Pinned @openai/codex@0.158.0 is missing. Reinstall @gkorepanov/ccodex.");
+    throw new Error("Pinned @openai/codex@0.159.2 is missing. Reinstall @gkorepanov/ccodex.");
   }
 }
 
