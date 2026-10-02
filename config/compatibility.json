@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "productVersion": "0.4.25-orbital.12",
+  "productVersion": "0.4.25-orbital.13",
   "node": ">=22.13 <27",
   "codexCli": "0.159.3",
   "codexGitRevision": "8e46774a94a745ffdf676bd7a8aa36466bbd4f99",
