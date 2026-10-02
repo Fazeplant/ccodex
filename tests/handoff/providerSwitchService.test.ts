@@ -34,6 +34,61 @@ function thread(id: string, provider: string, turns: Turn[] = []): Thread {
 }
 
 describe("provider switch service", () => {
+  it("pages overlay item anchors against visible history with duplicate backend item IDs", async () => {
+    const inherited = turn("inherited", "history");
+    const visible = turn("visible", "live");
+    for (const value of [inherited, visible]) {
+      value.items = ["one", "anchor", "four", "five"].map((id) => ({ ...value.items[0]!, id }));
+    }
+    const target = thread("overlay-target", "openai", [visible]);
+    const source = thread("overlay-source", "claude", [inherited]);
+    const store = new HandoffStore(join(mkdtempSync(join(tmpdir(), "ccodex-item-anchor-")), "handoffs.sqlite"));
+    store.setOverlay({ threadId: target.id, sourceThreadId: source.id, sourceThread: source, inheritedTurns: [inherited] });
+    const service = new CrossProviderForks(store, { ownsThread: () => false } as never);
+    const stock = { request: vi.fn(async () => ({ thread: target })) };
+    try {
+      for (const sortDirection of ["asc", "desc"] as const) {
+        const page = await service.itemsOverlay({ threadId: target.id, turnId: visible.id, cursor: { type: "item", itemId: sortDirection === "asc" ? "anchor" : "five" }, sortDirection, limit: 1 }, stock as never);
+        expect(page.data.map((entry) => [entry.turnId, entry.item.id])).toEqual([[visible.id, "four"]]);
+        const next = await service.itemsOverlay({ threadId: target.id, turnId: visible.id, cursor: page.nextCursor, sortDirection, limit: 1 }, stock as never);
+        expect(next.data[0]?.item.id).toBe(sortDirection === "asc" ? "five" : "anchor");
+        const reverse = await service.itemsOverlay({ threadId: target.id, turnId: visible.id, cursor: page.backwardsCursor, sortDirection: sortDirection === "asc" ? "desc" : "asc", limit: 1 }, stock as never);
+        expect(reverse.data).toEqual(page.data);
+      }
+      await expect(service.itemsOverlay({ threadId: target.id, cursor: { type: "item", itemId: "anchor" } }, stock as never))
+        .rejects.toThrow(expect.objectContaining({ code: -32602 }));
+      await expect(service.itemsOverlay({ threadId: target.id, turnId: visible.id, cursor: { type: "item", itemId: "foreign" } }, stock as never))
+        .rejects.toThrow(expect.objectContaining({ code: -32602 }));
+      expect((await service.itemsOverlay({ threadId: target.id, turnId: visible.id, cursor: "hyb-overlay-item:1" }, stock as never)).data.map((entry) => entry.item.id)).toEqual(["anchor", "four", "five"]);
+    } finally {
+      service.close();
+    }
+  });
+
+  it.each(["claude", "openai"])("pages logical %s item anchors using projected public IDs", async (provider) => {
+    const value = turn("visible", "answer");
+    value.items = ["one", "anchor", "four", "five"].map((id) => ({ ...value.items[0]!, id }));
+    const backend = thread("backend", provider, [value]);
+    const publicThread = { ...backend, id: "public", sessionId: "public" };
+    const store = new HandoffStore(join(mkdtempSync(join(tmpdir(), "ccodex-logical-item-anchor-")), "handoffs.sqlite"));
+    store.createLogicalThread({ thread: publicThread, epoch: { id: "epoch", provider: provider === "claude" ? "claude" : "stock", backendThreadId: backend.id, model: provider === "claude" ? "claude:sonnet" : "gpt-5.4", settings: {} } });
+    const service = new CrossProviderForks(store, { ownsThread: (id: string) => id === backend.id, readThread: () => ({ thread: backend }) } as never);
+    const stock = { request: vi.fn(async () => ({ thread: backend })) };
+    type Page = Awaited<ReturnType<CrossProviderForks["itemsOverlay"]>>;
+    try {
+      const listed = await service.requestLogical("thread/items/list", { threadId: publicThread.id }, stock as never);
+      const items = (listed.result as Page).data;
+      expect(items).toHaveLength(4);
+      const page = (await service.requestLogical("thread/items/list", { threadId: publicThread.id, turnId: items[0]!.turnId, cursor: { type: "item", itemId: items[1]!.item.id }, limit: 1 }, stock as never)).result as Page;
+      expect(page.data).toEqual([items[2]]);
+      const next = (await service.requestLogical("thread/items/list", { threadId: publicThread.id, turnId: items[0]!.turnId, cursor: page.nextCursor, limit: 1 }, stock as never)).result as Page;
+      expect(next.data).toEqual([items[3]]);
+      await expect(service.requestLogical("thread/items/list", { threadId: publicThread.id, turnId: items[0]!.turnId, cursor: { type: "item", itemId: "foreign" } }, stock as never))
+        .rejects.toThrow(expect.objectContaining({ code: -32602 }));
+    } finally {
+      service.close();
+    }
+  });
   it("drops incomplete provisional records from the app catalog", () => {
     const store = new HandoffStore(join(mkdtempSync(join(tmpdir(), "ccodex-switch-")), "handoffs.sqlite"));
     store.createLogicalThread({
@@ -668,7 +723,7 @@ describe("provider switch service", () => {
     expect(reverted).toMatchObject({
       thread: { id: publicThread.id, historyMode: "paginated", turns: [] },
       turnsBackwardsCursor: JSON.stringify({ turnId: first.id, includeAnchor: true }),
-      itemsBackwardsCursor: expect.stringMatching(/^\{"itemId":"ccodex-item-[0-9a-f]+","includeAnchor":true\}$/u),
+      itemsBackwardsCursor: expect.stringMatching(/^\{"itemId":"ccodex-item-[0-9a-f]+","includeAnchor":true,"turnId":"[^"]+"\}$/u),
     });
   });
 
@@ -700,7 +755,7 @@ describe("provider switch service", () => {
     expect(reverted).toMatchObject({
       thread: { id: publicThread.id, turns: [] },
       turnsBackwardsCursor: JSON.stringify({ turnId: first.id, includeAnchor: true }),
-      itemsBackwardsCursor: expect.stringMatching(/^\{"itemId":"ccodex-item-[0-9a-f]+","includeAnchor":true\}$/u),
+      itemsBackwardsCursor: expect.stringMatching(/^\{"itemId":"ccodex-item-[0-9a-f]+","includeAnchor":true,"turnId":"[^"]+"\}$/u),
     });
     await expect(service.revertLogicalThread({ threadId: publicThread.id, beforeTurnId: "missing" }, stock as never))
       .rejects.toThrow("Unknown turn 'missing'");
