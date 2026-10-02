@@ -123,6 +123,41 @@ afterEach(() => {
 });
 
 describe("ClaudeService", () => {
+  it("lists exclusive item anchors and string continuations within the requested visible turn", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-item-anchor-"));
+    directories.push(directory);
+    const store = new MemoryHybridStore();
+    const service = new ClaudeService(config(directory), new SubscriptionHub(), new Logger("error"), store, new FakeClaudeQuery().factory);
+    try {
+      const started = await service.startThread({ model: "claude:haiku", cwd: directory });
+      const threadId = started.thread.id;
+      expect(() => service.listItems({ threadId, turnId: "visible", cursor: { type: "item", itemId: "anchor" } }))
+        .toThrow(expect.objectContaining({ code: -32602 }));
+      for (const id of ["other", "visible"]) {
+        const value = paginationTurn(id);
+        value.items = ["one", "anchor", "four", "five"].map((itemId) => ({ ...value.items[0]!, id: itemId }));
+        store.createTurn(threadId, value);
+      }
+      const foreign = await service.startThread({ model: "claude:haiku", cwd: directory });
+      store.createTurn(foreign.thread.id, paginationTurn("foreign"));
+      for (const sortDirection of ["asc", "desc"] as const) {
+        const page = service.listItems({ threadId, turnId: "visible", cursor: { type: "item", itemId: sortDirection === "asc" ? "anchor" : "five" }, sortDirection, limit: 1 });
+        expect(page.data.map((entry) => [entry.turnId, entry.item.id])).toEqual([["visible", "four"]]);
+        expect(service.listItems({ threadId, turnId: "visible", cursor: page.nextCursor, sortDirection, limit: 1 }).data[0]?.item.id)
+          .toBe(sortDirection === "asc" ? "five" : "anchor");
+        expect(service.listItems({ threadId, turnId: "visible", cursor: page.backwardsCursor, sortDirection: sortDirection === "asc" ? "desc" : "asc", limit: 1 }).data).toEqual(page.data);
+      }
+      for (const itemId of ["", "missing", "foreign-item"]) {
+        expect(() => service.listItems({ threadId, turnId: "visible", cursor: { type: "item", itemId } }))
+          .toThrow(expect.objectContaining({ code: -32602 }));
+      }
+      expect(() => service.listItems({ threadId, cursor: { type: "item", itemId: "anchor" } }))
+        .toThrow(expect.objectContaining({ code: -32602 }));
+      expect(service.listItems({ threadId, turnId: "visible", cursor: "hyb-item:1" }).data.map((entry) => entry.item.id)).toEqual(["anchor", "four", "five"]);
+    } finally {
+      await service.close();
+    }
+  });
   it.each([undefined, "🌊 Native title"])("projects native metadata consistently through list, read, and resume (%s)", async (customTitle) => {
     const directory = mkdtempSync(join(tmpdir(), "codex-hybrid-native-metadata-"));
     directories.push(directory);
@@ -1360,7 +1395,7 @@ Keep this summary.
     });
     expect(resumed).toMatchObject({
       turnsBackwardsCursor: JSON.stringify({ turnId: resumed.initialTurnsPage!.data[0]!.id, includeAnchor: true }),
-      itemsBackwardsCursor: JSON.stringify({ itemId: resumed.initialTurnsPage!.data[0]!.items.at(-1)!.id, includeAnchor: true }),
+      itemsBackwardsCursor: JSON.stringify({ itemId: resumed.initialTurnsPage!.data[0]!.items.at(-1)!.id, includeAnchor: true, turnId: resumed.initialTurnsPage!.data[0]!.id }),
     });
     expect(service.listItems({ threadId: started.thread.id })).toEqual({
       data: [
@@ -1368,7 +1403,7 @@ Keep this summary.
         { turnId: expect.any(String), item: expect.objectContaining({ type: "agentMessage" }), startedAtMs: null, completedAtMs: null },
       ],
       nextCursor: null,
-      backwardsCursor: JSON.stringify({ itemId: resumed.initialTurnsPage!.data[0]!.items[0]!.id, includeAnchor: true }),
+      backwardsCursor: JSON.stringify({ itemId: resumed.initialTurnsPage!.data[0]!.items[0]!.id, includeAnchor: true, turnId: resumed.initialTurnsPage!.data[0]!.id }),
     });
     await service.close();
   });

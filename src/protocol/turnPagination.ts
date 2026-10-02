@@ -4,31 +4,37 @@ import type { ThreadItemsListResponse } from "../codex/generated/v2/ThreadItemsL
 import type { ThreadTurnsListParams } from "../codex/generated/v2/ThreadTurnsListParams.js";
 import type { ThreadTurnsListResponse } from "../codex/generated/v2/ThreadTurnsListResponse.js";
 import type { Turn } from "../codex/generated/v2/Turn.js";
-import { invalidRequest } from "./errors.js";
+import { invalidParams, invalidRequest } from "./errors.js";
 
 interface AnchorCursor {
   anchor: string;
   includeAnchor: boolean;
+  // Private item cursors identify a position by both IDs; old cursors omit this discriminator.
+  turnId?: string;
 }
 
 type CursorKey = "turnId" | "itemId";
 
-function encodeCursor(key: CursorKey, anchor: string, includeAnchor: boolean): string {
-  return JSON.stringify({ [key]: anchor, includeAnchor });
+function encodeCursor(key: CursorKey, anchor: string, includeAnchor: boolean, turnId?: string): string {
+  return JSON.stringify({ [key]: anchor, includeAnchor, ...(turnId === undefined ? {} : { turnId }) });
 }
 
 export function turnCursor(turnId: string, includeAnchor: boolean): string {
   return encodeCursor("turnId", turnId, includeAnchor);
 }
 
-export function itemCursor(itemId: string, includeAnchor: boolean): string {
-  return encodeCursor("itemId", itemId, includeAnchor);
+export function itemCursor(itemId: string, includeAnchor: boolean, turnId?: string): string {
+  return encodeCursor("itemId", itemId, includeAnchor, turnId);
 }
 
 function anchorCursor(key: CursorKey, cursor: string): AnchorCursor | undefined {
   try {
     const parsed = JSON.parse(cursor) as Record<string, unknown>;
     if (typeof parsed[key] === "string" && typeof parsed.includeAnchor === "boolean") {
+      if (key === "itemId" && "turnId" in parsed) {
+        if (typeof parsed.turnId !== "string" || !parsed.turnId) return undefined;
+        return { anchor: parsed[key], includeAnchor: parsed.includeAnchor, turnId: parsed.turnId };
+      }
       return { anchor: parsed[key], includeAnchor: parsed.includeAnchor };
     }
   } catch {
@@ -60,6 +66,7 @@ function paginate<T>(
   legacyPrefixes: readonly string[],
   defaultDirection: SortDirection,
   selected: (entry: T) => boolean = () => true,
+  turnIdOf?: (entry: T) => string,
 ): { data: T[]; nextCursor: string | null; backwardsCursor: string | null } {
   if (entries.length === 0) return { data: [], nextCursor: null, backwardsCursor: null };
   const direction = params.sortDirection ?? defaultDirection;
@@ -68,7 +75,8 @@ function paginate<T>(
   // Like stock, anchors are positions in the whole list; `selected` (e.g. a turn filter) applies on top.
   const anchor = params.cursor ? anchorCursor(key, params.cursor) : undefined;
   if (anchor) {
-    const anchorIndex = entries.findIndex((entry) => idOf(entry) === anchor.anchor);
+    const anchorIndex = entries.findIndex((entry) => idOf(entry) === anchor.anchor
+      && (anchor.turnId === undefined || turnIdOf?.(entry) === anchor.turnId));
     if (anchorIndex < 0) throw invalidRequest("invalid cursor: anchor is no longer present");
     keyed = keyed.filter(({ index }) => direction === "asc"
       ? anchor.includeAnchor ? index >= anchorIndex : index > anchorIndex
@@ -84,8 +92,8 @@ function paginate<T>(
   const page = keyed.slice(0, limit).map(({ entry }) => entry);
   return {
     data: page,
-    nextCursor: keyed.length > limit ? encodeCursor(key, idOf(page.at(-1)!), false) : null,
-    backwardsCursor: page.length ? encodeCursor(key, idOf(page[0]!), true) : null,
+    nextCursor: keyed.length > limit ? encodeCursor(key, idOf(page.at(-1)!), false, turnIdOf?.(page.at(-1)!)) : null,
+    backwardsCursor: page.length ? encodeCursor(key, idOf(page[0]!), true, turnIdOf?.(page[0]!)) : null,
   };
 }
 
@@ -127,8 +135,20 @@ export function paginateItems(
 ): ThreadItemsListResponse {
   const entries = turns.flatMap((turn) =>
     turn.items.map((item) => ({ turnId: turn.id, item, startedAtMs: null, completedAtMs: null })));
-  return paginate(entries, "itemId", (entry) => entry.item.id, params, legacyPrefixes, "asc",
-    (entry) => !params.turnId || entry.turnId === params.turnId);
+  const { cursor, ...pageParams } = params;
+  let stringCursor: string | null = typeof cursor === "string" ? cursor : null;
+  if (cursor !== undefined && cursor !== null && typeof cursor !== "string") {
+    if (typeof params.turnId !== "string" || !params.turnId) {
+      throw invalidParams("item anchor requires a non-empty turnId");
+    }
+    if (typeof cursor !== "object" || cursor.type !== "item" || typeof cursor.itemId !== "string" || !cursor.itemId
+      || !entries.some((entry) => entry.turnId === params.turnId && entry.item.id === cursor.itemId)) {
+      throw invalidParams("invalid item anchor: item is not present in the requested visible turn");
+    }
+    stringCursor = itemCursor(cursor.itemId, false, params.turnId);
+  }
+  return paginate(entries, "itemId", (entry) => entry.item.id, { ...pageParams, cursor: stringCursor }, legacyPrefixes, "asc",
+    (entry) => !params.turnId || entry.turnId === params.turnId, (entry) => entry.turnId);
 }
 
 /** The turn shape stock returns from `turn/start` and announces in `turn/started`: no items, `notLoaded`; items follow via `item/started`. */
@@ -141,9 +161,10 @@ export function historyCursors(turns: readonly Turn[]): {
   turnsBackwardsCursor: string | null;
   itemsBackwardsCursor: string | null;
 } {
-  const lastItem = turns.findLast((turn) => turn.items.length)?.items.at(-1);
+  const lastTurn = turns.findLast((turn) => turn.items.length);
+  const lastItem = lastTurn?.items.at(-1);
   return {
     turnsBackwardsCursor: turns.length ? turnCursor(turns.at(-1)!.id, true) : null,
-    itemsBackwardsCursor: lastItem ? itemCursor(lastItem.id, true) : null,
+    itemsBackwardsCursor: lastItem ? itemCursor(lastItem.id, true, lastTurn!.id) : null,
   };
 }
