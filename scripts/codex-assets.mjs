@@ -49,6 +49,8 @@ const TRANSPORT_OVERLAYS = {
   "8e46774a94a745ffdf676bd7a8aa36466bbd4f99": RESULT_AS_VALUE_OVERLAY,
   // rust-v0.160.0
   "79b1b666f2e8551f8abbbca34957227f67f3f553": RESULT_AS_VALUE_OVERLAY,
+  // rust-v0.160.1
+  "c3e23d4c4385619ecec78408766e46b7fa7dd9ad": RESULT_AS_VALUE_OVERLAY,
 };
 
 export function pinnedCodexRef(cargo = readFileSync(join(root, "relay", "Cargo.toml"), "utf8")) {
