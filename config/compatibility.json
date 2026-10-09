@@ -4,8 +4,8 @@
   "node": ">=22.13 <27",
   "codexCli": "0.161.0",
   "codexGitRevision": "7e21416b38834816c224ea0dfd135c3de94b2f15",
-  "claudeAgentSdk": "0.3.293",
-  "claudeCode": "2.1.293",
+  "claudeAgentSdk": "0.3.295",
+  "claudeCode": "2.1.295",
   "protocolFixture": "codex-0.144.4",
   "relayPackages": {
     "darwin-arm64": "@gkorepanov/ccodex-relay-darwin-arm64",
