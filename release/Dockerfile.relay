@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.95-bullseye AS build
+FROM rust:1.99-bullseye AS build
 
 ARG TARGET
 # Keep the glibc 2.31 baseline reproducible when Bullseye packages leave mirrors.
